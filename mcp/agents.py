@@ -50,19 +50,16 @@ Your role is to validate identity documents by extracting structured data from u
 ## Output Format
 Return JSON with extracted fields:
 {
-  "document_type": "aadhaar" | "pan" | "driving_license" | "education" | "land_records",
+  "document_type": "aadhaar" | "pan",
   "fields": {
     "name": "Full name as on document",
-    "date_of_birth": "Date of birth in DD/MM/YYYY or similar",
+    "dob": "Date of birth in DD/MM/YYYY or similar",
     "uid": "12-digit Aadhaar number (for Aadhaar)",
     "pan_number": "10-character PAN (for PAN)",
-    "address": "Address (for Aadhaar/land records)",
-    "license_number": "License number (for driving license)",
-    "institution": "Educational institution (for education)"
+    "address": "Address (for Aadhaar when present)"
   },
   "confidence": 0.0-1.0,
-  "warnings": ["OCR quality issues", "suspicious patterns", "missing fields"],
-  "recommendation": "Manual review required" or "Auto-approved"
+  "warnings": ["OCR quality issues", "suspicious patterns", "missing fields"]
 }
 
 ## Validation Rules
@@ -107,20 +104,15 @@ Return JSON with extracted fields:
 Aadhaar Card:
 Input: Image of Aadhaar card
 OCR: "राजवन श्री चन्द्रम शर्मा 1234 5678 9012"
-Extract: {name: "श्री चन्द्रमा शर्मा", aadhaar: "123456789012", dob: "01/01/1985"}
+Extract: {name: "श्री चन्द्रमा शर्मा", uid: "123456789012", dob: "01/01/1985"}
 Confidence: 0.95
 
 PAN Card:
 Input: Image of PAN card
 OCR: "ABCDE1234F  12/34/1990"
-Extract: {name: "John Doe", pan: "ABCDE1234F", dob: "12/34/1990"}
+Extract: {name: "John Doe", pan_number: "ABCDE1234F", dob: "12/34/1990"}
 Confidence: 0.9
 
-Driving License:
-Input: Image of driving license
-OCR: "LMN 1234567890123"
-Extract: {name: "John Doe", license: "LMN 1234567890123", address: "123 Main Street"}
-Confidence: 0.85
 """,
     tools=[
         "mcp://document-processor/ocr_document",
@@ -128,9 +120,7 @@ Confidence: 0.85
         "mcp://document-processor/extract_pan_fields",
         "mcp://document-processor/detect_document_type",
     ],
-    mcp_servers=[
-        "mcp://document-processor"
-    ],
+    mcp_servers=["document-processor"],
     tool_restrictions={
         "Task": False,  # Cannot orchestrate workflows
     },
@@ -235,8 +225,8 @@ Your role is to detect signs of document tampering, manipulation, and suspicious
         "mcp://compliance-rules/check_dpdp",
     ],
     mcp_servers=[
-        "mcp://pattern-analyzer",
-        "mcp://compliance-rules",
+        "pattern-analyzer",
+        "compliance-rules",
     ],
     tool_restrictions={
         "Task": False,
@@ -370,8 +360,8 @@ Result: Violation - excessive data collection
         "context-query-traces",  # Query past precedents
     ],
     mcp_servers=[
-        "mcp://compliance-rules",
-    "context-graph",
+        "compliance-rules",
+        "context-graph",
     ],
     tool_restrictions={
         "Task": False,

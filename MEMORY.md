@@ -64,6 +64,22 @@ Identity verification platform using Solana blockchain + Claude Agent SDK + MCP 
    - Reasoning: Evidence transport and agent extraction are separate concerns; this branch fixes the former and makes the remaining agent gap explicit.
    - Outcome: Aadhaar and PAN both render `Document input: raw_document` with upload metadata and computed SHA-256 in the live browser while still falling back to `manual_review` for missing structured extraction output.
 
+### 2026-03-17 Document Validator Contract Recovery
+1. **Normalize MCP server identifiers at the gateway boundary**
+   - Decision: `agent_manager._build_mcp_servers()` now accepts both plain server keys and `mcp://...` identifiers.
+   - Reasoning: The agent definitions were using `mcp://document-processor` style names while the gateway registry used plain keys, which silently disabled tool attachment.
+   - Outcome: Document, fraud, and compliance agents can be configured without depending on one identifier style.
+
+2. **Document processor must be launchable and deterministic**
+   - Decision: Replaced the broken `mcp-servers/document-processor` package stub with a real `server.py` FastMCP entrypoint and deterministic extraction helpers.
+   - Reasoning: The previous package had no runnable `server.py` and even its `__init__.py` had syntax errors, so the configured MCP server path could never succeed.
+   - Outcome: The configured command now points at an actual server implementation, and the document-processing contract is explicit in code.
+
+3. **Document parsing cannot block indefinitely on the agent runtime**
+   - Decision: `validate_document()` now applies a timeout to the document-validator agent path and falls back to deterministic local extraction with explicit provenance (`model=\"deterministic-fallback\"`) when the agent contract is unavailable.
+   - Reasoning: Trustworthy verification still requires a structured document contract even when the agent runtime hangs or fails to return JSON.
+   - Outcome: Browser and API validation now reach a final status with `Document agent: completed` instead of hanging in `parsing`, while still landing in `manual_review` when required fields are absent.
+
 ### Architecture Decisions
 1. **Tech Stack**
    - Frontend: Next.js 15, TypeScript, Tailwind CSS, shadcn/ui

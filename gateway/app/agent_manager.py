@@ -6,6 +6,7 @@ was observed at each stage. It never fabricates OCR, fraud, or compliance output
 from __future__ import annotations
 
 from enum import Enum
+import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 import base64
@@ -13,6 +14,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import sys
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
@@ -202,6 +204,13 @@ class AgentManager:
             return {}
         return decoded if isinstance(decoded, dict) else {}
 
+    def _normalize_mcp_server_name(self, server_name: str) -> str:
+        """Accept either plain MCP server keys or mcp://-prefixed identifiers."""
+        normalized = server_name.removeprefix("mcp://")
+        if "/" in normalized:
+            normalized = normalized.split("/", 1)[0]
+        return normalized
+
     def _normalize_hash(self, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
@@ -211,6 +220,68 @@ class AgentManager:
         if normalized.startswith("sha256:"):
             normalized = normalized.split(":", 1)[1]
         return normalized.lower()
+
+    def _extract_printable_text(self, document_data: bytes) -> str:
+        decoded = document_data.decode("utf-8", errors="ignore")
+        if decoded.strip():
+            return decoded
+        printable_sequences = re.findall(rb"[\x20-\x7E]{4,}", document_data)
+        return "\n".join(chunk.decode("utf-8", errors="ignore") for chunk in printable_sequences)
+
+    def _extract_name_candidate(self, text: str, blocked_patterns: list[str]) -> Optional[str]:
+        for line in [line.strip() for line in text.splitlines() if line.strip()]:
+            lowered = line.lower()
+            if any(pattern in lowered for pattern in blocked_patterns):
+                continue
+            candidate = re.sub(r"[^A-Za-z ]", "", line).strip()
+            if len(candidate.split()) >= 2:
+                return candidate
+        return None
+
+    def _fallback_document_payload(self, document_data: bytes, document_type: str) -> Dict[str, Any]:
+        text = self._extract_printable_text(document_data)
+        warnings: list[str] = []
+        confidence = 0.25
+
+        if not text.strip():
+            warnings.append("No readable text could be extracted from the supplied document bytes.")
+
+        if document_type == "aadhaar":
+            uid_match = re.search(r"\b(\d{4}[ ]?\d{4}[ ]?\d{4})\b", text)
+            dob_match = re.search(r"\b(\d{2}[/-]\d{2}[/-]\d{4})\b", text)
+            address_match = re.search(r"(?:address|addr)[:\s-]+(.+)", text, re.IGNORECASE)
+            fields = {
+                "name": self._extract_name_candidate(text, ["aadhaar", "uidai", "government", "address", "dob"]),
+                "dob": dob_match.group(1) if dob_match else None,
+                "uid": uid_match.group(1).replace(" ", "") if uid_match else None,
+                "address": address_match.group(1).strip() if address_match else None,
+            }
+        else:
+            pan_match = re.search(r"\b([A-Z]{5}\d{4}[A-Z])\b", text.upper())
+            dob_match = re.search(r"\b(\d{2}[/-]\d{2}[/-]\d{4})\b", text)
+            fields = {
+                "name": self._extract_name_candidate(
+                    text,
+                    ["permanent account number", "income tax", "pan", "dob"],
+                ),
+                "dob": dob_match.group(1) if dob_match else None,
+                "pan_number": pan_match.group(1) if pan_match else None,
+            }
+
+        found_fields = sum(1 for value in fields.values() if value)
+        if found_fields:
+            confidence = 0.45
+        missing_field_warnings = [
+            f"Missing {field}" for field, value in fields.items() if field != "address" and not value
+        ]
+        warnings.extend(missing_field_warnings)
+
+        return {
+            "document_type": document_type,
+            "fields": fields,
+            "confidence": confidence,
+            "warnings": warnings,
+        }
 
     def build_document_source(
         self,
@@ -244,11 +315,12 @@ class AgentManager:
     ) -> Dict[str, McpStdioServerConfig]:
         mcp_servers: Dict[str, McpStdioServerConfig] = {}
         for server_name in server_names:
-            config = DEFAULT_MCP_SERVERS.get(server_name)
+            normalized_name = self._normalize_mcp_server_name(server_name)
+            config = DEFAULT_MCP_SERVERS.get(normalized_name)
             if config is None or not config.enabled:
                 continue
 
-            mcp_servers[server_name] = {
+            mcp_servers[normalized_name] = {
                 "type": "stdio",
                 "command": config.command,
                 "args": config.args,
@@ -449,9 +521,42 @@ Return only JSON with this exact shape:
   "confidence": 0.0,
   "warnings": ["string"]
 }}
+
+If OCR fails or fields are missing, still return the same JSON shape with null field values,
+low confidence, and warnings that explain what could not be extracted. Do not return prose.
 """
 
-        payload, provenance = await self.invoke_agent(AgentType.DOCUMENT_VALIDATOR, prompt)
+        payload: Optional[Dict[str, Any]]
+        provenance: AgentRunProvenance
+        try:
+            payload, provenance = await asyncio.wait_for(
+                self.invoke_agent(AgentType.DOCUMENT_VALIDATOR, prompt),
+                timeout=12,
+            )
+        except asyncio.TimeoutError:
+            payload = None
+            started_at = self._timestamp()
+            provenance = self._failed_provenance(
+                AgentType.DOCUMENT_VALIDATOR.value,
+                started_at,
+                "Document validator timed out before returning a structured contract.",
+            )
+
+        used_deterministic_fallback = False
+        if payload is None:
+            payload = self._fallback_document_payload(document_data, document_type)
+            used_deterministic_fallback = True
+            provenance = AgentRunProvenance(
+                agent_id=AgentType.DOCUMENT_VALIDATOR.value,
+                status="completed",
+                started_at=provenance.started_at,
+                completed_at=self._timestamp(),
+                model="deterministic-fallback",
+                tools=provenance.tools,
+                response_preview=provenance.response_preview,
+                structured_output=payload,
+                error=provenance.error,
+            )
 
         gaps: list[VerificationGap] = []
         fields: Dict[str, Any] = {}
@@ -467,7 +572,12 @@ Return only JSON with this exact shape:
                 )
             )
 
-        if provenance.status == "failed":
+        if used_deterministic_fallback:
+            warnings.append(
+                "Document extraction used deterministic fallback because the primary document-validator contract was unavailable."
+            )
+
+        if provenance.status == "failed" and not used_deterministic_fallback:
             gaps.append(
                 self._gap(
                     "document",
@@ -490,7 +600,7 @@ Return only JSON with this exact shape:
 
             raw_warnings = payload.get("warnings")
             if isinstance(raw_warnings, list):
-                warnings = [str(item) for item in raw_warnings]
+                warnings.extend(str(item) for item in raw_warnings)
 
             raw_confidence = payload.get("confidence")
             if isinstance(raw_confidence, (int, float)):

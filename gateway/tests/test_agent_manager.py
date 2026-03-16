@@ -90,6 +90,19 @@ def test_build_document_source_hashes_uploaded_bytes() -> None:
     assert source.hash_matches_submission is False
 
 
+def test_build_mcp_servers_normalizes_prefixed_server_names() -> None:
+    manager = AgentManager()
+
+    servers = manager._build_mcp_servers(
+        ["mcp://document-processor", "pattern-analyzer", "mcp://compliance-rules/check_dpdp"]
+    )
+
+    assert "document-processor" in servers
+    assert "pattern-analyzer" in servers
+    assert "compliance-rules" in servers
+    assert all(name.startswith("mcp://") is False for name in servers)
+
+
 def test_validate_document_uses_uploaded_source_metadata() -> None:
     manager = AgentManager()
     verification = AadhaarVerificationData(
@@ -138,6 +151,44 @@ def test_validate_document_uses_uploaded_source_metadata() -> None:
     assert evidence.source.file_name == "aadhaar.pdf"
     assert evidence.source.sha256 is not None
     assert all(gap.code != "primary_document_missing" for gap in evidence.gaps)
+
+
+def test_validate_document_falls_back_to_deterministic_contract_when_agent_returns_none() -> None:
+    manager = AgentManager()
+    verification = AadhaarVerificationData(
+        name="Alice Example",
+        dob="1990-01-01",
+        uid="123456789012",
+        consent_provided=True,
+    )
+    source = manager.build_document_source(
+        "upload",
+        b"UIDAI\nAlice Example\n01/01/1990\n1234 5678 9012",
+        file_name="aadhaar.txt",
+        content_type="text/plain",
+    )
+
+    async def fake_invoke_agent(*args, **kwargs):
+        del args, kwargs
+        return None, _provenance("document-validator", status="missing_contract")
+
+    manager.invoke_agent = fake_invoke_agent  # type: ignore[method-assign]
+
+    evidence = asyncio.run(
+        manager.validate_document(
+            b"UIDAI\nAlice Example\n01/01/1990\n1234 5678 9012",
+            "aadhaar",
+            verification,
+            source,
+        )
+    )
+
+    assert evidence.provenance.status == "completed"
+    assert evidence.provenance.model == "deterministic-fallback"
+    assert evidence.input_kind == "raw_document"
+    assert evidence.extracted_fields["uid"] == "123456789012"
+    assert any("deterministic fallback" in warning.lower() for warning in evidence.warnings)
+    assert all(gap.code != "document_contract_missing" for gap in evidence.gaps)
 
 
 def test_build_metadata_only_approves_complete_evidence_contract() -> None:
