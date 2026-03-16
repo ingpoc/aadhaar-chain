@@ -1,11 +1,12 @@
 """Routes for identity operations with agent integration."""
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from typing import Optional
 
 from app.models import (
     IdentityData,
     CreateIdentityRequest,
     CreateIdentityResponse,
+    DocumentEvidenceSource,
     UpdateIdentityRequest,
     VerificationStatus,
     VerificationStep,
@@ -32,9 +33,25 @@ router = APIRouter(prefix="/api/identity", tags=["identity"])
 async def create_aadhaar_verification(
     background_tasks: BackgroundTasks,
     wallet_address: str,
-    data: AadhaarVerificationData
+    document: UploadFile = File(...),
+    name: str = Form(...),
+    dob: str = Form(...),
+    uid: str = Form(...),
+    address: Optional[str] = Form(default=None),
+    document_hash: Optional[str] = Form(default=None),
+    consent_provided: bool = Form(default=False),
 ):
     """Create Aadhaar card verification request and start agent workflow."""
+    data = AadhaarVerificationData(
+        name=name,
+        dob=dob,
+        uid=uid,
+        address=address,
+        document_hash=document_hash,
+        consent_provided=consent_provided,
+    )
+    document_data, document_source = await _read_uploaded_document(document, document_hash)
+
     verification_id = await agent_manager.create_verification(
         wallet_address,
         "aadhaar",
@@ -44,8 +61,9 @@ async def create_aadhaar_verification(
         agent_manager.orchestrate_verification,
         wallet_address,
         "aadhaar",
-        data.model_dump_json().encode("utf-8"),
+        document_data,
         data,
+        document_source,
     )
     
     return ApiResponse(
@@ -62,9 +80,21 @@ async def create_aadhaar_verification(
 async def create_pan_verification(
     background_tasks: BackgroundTasks,
     wallet_address: str,
-    data: PanVerificationData
+    document: UploadFile = File(...),
+    name: str = Form(...),
+    pan_number: str = Form(...),
+    dob: str = Form(...),
+    document_hash: Optional[str] = Form(default=None),
 ):
     """Create PAN card verification request and start agent workflow."""
+    data = PanVerificationData(
+        name=name,
+        pan_number=pan_number,
+        dob=dob,
+        document_hash=document_hash,
+    )
+    document_data, document_source = await _read_uploaded_document(document, document_hash)
+
     verification_id = await agent_manager.create_verification(
         wallet_address,
         "pan",
@@ -74,8 +104,9 @@ async def create_pan_verification(
         agent_manager.orchestrate_verification,
         wallet_address,
         "pan",
-        data.model_dump_json().encode("utf-8"),
+        document_data,
         data,
+        document_source,
     )
     
     return ApiResponse(
@@ -258,3 +289,22 @@ def _get_timestamp() -> str:
 def _build_did(wallet_address: str) -> str:
     """Build a stable DID-like identifier from the wallet address."""
     return f"did:solana:{wallet_address}"
+
+
+async def _read_uploaded_document(
+    document: UploadFile,
+    submitted_hash: Optional[str],
+) -> tuple[bytes, DocumentEvidenceSource]:
+    """Read uploaded document bytes and build a stable source descriptor."""
+    document_data = await document.read()
+    if not document_data:
+        raise HTTPException(status_code=400, detail="Document file is required")
+
+    document_source = agent_manager.build_document_source(
+        "upload",
+        document_data,
+        file_name=document.filename,
+        content_type=document.content_type,
+        submitted_hash=submitted_hash,
+    )
+    return document_data, document_source

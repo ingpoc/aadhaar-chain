@@ -48,6 +48,22 @@ Identity verification platform using Solana blockchain + Claude Agent SDK + MCP 
    - Local `mcp/` needed package-safe loading because the top-level `mcp` name can collide with installed packages.
    - `pytest` required `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` in this environment because a globally loaded `anchorpy` plugin depends on `pytest_xprocess`.
 
+### 2026-03-17 Primary Evidence Ingestion
+1. **Verification requests must upload primary document bytes**
+   - Decision: Switched Aadhaar and PAN verification submission from JSON-only requests to multipart uploads carrying the file plus structured claims.
+   - Reasoning: The backend trust contract cannot distinguish real evidence from self-asserted claims if the uploaded document never crosses the API boundary.
+   - Outcome: `gateway/app/routes.py` now reads uploaded files, computes source metadata, and passes raw bytes into `agent_manager.orchestrate_verification`.
+
+2. **Backend computes the evidence fingerprint**
+   - Decision: The gateway now computes a SHA-256 digest and records file name, content type, size, and optional submitted-hash match status in the document evidence contract.
+   - Reasoning: Trustworthy provenance should be based on observed backend input, not only on a client-provided hash field.
+   - Outcome: `VerificationMetadata.document.source` exposes stable upload provenance to both tests and the UI.
+
+3. **Successful ingestion still allows manual review**
+   - Decision: Browser validation now treats `raw_document` plus upload provenance as the success criterion for ingestion, even when the downstream document agent still returns `missing_contract`.
+   - Reasoning: Evidence transport and agent extraction are separate concerns; this branch fixes the former and makes the remaining agent gap explicit.
+   - Outcome: Aadhaar and PAN both render `Document input: raw_document` with upload metadata and computed SHA-256 in the live browser while still falling back to `manual_review` for missing structured extraction output.
+
 ### Architecture Decisions
 1. **Tech Stack**
    - Frontend: Next.js 15, TypeScript, Tailwind CSS, shadcn/ui

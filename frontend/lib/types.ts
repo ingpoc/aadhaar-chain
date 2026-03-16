@@ -34,6 +34,7 @@ export interface AadhaarVerificationData {
   dob: string;
   uid: string;
   address?: string;
+  documentFile: File;
   documentHash?: string;
   consentProvided: boolean;
 }
@@ -42,7 +43,18 @@ export interface PanVerificationData {
   name: string;
   panNumber: string;
   dob: string;
+  documentFile: File;
   documentHash?: string;
+}
+
+export interface DocumentEvidenceSource {
+  transport: 'upload' | 'request_payload' | 'unknown';
+  fileName?: string;
+  contentType?: string;
+  sizeBytes?: number;
+  sha256?: string;
+  submittedHash?: string;
+  hashMatchesSubmission?: boolean;
 }
 
 export interface VerificationResponse {
@@ -81,6 +93,7 @@ export interface AgentRunProvenance {
 export interface DocumentVerificationEvidence {
   documentType: 'aadhaar' | 'pan';
   inputKind: 'raw_document' | 'request_payload' | 'unknown';
+  source?: DocumentEvidenceSource;
   extractedFields: Record<string, unknown>;
   submittedClaims: Record<string, unknown>;
   confidence?: number;

@@ -96,6 +96,10 @@ export default function VerifyPanPage() {
       setError('Please provide your name and date of birth');
       return;
     }
+    if (!file) {
+      setError('Please upload a PAN document before submitting');
+      return;
+    }
 
     setError('');
 
@@ -104,6 +108,7 @@ export default function VerifyPanPage() {
         name: name.trim(),
         panNumber,
         dob,
+        documentFile: file,
       });
 
       setVerificationId(response.verificationId);
@@ -388,6 +393,24 @@ function EvidenceSummary({ status }: { status: VerificationStatus | null }) {
       <p className="font-medium">
         Evidence status: {metadata.evidenceStatus}
       </p>
+
+      {metadata.document.source && (
+        <div className="space-y-1 text-muted-foreground">
+          <p>Document transport: {metadata.document.source.transport}</p>
+          {metadata.document.source.fileName && (
+            <p>Document file: {metadata.document.source.fileName}</p>
+          )}
+          {metadata.document.source.contentType && (
+            <p>Document content type: {metadata.document.source.contentType}</p>
+          )}
+          {typeof metadata.document.source.sizeBytes === 'number' && (
+            <p>Document size: {metadata.document.source.sizeBytes} bytes</p>
+          )}
+          {metadata.document.source.sha256 && (
+            <p>Document sha256: {metadata.document.source.sha256}</p>
+          )}
+        </div>
+      )}
 
       {metadata.blockingGaps.length > 0 && (
         <div className="space-y-1">

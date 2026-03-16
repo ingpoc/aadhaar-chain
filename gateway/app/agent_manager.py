@@ -9,6 +9,7 @@ from enum import Enum
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -30,6 +31,7 @@ from app.models import (
     AgentRunProvenance,
     AgentToolTrace,
     ComplianceVerificationEvidence,
+    DocumentEvidenceSource,
     DocumentVerificationEvidence,
     FraudVerificationEvidence,
     PanVerificationData,
@@ -200,6 +202,42 @@ class AgentManager:
             return {}
         return decoded if isinstance(decoded, dict) else {}
 
+    def _normalize_hash(self, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if normalized.startswith("sha256:"):
+            normalized = normalized.split(":", 1)[1]
+        return normalized.lower()
+
+    def build_document_source(
+        self,
+        transport: str,
+        document_data: bytes,
+        *,
+        file_name: Optional[str] = None,
+        content_type: Optional[str] = None,
+        submitted_hash: Optional[str] = None,
+    ) -> DocumentEvidenceSource:
+        """Build a stable source descriptor for primary document evidence."""
+        digest = hashlib.sha256(document_data).hexdigest() if document_data else None
+        normalized_submitted_hash = self._normalize_hash(submitted_hash)
+        hash_matches_submission: Optional[bool] = None
+        if digest is not None and normalized_submitted_hash is not None:
+            hash_matches_submission = normalized_submitted_hash == digest
+
+        return DocumentEvidenceSource(
+            transport=transport,  # type: ignore[arg-type]
+            file_name=file_name,
+            content_type=content_type,
+            size_bytes=len(document_data),
+            sha256=f"sha256:{digest}" if digest else None,
+            submitted_hash=submitted_hash,
+            hash_matches_submission=hash_matches_submission,
+        )
+
     def _build_mcp_servers(
         self,
         server_names: list[str],
@@ -366,6 +404,7 @@ class AgentManager:
         document_data: bytes,
         document_type: str,
         verification_data: Optional[AadhaarVerificationData | PanVerificationData],
+        document_source: Optional[DocumentEvidenceSource] = None,
     ) -> DocumentVerificationEvidence:
         """Validate document using Document Validator agent when primary evidence exists."""
         input_kind = self._detect_input_kind(document_data)
@@ -381,6 +420,7 @@ class AgentManager:
             return DocumentVerificationEvidence(
                 document_type=document_type,  # type: ignore[arg-type]
                 input_kind=input_kind,  # type: ignore[arg-type]
+                source=document_source,
                 extracted_fields={},
                 submitted_claims=submitted_claims,
                 warnings=["Submitted form claims are not treated as verified document evidence."],
@@ -417,6 +457,15 @@ Return only JSON with this exact shape:
         fields: Dict[str, Any] = {}
         warnings: list[str] = []
         confidence: Optional[float] = None
+
+        if document_source and document_source.hash_matches_submission is False:
+            gaps.append(
+                self._gap(
+                    "document",
+                    "document_hash_mismatch",
+                    "Submitted document hash does not match the primary document bytes received by the backend.",
+                )
+            )
 
         if provenance.status == "failed":
             gaps.append(
@@ -478,6 +527,7 @@ Return only JSON with this exact shape:
         return DocumentVerificationEvidence(
             document_type=document_type,  # type: ignore[arg-type]
             input_kind="raw_document",
+            source=document_source,
             extracted_fields=fields,
             submitted_claims=submitted_claims,
             confidence=confidence,
@@ -793,6 +843,7 @@ Return only JSON with this exact shape:
         document_type: str,
         document_data: bytes,
         verification_data: Optional[AadhaarVerificationData | PanVerificationData],
+        document_source: Optional[DocumentEvidenceSource] = None,
     ) -> VerificationStatus:
         """Orchestrate the complete verification workflow."""
         verification_id = f"{document_type}_{wallet_address}"
@@ -802,7 +853,12 @@ Return only JSON with this exact shape:
             self.verification_records[verification_id] = status
 
         self._record_step(status, VerificationStep.parsing, 0.2)
-        document = await self.validate_document(document_data, document_type, verification_data)
+        document = await self.validate_document(
+            document_data,
+            document_type,
+            verification_data,
+            document_source,
+        )
 
         self._record_step(status, VerificationStep.fraud_check, 0.4)
         fraud = await self.detect_fraud(document, document_type)

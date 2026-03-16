@@ -70,6 +70,76 @@ def test_orchestrate_verification_requires_manual_review_without_primary_documen
     assert any(gap.code == "primary_document_missing" for gap in status.metadata.blocking_gaps)
 
 
+def test_build_document_source_hashes_uploaded_bytes() -> None:
+    manager = AgentManager()
+
+    source = manager.build_document_source(
+        "upload",
+        b"fake-pdf-bytes",
+        file_name="aadhaar.pdf",
+        content_type="application/pdf",
+        submitted_hash="sha256:deadbeef",
+    )
+
+    assert source.transport == "upload"
+    assert source.file_name == "aadhaar.pdf"
+    assert source.content_type == "application/pdf"
+    assert source.size_bytes == len(b"fake-pdf-bytes")
+    assert source.sha256 is not None
+    assert source.submitted_hash == "sha256:deadbeef"
+    assert source.hash_matches_submission is False
+
+
+def test_validate_document_uses_uploaded_source_metadata() -> None:
+    manager = AgentManager()
+    verification = AadhaarVerificationData(
+        name="Alice Example",
+        dob="1990-01-01",
+        uid="123456789012",
+        consent_provided=True,
+    )
+    source = manager.build_document_source(
+        "upload",
+        b"%PDF-1.4 test document",
+        file_name="aadhaar.pdf",
+        content_type="application/pdf",
+    )
+
+    async def fake_invoke_agent(*args, **kwargs):
+        del args, kwargs
+        return (
+            {
+                "document_type": "aadhaar",
+                "fields": {
+                    "name": "Alice Example",
+                    "dob": "1990-01-01",
+                    "uid": "123456789012",
+                },
+                "confidence": 0.96,
+                "warnings": [],
+            },
+            _provenance("document-validator"),
+        )
+
+    manager.invoke_agent = fake_invoke_agent  # type: ignore[method-assign]
+
+    evidence = asyncio.run(
+        manager.validate_document(
+            b"%PDF-1.4 test document",
+            "aadhaar",
+            verification,
+            source,
+        )
+    )
+
+    assert evidence.input_kind == "raw_document"
+    assert evidence.source is not None
+    assert evidence.source.transport == "upload"
+    assert evidence.source.file_name == "aadhaar.pdf"
+    assert evidence.source.sha256 is not None
+    assert all(gap.code != "primary_document_missing" for gap in evidence.gaps)
+
+
 def test_build_metadata_only_approves_complete_evidence_contract() -> None:
     manager = AgentManager()
     document = DocumentVerificationEvidence(

@@ -7,6 +7,7 @@ import type {
   AgentRunProvenance,
   AgentToolTrace,
   ComplianceVerificationEvidence,
+  DocumentEvidenceSource,
   DocumentVerificationEvidence,
   FraudVerificationEvidence,
   VerificationGap,
@@ -80,6 +81,7 @@ interface BackendAgentRunProvenance {
 interface BackendDocumentVerificationEvidence {
   document_type: DocumentVerificationEvidence['documentType'];
   input_kind: DocumentVerificationEvidence['inputKind'];
+  source?: BackendDocumentEvidenceSource;
   extracted_fields: Record<string, unknown>;
   submitted_claims: Record<string, unknown>;
   confidence?: number;
@@ -88,6 +90,16 @@ interface BackendDocumentVerificationEvidence {
   missing_fields: string[];
   provenance: BackendAgentRunProvenance;
   gaps: BackendVerificationGap[];
+}
+
+interface BackendDocumentEvidenceSource {
+  transport: DocumentEvidenceSource['transport'];
+  file_name?: string;
+  content_type?: string;
+  size_bytes?: number;
+  sha256?: string;
+  submitted_hash?: string;
+  hash_matches_submission?: boolean;
 }
 
 interface BackendFraudVerificationEvidence {
@@ -232,6 +244,17 @@ function toDocumentVerificationEvidence(
   return {
     documentType: evidence.document_type,
     inputKind: evidence.input_kind,
+    source: evidence.source
+      ? {
+          transport: evidence.source.transport,
+          fileName: evidence.source.file_name,
+          contentType: evidence.source.content_type,
+          sizeBytes: evidence.source.size_bytes,
+          sha256: evidence.source.sha256,
+          submittedHash: evidence.source.submitted_hash,
+          hashMatchesSubmission: evidence.source.hash_matches_submission,
+        }
+      : undefined,
     extractedFields: evidence.extracted_fields,
     submittedClaims: evidence.submitted_claims,
     confidence: evidence.confidence,
@@ -341,15 +364,26 @@ export const verificationApi = {
     walletAddress: string,
     verificationData: AadhaarVerificationData
   ): Promise<VerificationResponse> {
+    const formData = new FormData();
+    formData.append('document', verificationData.documentFile);
+    formData.append('name', verificationData.name);
+    formData.append('dob', verificationData.dob);
+    formData.append('uid', verificationData.uid);
+    formData.append('consent_provided', String(verificationData.consentProvided));
+    if (verificationData.address) {
+      formData.append('address', verificationData.address);
+    }
+    if (verificationData.documentHash) {
+      formData.append('document_hash', verificationData.documentHash);
+    }
+
     const { data } = await apiClient.post<ApiResponse<BackendVerificationResponse>>(
       `/api/identity/${walletAddress}/aadhaar`,
+      formData,
       {
-        name: verificationData.name,
-        dob: verificationData.dob,
-        uid: verificationData.uid,
-        address: verificationData.address,
-        document_hash: verificationData.documentHash,
-        consent_provided: verificationData.consentProvided,
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        },
       }
     );
     if (!data.data) throw new Error(data.error?.message || 'Failed to submit verification');
@@ -361,13 +395,22 @@ export const verificationApi = {
     walletAddress: string,
     verificationData: PanVerificationData
   ): Promise<VerificationResponse> {
+    const formData = new FormData();
+    formData.append('document', verificationData.documentFile);
+    formData.append('name', verificationData.name);
+    formData.append('pan_number', verificationData.panNumber);
+    formData.append('dob', verificationData.dob);
+    if (verificationData.documentHash) {
+      formData.append('document_hash', verificationData.documentHash);
+    }
+
     const { data } = await apiClient.post<ApiResponse<BackendVerificationResponse>>(
       `/api/identity/${walletAddress}/pan`,
+      formData,
       {
-        name: verificationData.name,
-        pan_number: verificationData.panNumber,
-        dob: verificationData.dob,
-        document_hash: verificationData.documentHash,
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        },
       }
     );
     if (!data.data) throw new Error(data.error?.message || 'Failed to submit verification');

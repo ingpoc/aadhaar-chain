@@ -98,6 +98,10 @@ export default function VerifyAadhaarPage() {
       setError('Please provide your name and date of birth');
       return;
     }
+    if (!file) {
+      setError('Please upload an Aadhaar document before submitting');
+      return;
+    }
     if (!consent) {
       setError('You must accept the consent terms before submitting verification');
       return;
@@ -111,6 +115,7 @@ export default function VerifyAadhaarPage() {
         dob,
         uid: aadhaarNumber,
         address: address.trim() || undefined,
+        documentFile: file,
         consentProvided: consent,
       });
 
@@ -413,10 +418,28 @@ function EvidenceSummary({ status }: { status: VerificationStatus | null }) {
   }
 
   return (
-    <div className="space-y-3 rounded-md border border-border/60 bg-background/80 p-4 text-sm">
+      <div className="space-y-3 rounded-md border border-border/60 bg-background/80 p-4 text-sm">
       <p className="font-medium">
         Evidence status: {metadata.evidenceStatus}
       </p>
+
+      {metadata.document.source && (
+        <div className="space-y-1 text-muted-foreground">
+          <p>Document transport: {metadata.document.source.transport}</p>
+          {metadata.document.source.fileName && (
+            <p>Document file: {metadata.document.source.fileName}</p>
+          )}
+          {metadata.document.source.contentType && (
+            <p>Document content type: {metadata.document.source.contentType}</p>
+          )}
+          {typeof metadata.document.source.sizeBytes === 'number' && (
+            <p>Document size: {metadata.document.source.sizeBytes} bytes</p>
+          )}
+          {metadata.document.source.sha256 && (
+            <p>Document sha256: {metadata.document.source.sha256}</p>
+          )}
+        </div>
+      )}
 
       {metadata.blockingGaps.length > 0 && (
         <div className="space-y-1">

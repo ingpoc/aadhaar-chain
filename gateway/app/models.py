@@ -78,10 +78,22 @@ class AgentRunProvenance(BaseModel):
     error: Optional[str] = None
 
 
+class DocumentEvidenceSource(BaseModel):
+    """Descriptor for the primary document evidence observed by the backend."""
+    transport: Literal["upload", "request_payload", "unknown"]
+    file_name: Optional[str] = None
+    content_type: Optional[str] = None
+    size_bytes: Optional[int] = None
+    sha256: Optional[str] = None
+    submitted_hash: Optional[str] = None
+    hash_matches_submission: Optional[bool] = None
+
+
 class DocumentVerificationEvidence(BaseModel):
     """Evidence contract for the document parsing stage."""
     document_type: Literal["aadhaar", "pan"]
     input_kind: Literal["raw_document", "request_payload", "unknown"]
+    source: Optional[DocumentEvidenceSource] = None
     extracted_fields: Dict[str, Any] = Field(default_factory=dict)
     submitted_claims: Dict[str, Any] = Field(default_factory=dict)
     confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
