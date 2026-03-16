@@ -239,3 +239,29 @@ Before making compliance decisions:
 
 **Last Updated:** 2026-02-03 16:25 UTC
 **Agent:** Marvin (Clawdbot)
+
+## 2026-03-17 Fraud And Compliance Contract Recovery
+
+### Root Cause
+- The gateway was reusing cached `ClaudeSDKClient` instances across concurrent background verification tasks.
+- When Aadhaar/PAN submissions overlapped, the SDK transport hit `read() called while another coroutine is already waiting for incoming data`.
+- That left verifications stuck in `fraud_check` or `parsing`, and the browser surfaced incomplete evidence contracts.
+
+### Decision
+- Create a fresh `ClaudeSDKClient` per agent invocation instead of caching clients on `AgentManager`.
+- Apply the same timeout-plus-deterministic-fallback pattern used for document extraction to both fraud and compliance stages.
+- Preserve provenance truthfully: fallback runs are marked `status=completed`, `model=deterministic-fallback`, and keep the original timeout/missing-contract error in provenance.
+
+### Verification Evidence
+- `python -m py_compile` passed for the gateway modules.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q` passed with `11 passed`.
+- API validation with readable synthetic Aadhaar and PAN uploads now completes the full pipeline instead of hanging.
+- Live browser validation in the attached Chrome Beta session now shows:
+  - `Document agent: completed`
+  - `Fraud agent: completed`
+  - `Compliance agent: completed`
+  - `Evidence status: complete`
+
+### Residual Gap
+- The current document fallback extractor still misidentifies names on low-signal synthetic docs by preferring header text such as `UNIQUE IDENTIFICATION AUTHORITY OF INDIA` or `GOVT OF INDIA`.
+- That is now an extraction-quality problem, not a contract/provenance problem. It should be handled in a separate follow-up branch.

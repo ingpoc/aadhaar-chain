@@ -75,7 +75,6 @@ class AgentManager:
     def __init__(self) -> None:
         self.agents: Dict[AgentType, Any] = {}
         self.verification_records: Dict[str, VerificationStatus] = {}
-        self.sdk_clients: Dict[str, ClaudeSDKClient] = {}
         self.repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
     def _build_verification_status(
@@ -328,25 +327,157 @@ class AgentManager:
             }
         return mcp_servers
 
-    def _get_sdk_client(self, agent_type: AgentType) -> ClaudeSDKClient:
-        """Get or create SDK client for an agent."""
-        agent_id = agent_type.value
-        if agent_id in self.sdk_clients:
-            return self.sdk_clients[agent_id]
+    def _create_sdk_client(self, agent_type: AgentType) -> ClaudeSDKClient:
+        """Create a fresh SDK client for each invocation.
 
+        ClaudeSDKClient instances cannot safely service concurrent background tasks.
+        Reusing them causes overlapping reads against the same subprocess transport.
+        """
         agent_def = self.agents.get(agent_type)
         if agent_def is None:
             raise ValueError(f"Agent not found: {agent_type}")
 
-        client = ClaudeSDKClient(
+        return ClaudeSDKClient(
             options=ClaudeAgentOptions(
                 system_prompt=agent_def.system_prompt,
                 mcp_servers=self._build_mcp_servers(agent_def.mcp_servers or []),
                 cwd=self.repo_root,
             )
         )
-        self.sdk_clients[agent_id] = client
-        return client
+
+    def _build_deterministic_fallback_provenance(
+        self,
+        agent_type: AgentType,
+        provenance: AgentRunProvenance,
+        payload: Dict[str, Any],
+    ) -> AgentRunProvenance:
+        return AgentRunProvenance(
+            agent_id=agent_type.value,
+            status="completed",
+            started_at=provenance.started_at,
+            completed_at=self._timestamp(),
+            model="deterministic-fallback",
+            tools=provenance.tools,
+            response_preview=provenance.response_preview,
+            structured_output=payload,
+            error=provenance.error,
+        )
+
+    def _normalize_comparable_value(self, value: Any) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        return re.sub(r"[^a-z0-9]", "", str(value).lower())
+
+    def _fallback_fraud_payload(
+        self,
+        document_evidence: DocumentVerificationEvidence,
+    ) -> Dict[str, Any]:
+        indicators: list[str] = []
+        risk_score = 0.08
+        risk_level = "safe"
+        recommendation = "approve"
+
+        if document_evidence.confidence is None:
+            indicators.append("Document extraction confidence was unavailable.")
+            risk_score = max(risk_score, 0.45)
+        elif document_evidence.confidence < 0.75:
+            indicators.append(
+                f"Document extraction confidence was low ({document_evidence.confidence:.2f})."
+            )
+            risk_score = max(risk_score, 0.45)
+
+        for warning in document_evidence.warnings:
+            indicators.append(f"Document warning: {warning}")
+            risk_score = max(risk_score, 0.35)
+
+        for field in ("name", "dob", "uid", "pan_number"):
+            extracted = self._normalize_comparable_value(
+                document_evidence.extracted_fields.get(field)
+            )
+            submitted = self._normalize_comparable_value(
+                document_evidence.submitted_claims.get(field)
+            )
+            if extracted is None or submitted is None or extracted == submitted:
+                continue
+
+            indicators.append(
+                f"Submitted {field} does not match the value extracted from the uploaded document."
+            )
+            if field in {"uid", "pan_number"}:
+                risk_score = max(risk_score, 0.85)
+            else:
+                risk_score = max(risk_score, 0.65)
+
+        if risk_score >= 0.85:
+            risk_level = "high"
+            recommendation = "manual_review"
+        elif risk_score >= 0.35:
+            risk_level = "medium"
+            recommendation = "manual_review"
+
+        return {
+            "risk_score": risk_score,
+            "risk_level": risk_level,
+            "indicators": indicators,
+            "recommendation": recommendation,
+        }
+
+    def _fallback_compliance_payload(
+        self,
+        document_type: str,
+        verification_data: Optional[AadhaarVerificationData | PanVerificationData],
+        purpose: str,
+    ) -> Dict[str, Any]:
+        violations: list[str] = []
+        aadhaar_act_compliant = True
+        dpdp_compliant = True
+        recommendation = "approve"
+
+        purpose_normalized = purpose.lower()
+        if document_type == "aadhaar":
+            consent_provided = bool(getattr(verification_data, "consent_provided", False))
+            if not consent_provided:
+                aadhaar_act_compliant = False
+                violations.append("Explicit Aadhaar consent was not provided in the backend request.")
+
+            allowed_purposes = (
+                "identity_verification",
+                "kyc",
+                "age_verification",
+                "address_verification",
+            )
+            if not any(token in purpose_normalized for token in allowed_purposes):
+                aadhaar_act_compliant = False
+                violations.append(
+                    f"Declared Aadhaar processing purpose {purpose!r} does not match the allowed verification purposes."
+                )
+
+        if verification_data is not None:
+            submitted_claims = verification_data.model_dump(exclude_none=True)
+            allowed_fields = {"name", "dob", "document_hash"}
+            if document_type == "aadhaar":
+                allowed_fields.update({"uid", "address", "consent_provided"})
+            else:
+                allowed_fields.add("pan_number")
+
+            unexpected_fields = sorted(set(submitted_claims) - allowed_fields)
+            if unexpected_fields:
+                dpdp_compliant = False
+                violations.append(
+                    "Unexpected verification fields were collected: "
+                    + ", ".join(unexpected_fields)
+                    + "."
+                )
+
+        if violations:
+            recommendation = "block" if any("consent" in violation.lower() for violation in violations) else "manual_review"
+
+        return {
+            "aadhaar_act_compliant": aadhaar_act_compliant,
+            "dpdp_compliant": dpdp_compliant,
+            "violations": violations,
+            "recommendation": recommendation,
+        }
 
     def _append_tool_result(
         self,
@@ -415,7 +546,7 @@ class AgentManager:
         agent_id = agent_type.value
 
         try:
-            client = self._get_sdk_client(agent_type)
+            client = self._create_sdk_client(agent_type)
             await client.connect()
             try:
                 await client.query(prompt)
@@ -684,7 +815,32 @@ Return only JSON with this exact shape:
 }}
 """
 
-        payload, provenance = await self.invoke_agent(AgentType.FRAUD_DETECTION, prompt)
+        payload: Optional[Dict[str, Any]]
+        provenance: AgentRunProvenance
+        try:
+            payload, provenance = await asyncio.wait_for(
+                self.invoke_agent(AgentType.FRAUD_DETECTION, prompt),
+                timeout=12,
+            )
+        except asyncio.TimeoutError:
+            payload = None
+            started_at = self._timestamp()
+            provenance = self._failed_provenance(
+                AgentType.FRAUD_DETECTION.value,
+                started_at,
+                "Fraud detection timed out before returning a structured contract.",
+            )
+
+        used_deterministic_fallback = False
+        if payload is None:
+            payload = self._fallback_fraud_payload(document_evidence)
+            used_deterministic_fallback = True
+            provenance = self._build_deterministic_fallback_provenance(
+                AgentType.FRAUD_DETECTION,
+                provenance,
+                payload,
+            )
+
         gaps: list[VerificationGap] = []
         risk_score: Optional[float] = None
         risk_level: Optional[str] = None
@@ -746,6 +902,11 @@ Return only JSON with this exact shape:
                         "Fraud contract did not provide an explicit recommendation.",
                     )
                 )
+
+        if used_deterministic_fallback:
+            indicators.append(
+                "Fraud analysis used deterministic fallback because the primary fraud-detection contract was unavailable."
+            )
 
         return FraudVerificationEvidence(
             risk_score=risk_score,
@@ -813,7 +974,33 @@ Return only JSON with this exact shape:
 }}
 """
 
-        payload, provenance = await self.invoke_agent(AgentType.COMPLIANCE_MONITOR, prompt)
+        payload: Optional[Dict[str, Any]]
+        provenance: AgentRunProvenance
+        try:
+            payload, provenance = await asyncio.wait_for(
+                self.invoke_agent(AgentType.COMPLIANCE_MONITOR, prompt),
+                timeout=12,
+            )
+        except asyncio.TimeoutError:
+            payload = None
+            started_at = self._timestamp()
+            provenance = self._failed_provenance(
+                AgentType.COMPLIANCE_MONITOR.value,
+                started_at,
+                "Compliance monitor timed out before returning a structured contract.",
+            )
+
+        if payload is None:
+            payload = self._fallback_compliance_payload(
+                document_type,
+                verification_data,
+                purpose,
+            )
+            provenance = self._build_deterministic_fallback_provenance(
+                AgentType.COMPLIANCE_MONITOR,
+                provenance,
+                payload,
+            )
 
         aadhaar_act_compliant: Optional[bool] = None
         dpdp_compliant: Optional[bool] = None

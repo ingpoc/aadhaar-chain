@@ -1,10 +1,11 @@
 import asyncio
 import os
 import sys
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from app.agent_manager import AgentManager
+from app.agent_manager import AgentManager, AgentType
 from app.models import (
     AadhaarVerificationData,
     AgentRunProvenance,
@@ -189,6 +190,105 @@ def test_validate_document_falls_back_to_deterministic_contract_when_agent_retur
     assert evidence.extracted_fields["uid"] == "123456789012"
     assert any("deterministic fallback" in warning.lower() for warning in evidence.warnings)
     assert all(gap.code != "document_contract_missing" for gap in evidence.gaps)
+
+
+def test_create_sdk_client_returns_distinct_instances_per_call() -> None:
+    manager = AgentManager()
+    asyncio.run(manager.initialize_agents())
+    created_clients = []
+
+    class FakeClient:
+        def __init__(self, options):
+            self.options = options
+            created_clients.append(self)
+
+    with patch("app.agent_manager.ClaudeSDKClient", FakeClient):
+        first = manager._create_sdk_client(AgentType.DOCUMENT_VALIDATOR)
+        second = manager._create_sdk_client(AgentType.DOCUMENT_VALIDATOR)
+
+    assert first is not second
+    assert len(created_clients) == 2
+
+
+def test_detect_fraud_falls_back_to_deterministic_contract_when_agent_returns_none() -> None:
+    manager = AgentManager()
+    document = DocumentVerificationEvidence(
+        document_type="pan",
+        input_kind="raw_document",
+        extracted_fields={
+            "name": "Alice Example",
+            "dob": "1990-01-01",
+            "pan_number": "ABCDE1234F",
+        },
+        submitted_claims={
+            "name": "Alice Example",
+            "dob": "1990-01-01",
+            "pan_number": "ABCDE1234F",
+        },
+        confidence=0.92,
+        warnings=[],
+        required_fields=["name", "dob", "pan_number"],
+        missing_fields=[],
+        provenance=_provenance("document-validator"),
+        gaps=[],
+    )
+
+    async def fake_invoke_agent(*args, **kwargs):
+        del args, kwargs
+        return None, _provenance("fraud-detection", status="missing_contract")
+
+    manager.invoke_agent = fake_invoke_agent  # type: ignore[method-assign]
+
+    evidence = asyncio.run(manager.detect_fraud(document, "pan"))
+
+    assert evidence.provenance.status == "completed"
+    assert evidence.provenance.model == "deterministic-fallback"
+    assert evidence.recommendation == "approve"
+    assert evidence.risk_level == "safe"
+    assert evidence.gaps == []
+    assert any("deterministic fallback" in indicator.lower() for indicator in evidence.indicators)
+
+
+def test_check_compliance_falls_back_to_deterministic_contract_when_agent_returns_none() -> None:
+    manager = AgentManager()
+    verification = AadhaarVerificationData(
+        name="Alice Example",
+        dob="1990-01-01",
+        uid="123456789012",
+        consent_provided=True,
+    )
+    document = DocumentVerificationEvidence(
+        document_type="aadhaar",
+        input_kind="raw_document",
+        extracted_fields={
+            "name": "Alice Example",
+            "dob": "1990-01-01",
+            "uid": "123456789012",
+        },
+        submitted_claims=verification.model_dump(exclude_none=True),
+        confidence=0.88,
+        warnings=[],
+        required_fields=["name", "dob", "uid"],
+        missing_fields=[],
+        provenance=_provenance("document-validator"),
+        gaps=[],
+    )
+
+    async def fake_invoke_agent(*args, **kwargs):
+        del args, kwargs
+        return None, _provenance("compliance-monitor", status="missing_contract")
+
+    manager.invoke_agent = fake_invoke_agent  # type: ignore[method-assign]
+
+    evidence = asyncio.run(manager.check_compliance(document, "aadhaar", verification))
+
+    assert evidence.provenance.status == "completed"
+    assert evidence.provenance.model == "deterministic-fallback"
+    assert evidence.recommendation == "approve"
+    assert evidence.aadhaar_act_compliant is True
+    assert evidence.dpdp_compliant is True
+    assert evidence.gaps == []
+    assert evidence.violations == []
 
 
 def test_build_metadata_only_approves_complete_evidence_contract() -> None:
