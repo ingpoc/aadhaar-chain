@@ -10,7 +10,7 @@ from enum import Enum
 class ApiResponse(BaseModel):
     """Wrapper for consistent API responses."""
     success: bool = True
-    message: str
+    message: str = ""
     data: Optional[Dict[str, Any]] = None
     error: Optional[Dict[str, Any]] = None
 
@@ -49,17 +49,93 @@ class VerificationStepDetail(BaseModel):
     status: StepStatus
 
 
+class VerificationGap(BaseModel):
+    """Explicit missing evidence or provenance in the verification chain."""
+    code: str
+    stage: Literal["document", "fraud", "compliance", "decision"]
+    message: str
+    blocking: bool = True
+
+
+class AgentToolTrace(BaseModel):
+    """Observed tool usage during an agent run."""
+    tool_name: str
+    status: Literal["requested", "completed", "failed"]
+    output_preview: Optional[str] = None
+
+
+class AgentRunProvenance(BaseModel):
+    """Stable provenance contract for each agent invocation."""
+    agent_id: str
+    status: Literal["completed", "missing_contract", "failed"]
+    started_at: str
+    completed_at: str
+    model: Optional[str] = None
+    session_id: Optional[str] = None
+    tools: List[AgentToolTrace] = Field(default_factory=list)
+    response_preview: Optional[str] = None
+    structured_output: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+class DocumentVerificationEvidence(BaseModel):
+    """Evidence contract for the document parsing stage."""
+    document_type: Literal["aadhaar", "pan"]
+    input_kind: Literal["raw_document", "request_payload", "unknown"]
+    extracted_fields: Dict[str, Any] = Field(default_factory=dict)
+    submitted_claims: Dict[str, Any] = Field(default_factory=dict)
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    warnings: List[str] = Field(default_factory=list)
+    required_fields: List[str] = Field(default_factory=list)
+    missing_fields: List[str] = Field(default_factory=list)
+    provenance: AgentRunProvenance
+    gaps: List[VerificationGap] = Field(default_factory=list)
+
+
+class FraudVerificationEvidence(BaseModel):
+    """Evidence contract for the fraud stage."""
+    risk_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    risk_level: Optional[str] = None
+    indicators: List[str] = Field(default_factory=list)
+    recommendation: Optional[Literal["approve", "manual_review", "block"]] = None
+    provenance: AgentRunProvenance
+    gaps: List[VerificationGap] = Field(default_factory=list)
+
+
+class ComplianceVerificationEvidence(BaseModel):
+    """Evidence contract for the compliance stage."""
+    aadhaar_act_compliant: Optional[bool] = None
+    dpdp_compliant: Optional[bool] = None
+    violations: List[str] = Field(default_factory=list)
+    recommendation: Optional[Literal["approve", "manual_review", "block"]] = None
+    provenance: AgentRunProvenance
+    gaps: List[VerificationGap] = Field(default_factory=list)
+
+
+class VerificationMetadata(BaseModel):
+    """Typed verification metadata returned to the frontend."""
+    decision: Literal["approve", "reject", "manual_review"]
+    reason: str
+    evidence_status: Literal["complete", "partial", "missing"]
+    document: DocumentVerificationEvidence
+    fraud: FraudVerificationEvidence
+    compliance: ComplianceVerificationEvidence
+    blocking_gaps: List[VerificationGap] = Field(default_factory=list)
+    assumptions: List[str] = Field(default_factory=list)
+
+
 class VerificationStatus(BaseModel):
     """Status of verification process."""
     verification_id: str
     wallet_address: str
-    status: Literal["pending", "processing", "verified", "failed"]
+    status: Literal["pending", "processing", "verified", "failed", "manual_review"]
     current_step: Optional[VerificationStep] = None
-    steps: List[VerificationStepDetail] = []
+    steps: List[VerificationStepDetail] = Field(default_factory=list)
     progress: float = Field(default=0.0, ge=0.0, le=1.0)
     created_at: str
     updated_at: str
     error: Optional[str] = None
+    metadata: Optional[VerificationMetadata] = None
 
 
 # --- Identity Models ---
@@ -86,6 +162,12 @@ class CreateIdentityResponse(BaseModel):
     signature: Optional[str] = None
 
 
+class UpdateIdentityRequest(BaseModel):
+    """Request to update mutable identity fields."""
+    commitment: Optional[str] = None
+    verification_bitmap: Optional[int] = Field(default=None, ge=0)
+
+
 # --- Verification Request Models ---
 
 
@@ -96,6 +178,7 @@ class AadhaarVerificationData(BaseModel):
     uid: str
     address: Optional[str] = None
     document_hash: Optional[str] = None
+    consent_provided: bool = False
 
 
 class PanVerificationData(BaseModel):
@@ -116,7 +199,7 @@ class VerificationResponse(BaseModel):
     """Response after initiating verification."""
     success: bool
     verification_id: str
-    status: Literal["pending", "processing", "verified", "failed"]
+    status: Literal["document_received", "pending", "processing", "verified", "failed", "manual_review"]
     message: str
 
 
@@ -201,6 +284,6 @@ class SubmitTransactionRequest(BaseModel):
 class StatusUpdate(BaseModel):
     """Generic status update."""
     verification_id: str
-    status: Literal["pending", "processing", "verified", "failed"]
+    status: Literal["pending", "processing", "verified", "failed", "manual_review"]
     progress: Optional[float] = Field(None, ge=0.0, le=1.0)
     error: Optional[str] = None

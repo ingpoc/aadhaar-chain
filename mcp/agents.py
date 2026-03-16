@@ -1,5 +1,5 @@
 """Agent definitions for aadhaar-chain verification workflow."""
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 
 class AgentDefinition:

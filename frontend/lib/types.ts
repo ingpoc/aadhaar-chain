@@ -10,8 +10,8 @@ export interface Identity {
   owner: string;
   commitment: string;
   verificationBitmap: number;
-  createdAt: number;
-  updatedAt: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface CreateIdentityRequest {
@@ -20,7 +20,7 @@ export interface CreateIdentityRequest {
 
 export interface CreateIdentityResponse {
   identity: Identity;
-  signature: string;
+  signature?: string;
 }
 
 // Verification Types
@@ -30,33 +30,107 @@ export interface VerificationRequest {
 }
 
 export interface AadhaarVerificationData {
-  aadhaarNumber: string;
-  otp: string;
+  name: string;
+  dob: string;
+  uid: string;
+  address?: string;
   documentHash?: string;
+  consentProvided: boolean;
 }
 
 export interface PanVerificationData {
+  name: string;
   panNumber: string;
-  fullName: string;
-  dateOfBirth: string;
+  dob: string;
   documentHash?: string;
 }
 
 export interface VerificationResponse {
   success: boolean;
   verificationId: string;
-  status: 'pending' | 'processing' | 'verified' | 'failed';
+  status: 'document_received' | 'pending' | 'processing' | 'verified' | 'failed' | 'manual_review';
   message: string;
+}
+
+export interface VerificationGap {
+  code: string;
+  stage: 'document' | 'fraud' | 'compliance' | 'decision';
+  message: string;
+  blocking: boolean;
+}
+
+export interface AgentToolTrace {
+  toolName: string;
+  status: 'requested' | 'completed' | 'failed';
+  outputPreview?: string;
+}
+
+export interface AgentRunProvenance {
+  agentId: string;
+  status: 'completed' | 'missing_contract' | 'failed';
+  startedAt: string;
+  completedAt: string;
+  model?: string;
+  sessionId?: string;
+  tools: AgentToolTrace[];
+  responsePreview?: string;
+  structuredOutput?: Record<string, unknown>;
+  error?: string;
+}
+
+export interface DocumentVerificationEvidence {
+  documentType: 'aadhaar' | 'pan';
+  inputKind: 'raw_document' | 'request_payload' | 'unknown';
+  extractedFields: Record<string, unknown>;
+  submittedClaims: Record<string, unknown>;
+  confidence?: number;
+  warnings: string[];
+  requiredFields: string[];
+  missingFields: string[];
+  provenance: AgentRunProvenance;
+  gaps: VerificationGap[];
+}
+
+export interface FraudVerificationEvidence {
+  riskScore?: number;
+  riskLevel?: string;
+  indicators: string[];
+  recommendation?: 'approve' | 'manual_review' | 'block';
+  provenance: AgentRunProvenance;
+  gaps: VerificationGap[];
+}
+
+export interface ComplianceVerificationEvidence {
+  aadhaarActCompliant?: boolean;
+  dpdpCompliant?: boolean;
+  violations: string[];
+  recommendation?: 'approve' | 'manual_review' | 'block';
+  provenance: AgentRunProvenance;
+  gaps: VerificationGap[];
+}
+
+export interface VerificationMetadata {
+  decision: 'approve' | 'reject' | 'manual_review';
+  reason: string;
+  evidenceStatus: 'complete' | 'partial' | 'missing';
+  document: DocumentVerificationEvidence;
+  fraud: FraudVerificationEvidence;
+  compliance: ComplianceVerificationEvidence;
+  blockingGaps: VerificationGap[];
+  assumptions: string[];
 }
 
 export interface VerificationStatus {
   verificationId: string;
-  status: 'pending' | 'processing' | 'verified' | 'failed';
+  status: 'pending' | 'processing' | 'verified' | 'failed' | 'manual_review';
+  currentStep?: 'document_received' | 'parsing' | 'fraud_check' | 'compliance_check' | 'blockchain_upload' | 'complete';
   progress: number;
   steps: {
     name: string;
     status: 'pending' | 'in_progress' | 'completed' | 'failed';
   }[];
+  metadata?: VerificationMetadata;
+  decision?: 'approve' | 'reject' | 'manual_review';
   error?: string;
 }
 

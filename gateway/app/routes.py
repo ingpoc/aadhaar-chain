@@ -1,9 +1,12 @@
 """Routes for identity operations with agent integration."""
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from typing import Optional
 
 from app.models import (
     IdentityData,
+    CreateIdentityRequest,
+    CreateIdentityResponse,
+    UpdateIdentityRequest,
     VerificationStatus,
     VerificationStep,
     AadhaarVerificationData,
@@ -27,6 +30,7 @@ router = APIRouter(prefix="/api/identity", tags=["identity"])
 
 @router.post("/{wallet_address}/aadhaar", response_model=ApiResponse, tags=["identity"])
 async def create_aadhaar_verification(
+    background_tasks: BackgroundTasks,
     wallet_address: str,
     data: AadhaarVerificationData
 ):
@@ -35,6 +39,13 @@ async def create_aadhaar_verification(
         wallet_address,
         "aadhaar",
         data
+    )
+    background_tasks.add_task(
+        agent_manager.orchestrate_verification,
+        wallet_address,
+        "aadhaar",
+        data.model_dump_json().encode("utf-8"),
+        data,
     )
     
     return ApiResponse(
@@ -49,6 +60,7 @@ async def create_aadhaar_verification(
 
 @router.post("/{wallet_address}/pan", response_model=ApiResponse, tags=["identity"])
 async def create_pan_verification(
+    background_tasks: BackgroundTasks,
     wallet_address: str,
     data: PanVerificationData
 ):
@@ -57,6 +69,13 @@ async def create_pan_verification(
         wallet_address,
         "pan",
         data
+    )
+    background_tasks.add_task(
+        agent_manager.orchestrate_verification,
+        wallet_address,
+        "pan",
+        data.model_dump_json().encode("utf-8"),
+        data,
     )
     
     return ApiResponse(
@@ -118,7 +137,7 @@ async def verify_aadhaar_document(
             "verification_id": verification_id,
             "status": status.current_step.value,
             "progress": status.progress,
-            "decision": status.metadata.get("decision", "pending") if status.metadata else None,
+            "decision": status.metadata.decision if status.metadata else None,
         }
     )
 
@@ -153,7 +172,7 @@ async def verify_pan_document(
             "verification_id": verification_id,
             "status": status.current_step.value,
             "progress": status.progress,
-            "decision": status.metadata.get("decision", "pending") if status.metadata else None,
+            "decision": status.metadata.decision if status.metadata else None,
         }
     )
 
@@ -167,14 +186,7 @@ async def get_identity(
 ):
     """Get identity data for wallet address."""
     if wallet_address not in identities:
-        # Create new identity if not exists
-        identities[wallet_address] = IdentityData(
-            did=f"did:{wallet_address}",
-            wallet_address=wallet_address,
-            verification_bitmap=0,
-            created_at=_get_timestamp(),
-            updated_at=_get_timestamp(),
-        )
+        raise HTTPException(status_code=404, detail="Identity not found")
     
     return ApiResponse(
         success=True,
@@ -183,24 +195,54 @@ async def get_identity(
 
 
 @router.post("/{wallet_address}", response_model=ApiResponse, tags=["identity"])
+async def create_identity(
+    wallet_address: str,
+    data: CreateIdentityRequest,
+):
+    """Create a new identity anchor for the wallet address."""
+    if wallet_address in identities:
+        raise HTTPException(status_code=409, detail="Identity already exists")
+
+    identity = IdentityData(
+        did=_build_did(wallet_address),
+        owner=wallet_address,
+        commitment=data.commitment,
+        verification_bitmap=0,
+        created_at=_get_timestamp(),
+        updated_at=_get_timestamp(),
+    )
+    identities[wallet_address] = identity
+
+    return ApiResponse(
+        success=True,
+        message="Identity created",
+        data=CreateIdentityResponse(identity=identity).model_dump()
+    )
+
+
+@router.patch("/{wallet_address}", response_model=ApiResponse, tags=["identity"])
 async def update_identity(
     wallet_address: str,
-    data: dict,
+    data: UpdateIdentityRequest,
 ):
     """Update identity data for wallet address."""
     if wallet_address not in identities:
         raise HTTPException(status_code=404, detail="Identity not found")
     
-    # Update identity (e.g., set verification bits)
-    if "verification_bitmap" in data:
-        identities[wallet_address].verification_bitmap = data["verification_bitmap"]
+    identity = identities[wallet_address]
+
+    if data.commitment is not None:
+        identity.commitment = data.commitment
+
+    if data.verification_bitmap is not None:
+        identity.verification_bitmap = data.verification_bitmap
     
-    identities[wallet_address].updated_at = _get_timestamp()
+    identity.updated_at = _get_timestamp()
     
     return ApiResponse(
         success=True,
         message="Identity updated",
-        data=identities[wallet_address].model_dump()
+        data=identity.model_dump()
     )
 
 
@@ -211,3 +253,8 @@ def _get_timestamp() -> str:
     """Get current timestamp in ISO format."""
     from datetime import datetime
     return datetime.utcnow().isoformat() + "Z"
+
+
+def _build_did(wallet_address: str) -> str:
+    """Build a stable DID-like identifier from the wallet address."""
+    return f"did:solana:{wallet_address}"

@@ -1,408 +1,792 @@
 """Agent Manager Service for Claude Agent SDK integration.
 
-This service orchestrates agent-based verification workflows using the Claude Agent SDK.
-Implements Kepler-grade features: provenance tracking, closed-loop learning, and
-context graph integration.
+This service orchestrates verification workflows and records exactly what evidence
+was observed at each stage. It never fabricates OCR, fraud, or compliance outputs.
 """
-from typing import Optional, List, Dict, Any
-from enum import Enum
-import asyncio
-from datetime import datetime
-import base64
-import json
+from __future__ import annotations
 
-from app.models import (
-    VerificationStatus,
-    VerificationStep,
-    AadhaarVerificationData,
-    PanVerificationData,
-    ApiResponse,
+from enum import Enum
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+import base64
+import importlib.util
+import json
+import os
+import sys
+
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    ResultMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    McpStdioServerConfig,
 )
 
-# Claude Agent SDK imports
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, AgentDefinition
-from claude_agent_sdk.types import McpSdkServerConfig
+from app.mcp_config import DEFAULT_MCP_SERVERS
+from app.models import (
+    AadhaarVerificationData,
+    AgentRunProvenance,
+    AgentToolTrace,
+    ComplianceVerificationEvidence,
+    DocumentVerificationEvidence,
+    FraudVerificationEvidence,
+    PanVerificationData,
+    StepStatus,
+    VerificationGap,
+    VerificationMetadata,
+    VerificationStatus,
+    VerificationStep,
+    VerificationStepDetail,
+)
 
-# Load agent definitions from mcp/agents.py
-import sys
-import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
-from mcp.agents import get_all_agents, get_agent_by_id
+repo_root_for_imports = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if repo_root_for_imports not in sys.path:
+    sys.path.insert(0, repo_root_for_imports)
+
+_agents_spec = importlib.util.spec_from_file_location(
+    "aadhaar_chain_mcp_agents",
+    os.path.join(repo_root_for_imports, "mcp", "agents.py"),
+)
+if _agents_spec is None or _agents_spec.loader is None:
+    raise ImportError("Unable to load aadhaar-chain agent definitions.")
+_agents_module = importlib.util.module_from_spec(_agents_spec)
+_agents_spec.loader.exec_module(_agents_module)
+get_all_agents = _agents_module.get_all_agents
 
 
 class AgentType(str, Enum):
     """Types of agents available."""
+
     DOCUMENT_VALIDATOR = "document-validator"
     FRAUD_DETECTION = "fraud-detection"
     COMPLIANCE_MONITOR = "compliance-monitor"
     ORCHESTRATOR = "orchestrator"
 
 
-class ProvenanceData:
-    """Provenance tracking for verification results (Kepler-grade).
-    
-    OpenAI Kepler principle: Provenance Over Generation
-    - Track evidence sources and assumptions
-    - Return full decision chain
-    - Enable CFO/auditor verification
-    """
-    def __init__(
-        self,
-        decision: str,
-        ocr_evidence: Optional[Dict[str, Any]] = None,
-        fraud_evidence: Optional[Dict[str, Any]] = None,
-        compliance_evidence: Optional[Dict[str, Any]] = None,
-        assumptions: Optional[List[str]] = None,
-    ):
-        self.decision = decision
-        self.ocr_evidence = ocr_evidence or {}
-        self.fraud_evidence = fraud_evidence or {}
-        self.compliance_evidence = compliance_evidence or {}
-        self.assumptions = assumptions or []
-        self.timestamp = datetime.utcnow().isoformat() + "Z"
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for API response."""
-        return {
-            "decision": self.decision,
-            "timestamp": self.timestamp,
-            "evidence": {
-                "ocr": self.ocr_evidence,
-                "fraud": self.fraud_evidence,
-                "compliance": self.compliance_evidence,
-            },
-            "assumptions": self.assumptions,
-        }
-
-
 class AgentManager:
-    """Manages agent orchestration and task execution using Claude Agent SDK."""
-    
-    def __init__(self):
-        self.tasks: Dict[str, Any] = {}
+    """Manages verification workflows and evidence collection."""
+
+    def __init__(self) -> None:
         self.agents: Dict[AgentType, Any] = {}
         self.verification_records: Dict[str, VerificationStatus] = {}
         self.sdk_clients: Dict[str, ClaudeSDKClient] = {}
-        self.context_graph_available = True
-        
-    async def initialize_agents(self):
-        """Initialize Claude Agent SDK and register agents.
-        
-        Setup:
-        1. Load agent definitions from mcp/agents.py
-        2. Configure MCP servers
-        3. Initialize SDK clients for each agent
-        4. Connect to MCP servers
-        """
-        # Get all agent definitions
-        agent_definitions = get_all_agents()
-        
-        # Store agent definitions
-        for agent_def in agent_definitions:
-            agent_type = AgentType(agent_def.agent_id)
-            self.agents[agent_type] = agent_def
-        
-        # Log initialization
-        print(f"✓ Loaded {len(agent_definitions)} agent definitions")
-        print(f"  - document-validator")
-        print(f"  - fraud-detection")
-        print(f"  - compliance-monitor")
-        print(f"  - orchestrator")
-    
-    def _get_sdk_client(
+        self.repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+    def _build_verification_status(
+        self,
+        verification_id: str,
+        wallet_address: str,
+    ) -> VerificationStatus:
+        """Create a consistent initial verification status object."""
+        timestamp = self._timestamp()
+        return VerificationStatus(
+            verification_id=verification_id,
+            wallet_address=wallet_address,
+            status="pending",
+            current_step=VerificationStep.document_received,
+            steps=[
+                VerificationStepDetail(
+                    name=VerificationStep.document_received.value,
+                    status=StepStatus.completed,
+                )
+            ],
+            progress=0.0,
+            created_at=timestamp,
+            updated_at=timestamp,
+            metadata=None,
+        )
+
+    def _record_step(
+        self,
+        status: VerificationStatus,
+        step: VerificationStep,
+        progress: float,
+    ) -> None:
+        """Advance the verification workflow while keeping step state consistent."""
+        if status.steps:
+            status.steps[-1].status = StepStatus.completed
+
+        status.current_step = step
+        status.progress = progress
+        status.status = "processing"
+        status.updated_at = self._timestamp()
+        status.steps.append(
+            VerificationStepDetail(
+                name=step.value,
+                status=StepStatus.in_progress,
+            )
+        )
+
+    async def initialize_agents(self) -> None:
+        """Load configured agent definitions."""
+        for agent_def in get_all_agents():
+            self.agents[AgentType(agent_def.agent_id)] = agent_def
+
+        print(f"✓ Loaded {len(self.agents)} agent definitions")
+        for agent_type in AgentType:
+            if agent_type in self.agents:
+                print(f"  - {agent_type.value}")
+
+    def _timestamp(self) -> str:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _gap(
+        self,
+        stage: str,
+        code: str,
+        message: str,
+        *,
+        blocking: bool = True,
+    ) -> VerificationGap:
+        return VerificationGap(
+            code=code,
+            stage=stage,  # type: ignore[arg-type]
+            message=message,
+            blocking=blocking,
+        )
+
+    def _missing_provenance(
         self,
         agent_id: str,
-        agent_def: AgentDefinition,
-    ) -> ClaudeSDKClient:
-        """Get or create SDK client for an agent.
-        
-        Args:
-            agent_id: Agent identifier
-            agent_def: AgentDefinition from mcp/agents.py
-        
-        Returns:
-            ClaudeSDKClient instance
-        """
-        # Return cached client if exists
+        error: str,
+    ) -> AgentRunProvenance:
+        timestamp = self._timestamp()
+        return AgentRunProvenance(
+            agent_id=agent_id,
+            status="missing_contract",
+            started_at=timestamp,
+            completed_at=timestamp,
+            error=error,
+        )
+
+    def _failed_provenance(
+        self,
+        agent_id: str,
+        started_at: str,
+        error: str,
+    ) -> AgentRunProvenance:
+        return AgentRunProvenance(
+            agent_id=agent_id,
+            status="failed",
+            started_at=started_at,
+            completed_at=self._timestamp(),
+            error=error,
+        )
+
+    def _required_document_fields(self, document_type: str) -> list[str]:
+        if document_type == "aadhaar":
+            return ["name", "dob", "uid"]
+        return ["name", "dob", "pan_number"]
+
+    def _detect_input_kind(self, document_data: bytes) -> str:
+        if not document_data:
+            return "unknown"
+
+        stripped = document_data.lstrip()
+        if stripped.startswith(b"{") or stripped.startswith(b"["):
+            try:
+                json.loads(document_data.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return "raw_document"
+            return "request_payload"
+        return "raw_document"
+
+    def _decode_json_bytes(self, payload: bytes) -> Dict[str, Any]:
+        try:
+            decoded = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+
+    def _build_mcp_servers(
+        self,
+        server_names: list[str],
+    ) -> Dict[str, McpStdioServerConfig]:
+        mcp_servers: Dict[str, McpStdioServerConfig] = {}
+        for server_name in server_names:
+            config = DEFAULT_MCP_SERVERS.get(server_name)
+            if config is None or not config.enabled:
+                continue
+
+            mcp_servers[server_name] = {
+                "type": "stdio",
+                "command": config.command,
+                "args": config.args,
+                "env": config.env,
+            }
+        return mcp_servers
+
+    def _get_sdk_client(self, agent_type: AgentType) -> ClaudeSDKClient:
+        """Get or create SDK client for an agent."""
+        agent_id = agent_type.value
         if agent_id in self.sdk_clients:
             return self.sdk_clients[agent_id]
-        
-        # Create new SDK client
+
+        agent_def = self.agents.get(agent_type)
+        if agent_def is None:
+            raise ValueError(f"Agent not found: {agent_type}")
+
         client = ClaudeSDKClient(
             options=ClaudeAgentOptions(
                 system_prompt=agent_def.system_prompt,
-                mcp_servers=agent_def.mcp_servers or {},
-                agents={agent_id: {
-                    "description": agent_def.description,
-                    "prompt": agent_def.system_prompt,
-                }},
+                mcp_servers=self._build_mcp_servers(agent_def.mcp_servers or []),
+                cwd=self.repo_root,
             )
         )
-        
-        # Cache client
         self.sdk_clients[agent_id] = client
         return client
-    
+
+    def _append_tool_result(
+        self,
+        tools: list[AgentToolTrace],
+        tool_use_id_to_name: Dict[str, str],
+        tool_use_id: str,
+        content: str | list[dict[str, Any]] | None,
+        is_error: Optional[bool],
+    ) -> None:
+        tool_name = tool_use_id_to_name.get(tool_use_id, tool_use_id)
+        preview = self._preview_tool_content(content)
+        tool_status = "failed" if is_error else "completed"
+        tools.append(
+            AgentToolTrace(
+                tool_name=tool_name,
+                status=tool_status,
+                output_preview=preview,
+            )
+        )
+
+    def _preview_tool_content(
+        self,
+        content: str | list[dict[str, Any]] | None,
+    ) -> Optional[str]:
+        if content is None:
+            return None
+        if isinstance(content, str):
+            return content[:240]
+        try:
+            return json.dumps(content)[:240]
+        except TypeError:
+            return str(content)[:240]
+
+    def _extract_json_payload(self, response_text: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not response_text:
+            return None
+
+        candidates = [response_text]
+        start = response_text.find("{")
+        end = response_text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidates.append(response_text[start : end + 1])
+
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
     async def invoke_agent(
         self,
         agent_type: AgentType,
         prompt: str,
-    ) -> Dict[str, Any]:
-        """Invoke an agent via SDK and return result.
-        
-        Args:
-            agent_type: Type of agent to invoke
-            prompt: Prompt/message for the agent
-        
-        Returns:
-            Agent response as dictionary
-        
-        Raises:
-            Exception: If agent invocation fails
-        """
-        agent_def = self.agents.get(agent_type)
-        if not agent_def:
-            raise ValueError(f"Agent not found: {agent_type}")
-        
-        # Get SDK client
-        client = self._get_sdk_client(agent_type.value, agent_def)
-        
+    ) -> tuple[Optional[Dict[str, Any]], AgentRunProvenance]:
+        """Invoke an agent via SDK and return parsed JSON plus provenance."""
+        started_at = self._timestamp()
+        tools: list[AgentToolTrace] = []
+        tool_use_id_to_name: Dict[str, str] = {}
+        response_fragments: list[str] = []
+        model: Optional[str] = None
+        session_id: Optional[str] = None
+        structured_output: Optional[Dict[str, Any]] = None
+        agent_id = agent_type.value
+
         try:
-            # Connect and send message
+            client = self._get_sdk_client(agent_type)
             await client.connect()
-            
-            # Get response (simplified - actual SDK usage may vary)
-            # This is a placeholder for the actual SDK invocation pattern
-            # The SDK will handle the actual agent-to-agent communication
-            
-            result = {
-                "agent_id": agent_type.value,
-                "success": True,
-                "response": "Agent response placeholder",  # TODO: Get actual response from SDK
-            }
-            
-            return result
-            
-        except Exception as e:
-            print(f"✗ Agent invocation failed: {agent_type.value} - {e}")
-            return {
-                "agent_id": agent_type.value,
-                "success": False,
-                "error": str(e),
-            }
-    
+            try:
+                await client.query(prompt)
+
+                async for message in client.receive_response():
+                    if isinstance(message, AssistantMessage):
+                        model = message.model or model
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                response_fragments.append(block.text)
+                            elif isinstance(block, ToolUseBlock):
+                                tool_use_id_to_name[block.id] = block.name
+                                tools.append(
+                                    AgentToolTrace(
+                                        tool_name=block.name,
+                                        status="requested",
+                                    )
+                                )
+                            elif isinstance(block, ToolResultBlock):
+                                self._append_tool_result(
+                                    tools,
+                                    tool_use_id_to_name,
+                                    block.tool_use_id,
+                                    block.content,
+                                    block.is_error,
+                                )
+                    elif isinstance(message, ResultMessage):
+                        session_id = message.session_id
+                        if isinstance(message.structured_output, dict):
+                            structured_output = message.structured_output
+                        if message.result:
+                            response_fragments.append(message.result)
+
+                response_text = "\n".join(fragment.strip() for fragment in response_fragments if fragment.strip()) or None
+                payload = structured_output or self._extract_json_payload(response_text)
+                status = "completed" if payload is not None else "missing_contract"
+
+                provenance = AgentRunProvenance(
+                    agent_id=agent_id,
+                    status=status,
+                    started_at=started_at,
+                    completed_at=self._timestamp(),
+                    model=model,
+                    session_id=session_id,
+                    tools=tools,
+                    response_preview=response_text[:400] if response_text else None,
+                    structured_output=payload,
+                    error=None if payload is not None else "Agent response did not contain a parseable JSON contract.",
+                )
+                return payload, provenance
+            finally:
+                await client.disconnect()
+        except Exception as exc:
+            return None, self._failed_provenance(agent_id, started_at, str(exc))
+
     async def validate_document(
         self,
         document_data: bytes,
         document_type: str,
-    ) -> Dict[str, Any]:
-        """Validate document using Document Validator agent.
-        
-        Args:
-            document_data: Raw document data (image/PDF bytes)
-            document_type: Type of document (aadhaar, pan)
-        
-        Returns:
-            Extracted fields from document with provenance
-            
-        Provenance tracking (Kepler principle):
-        - OCR source: document-processor/ocr_document
-        - Field extraction: document-processor/extract_*_fields
-        - Confidence score included
-        """
-        # Encode document to base64 for transmission
-        document_b64 = base64.b64encode(document_data).decode('utf-8')
-        
-        # Prepare prompt for Document Validator
+        verification_data: Optional[AadhaarVerificationData | PanVerificationData],
+    ) -> DocumentVerificationEvidence:
+        """Validate document using Document Validator agent when primary evidence exists."""
+        input_kind = self._detect_input_kind(document_data)
+        required_fields = self._required_document_fields(document_type)
+        submitted_claims = verification_data.model_dump(exclude_none=True) if verification_data else {}
+
+        if input_kind != "raw_document":
+            gap = self._gap(
+                "document",
+                "primary_document_missing",
+                "Gateway received request payload fields instead of primary document bytes, so OCR evidence is unavailable.",
+            )
+            return DocumentVerificationEvidence(
+                document_type=document_type,  # type: ignore[arg-type]
+                input_kind=input_kind,  # type: ignore[arg-type]
+                extracted_fields={},
+                submitted_claims=submitted_claims,
+                warnings=["Submitted form claims are not treated as verified document evidence."],
+                required_fields=required_fields,
+                missing_fields=required_fields,
+                provenance=self._missing_provenance(
+                    AgentType.DOCUMENT_VALIDATOR.value,
+                    "Primary document evidence was not supplied to the backend.",
+                ),
+                gaps=[gap],
+            )
+
+        document_b64 = base64.b64encode(document_data).decode("utf-8")
         prompt = f"""Validate this {document_type} document.
 
 Document data (base64): {document_b64[:1000]}...
 
-Extract and return:
-1. Document type (aadhaar/pan)
-2. All fields (name, DOB, UID/PAN number)
-3. OCR confidence score (0.0-1.0)
-4. Any warnings or quality issues
-
-Return as JSON with fields, confidence, and warnings.
+Return only JSON with this exact shape:
+{{
+  "document_type": "{document_type}",
+  "fields": {{
+    "name": "string or null",
+    "dob": "string or null",
+    "{'uid' if document_type == 'aadhaar' else 'pan_number'}": "string or null"
+  }},
+  "confidence": 0.0,
+  "warnings": ["string"]
+}}
 """
-        
-        # Invoke Document Validator agent
-        result = await self.invoke_agent(
-            AgentType.DOCUMENT_VALIDATOR,
-            prompt
+
+        payload, provenance = await self.invoke_agent(AgentType.DOCUMENT_VALIDATOR, prompt)
+
+        gaps: list[VerificationGap] = []
+        fields: Dict[str, Any] = {}
+        warnings: list[str] = []
+        confidence: Optional[float] = None
+
+        if provenance.status == "failed":
+            gaps.append(
+                self._gap(
+                    "document",
+                    "document_agent_failed",
+                    provenance.error or "Document validator invocation failed.",
+                )
+            )
+        elif payload is None:
+            gaps.append(
+                self._gap(
+                    "document",
+                    "document_contract_missing",
+                    provenance.error or "Document validator did not return a structured evidence contract.",
+                )
+            )
+        else:
+            raw_fields = payload.get("fields")
+            if isinstance(raw_fields, dict):
+                fields = {key: value for key, value in raw_fields.items() if value not in (None, "")}
+
+            raw_warnings = payload.get("warnings")
+            if isinstance(raw_warnings, list):
+                warnings = [str(item) for item in raw_warnings]
+
+            raw_confidence = payload.get("confidence")
+            if isinstance(raw_confidence, (int, float)):
+                confidence = float(raw_confidence)
+            else:
+                gaps.append(
+                    self._gap(
+                        "document",
+                        "document_confidence_missing",
+                        "Document validator did not provide a numeric confidence score.",
+                    )
+                )
+
+            returned_type = payload.get("document_type")
+            if returned_type not in (None, document_type):
+                gaps.append(
+                    self._gap(
+                        "document",
+                        "document_type_mismatch",
+                        f"Document validator reported {returned_type!r} instead of {document_type!r}.",
+                    )
+                )
+
+        missing_fields = [field for field in required_fields if not fields.get(field)]
+        if missing_fields:
+            gaps.append(
+                self._gap(
+                    "document",
+                    "document_fields_missing",
+                    f"Document evidence is missing required extracted fields: {', '.join(missing_fields)}.",
+                )
+            )
+
+        return DocumentVerificationEvidence(
+            document_type=document_type,  # type: ignore[arg-type]
+            input_kind="raw_document",
+            extracted_fields=fields,
+            submitted_claims=submitted_claims,
+            confidence=confidence,
+            warnings=warnings,
+            required_fields=required_fields,
+            missing_fields=missing_fields,
+            provenance=provenance,
+            gaps=gaps,
         )
-        
-        if not result.get("success", False):
-            return {
-                "success": False,
-                "error": result.get("error", "Unknown error"),
-            }
-        
-        # Parse response (placeholder - actual response from SDK)
-        # TODO: Parse actual SDK response format
-        fields = {
-            "name": "Extracted Name",
-            "dob": "01/01/1985",
-            "uid": "123456789012" if document_type == "aadhaar" else None,
-            "pan_number": "ABCDE1234F" if document_type == "pan" else None,
-            "confidence": 0.95,
-        }
-        
-        # Provenance tracking
-        provenance = {
-            "source": "document-validator agent",
-            "mcp_servers": ["document-processor"],
-            "tools_used": ["ocr_document", f"extract_{document_type}_fields"],
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-        }
-        
-        return {
-            "success": True,
-            "document_type": document_type,
-            "fields": fields,
-            "provenance": provenance,
-        }
-    
+
     async def detect_fraud(
         self,
-        document_fields: Dict[str, Any],
+        document_evidence: DocumentVerificationEvidence,
         document_type: str,
-    ) -> Dict[str, Any]:
-        """Detect fraud using Fraud Detection agent.
-        
-        Args:
-            document_fields: Extracted fields from document
-            document_type: Type of document
-        
-        Returns:
-            Fraud detection result with provenance
-            
-        Provenance tracking (Kepler principle):
-        - Source: pattern-analyzer MCP
-        - Tools: detect_tampering, check_watchlist
-        - Risk score calculation method
-        """
-        # Prepare prompt for Fraud Detection
-        prompt = f"""Analyze this {document_type} document for fraud.
+    ) -> FraudVerificationEvidence:
+        """Run fraud checks only when document evidence is explicit."""
+        blocking_document_gaps = [gap for gap in document_evidence.gaps if gap.blocking]
+        if blocking_document_gaps:
+            return FraudVerificationEvidence(
+                provenance=self._missing_provenance(
+                    AgentType.FRAUD_DETECTION.value,
+                    "Fraud analysis skipped because primary document evidence was incomplete.",
+                ),
+                gaps=[
+                    self._gap(
+                        "fraud",
+                        "fraud_prerequisite_missing",
+                        "Fraud analysis requires explicit document extraction evidence before it can be trusted.",
+                    )
+                ],
+            )
 
-Document fields: {json.dumps(document_fields, indent=2)}
+        prompt = f"""Analyze this {document_type} verification for fraud.
 
-Check for:
-1. Image manipulation or tampering
-2. Metadata inconsistencies
-3. Watchlist matches
-4. Suspicious patterns
+Observed document fields:
+{json.dumps(document_evidence.extracted_fields, indent=2)}
 
-Return as JSON with:
-- risk_score (0.0-1.0)
-- risk_level (safe/medium/high)
-- indicators (list of detected issues)
-- recommendation (auto_approve/manual_review/block)
+Return only JSON with this exact shape:
+{{
+  "risk_score": 0.0,
+  "risk_level": "safe|medium|high",
+  "indicators": ["string"],
+  "recommendation": "approve|manual_review|block"
+}}
 """
-        
-        # Invoke Fraud Detection agent
-        result = await self.invoke_agent(
-            AgentType.FRAUD_DETECTION,
-            prompt
+
+        payload, provenance = await self.invoke_agent(AgentType.FRAUD_DETECTION, prompt)
+        gaps: list[VerificationGap] = []
+        risk_score: Optional[float] = None
+        risk_level: Optional[str] = None
+        indicators: list[str] = []
+        recommendation: Optional[str] = None
+
+        if provenance.status == "failed":
+            gaps.append(
+                self._gap(
+                    "fraud",
+                    "fraud_agent_failed",
+                    provenance.error or "Fraud detection agent invocation failed.",
+                )
+            )
+        elif payload is None:
+            gaps.append(
+                self._gap(
+                    "fraud",
+                    "fraud_contract_missing",
+                    provenance.error or "Fraud detection agent did not return a structured evidence contract.",
+                )
+            )
+        else:
+            raw_score = payload.get("risk_score")
+            if isinstance(raw_score, (int, float)):
+                risk_score = float(raw_score)
+            else:
+                gaps.append(
+                    self._gap(
+                        "fraud",
+                        "fraud_score_missing",
+                        "Fraud contract did not provide a numeric risk score.",
+                    )
+                )
+
+            if isinstance(payload.get("risk_level"), str):
+                risk_level = payload["risk_level"]
+            else:
+                gaps.append(
+                    self._gap(
+                        "fraud",
+                        "fraud_level_missing",
+                        "Fraud contract did not provide a risk level.",
+                    )
+                )
+
+            raw_indicators = payload.get("indicators")
+            if isinstance(raw_indicators, list):
+                indicators = [str(item) for item in raw_indicators]
+
+            raw_recommendation = payload.get("recommendation")
+            if raw_recommendation in {"approve", "manual_review", "block"}:
+                recommendation = raw_recommendation
+            else:
+                gaps.append(
+                    self._gap(
+                        "fraud",
+                        "fraud_recommendation_missing",
+                        "Fraud contract did not provide an explicit recommendation.",
+                    )
+                )
+
+        return FraudVerificationEvidence(
+            risk_score=risk_score,
+            risk_level=risk_level,
+            indicators=indicators,
+            recommendation=recommendation,  # type: ignore[arg-type]
+            provenance=provenance,
+            gaps=gaps,
         )
-        
-        if not result.get("success", False):
-            return {
-                "success": False,
-                "error": result.get("error", "Unknown error"),
-            }
-        
-        # Parse response (placeholder)
-        risk_score = 0.1
-        risk_level = "safe" if risk_score < 0.5 else "high" if risk_score > 0.7 else "medium"
-        
-        # Provenance tracking
-        provenance = {
-            "source": "fraud-detection agent",
-            "mcp_servers": ["pattern-analyzer", "compliance-rules"],
-            "tools_used": ["detect_tampering", "check_watchlist", "check_aadhaar_act", "check_dpdp"],
-            "risk_calculation": "based on tampering indicators + watchlist match + compliance violations",
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-        }
-        
-        return {
-            "risk_score": risk_score,
-            "risk_level": risk_level,
-            "indicators": [],
-            "recommendation": "auto_approve" if risk_level == "safe" else "manual_review",
-            "provenance": provenance,
-        }
-    
+
     async def check_compliance(
         self,
-        document_fields: Dict[str, Any],
+        document_evidence: DocumentVerificationEvidence,
         document_type: str,
+        verification_data: Optional[AadhaarVerificationData | PanVerificationData],
         purpose: str = "kyc_verification",
-    ) -> Dict[str, Any]:
-        """Check compliance using Compliance Monitor agent.
-        
-        Args:
-            document_fields: Extracted fields from document
-            document_type: Type of document
-            purpose: Purpose of data access (kyc, lending, etc.)
-        
-        Returns:
-            Compliance check result with provenance
-            
-        Provenance tracking (Kepler principle):
-        - Source: compliance-rules MCP
-        - Tools: check_aadhaar_act, check_dpdp
-        - Regulatory citations
-        """
-        # Prepare prompt for Compliance Monitor
+    ) -> ComplianceVerificationEvidence:
+        """Run compliance checks when the required supporting evidence exists."""
+        gaps: list[VerificationGap] = []
+        violations: list[str] = []
+
+        if document_evidence.gaps:
+            gaps.append(
+                self._gap(
+                    "compliance",
+                    "compliance_prerequisite_missing",
+                    "Compliance analysis requires explicit document evidence and provenance.",
+                )
+            )
+
+        if document_type == "aadhaar":
+            consent_provided = bool(getattr(verification_data, "consent_provided", False))
+            if not consent_provided:
+                violations.append("Explicit Aadhaar consent was not provided in the backend request.")
+        else:
+            consent_provided = True
+
+        if gaps:
+            recommendation = "block" if violations else "manual_review"
+            return ComplianceVerificationEvidence(
+                aadhaar_act_compliant=False if violations else None,
+                dpdp_compliant=None,
+                violations=violations,
+                recommendation=recommendation,
+                provenance=self._missing_provenance(
+                    AgentType.COMPLIANCE_MONITOR.value,
+                    "Compliance analysis skipped because prerequisite evidence was incomplete.",
+                ),
+                gaps=gaps,
+            )
+
         prompt = f"""Verify compliance for this {document_type} document.
 
-Document fields: {json.dumps(document_fields, indent=2)}
+Observed document fields:
+{json.dumps(document_evidence.extracted_fields, indent=2)}
 Purpose: {purpose}
+Consent provided: {consent_provided}
 
-Check:
-1. Aadhaar Act 2019 compliance (purpose limitation, consent, data minimization)
-2. DPDP Act 2019 compliance (data minimization, storage duration, access control)
-
-Return as JSON with:
-- aadhaar_act_compliant (boolean)
-- dpdp_compliant (boolean)
-- violations (list of any violations)
-- recommendation (auto_approve/manual_review/block)
+Return only JSON with this exact shape:
+{{
+  "aadhaar_act_compliant": true,
+  "dpdp_compliant": true,
+  "violations": ["string"],
+  "recommendation": "approve|manual_review|block"
+}}
 """
-        
-        # Invoke Compliance Monitor agent
-        result = await self.invoke_agent(
-            AgentType.COMPLIANCE_MONITOR,
-            prompt
+
+        payload, provenance = await self.invoke_agent(AgentType.COMPLIANCE_MONITOR, prompt)
+
+        aadhaar_act_compliant: Optional[bool] = None
+        dpdp_compliant: Optional[bool] = None
+        recommendation: Optional[str] = None
+
+        if provenance.status == "failed":
+            gaps.append(
+                self._gap(
+                    "compliance",
+                    "compliance_agent_failed",
+                    provenance.error or "Compliance agent invocation failed.",
+                )
+            )
+        elif payload is None:
+            gaps.append(
+                self._gap(
+                    "compliance",
+                    "compliance_contract_missing",
+                    provenance.error or "Compliance agent did not return a structured evidence contract.",
+                )
+            )
+        else:
+            if isinstance(payload.get("aadhaar_act_compliant"), bool):
+                aadhaar_act_compliant = payload["aadhaar_act_compliant"]
+            else:
+                gaps.append(
+                    self._gap(
+                        "compliance",
+                        "aadhaar_compliance_missing",
+                        "Compliance contract did not provide Aadhaar Act compliance status.",
+                    )
+                )
+
+            if isinstance(payload.get("dpdp_compliant"), bool):
+                dpdp_compliant = payload["dpdp_compliant"]
+            else:
+                gaps.append(
+                    self._gap(
+                        "compliance",
+                        "dpdp_compliance_missing",
+                        "Compliance contract did not provide DPDP compliance status.",
+                    )
+                )
+
+            raw_violations = payload.get("violations")
+            if isinstance(raw_violations, list):
+                violations.extend(str(item) for item in raw_violations)
+
+            raw_recommendation = payload.get("recommendation")
+            if raw_recommendation in {"approve", "manual_review", "block"}:
+                recommendation = raw_recommendation
+            else:
+                gaps.append(
+                    self._gap(
+                        "compliance",
+                        "compliance_recommendation_missing",
+                        "Compliance contract did not provide an explicit recommendation.",
+                    )
+                )
+
+        if violations and aadhaar_act_compliant is None:
+            aadhaar_act_compliant = False
+
+        return ComplianceVerificationEvidence(
+            aadhaar_act_compliant=aadhaar_act_compliant,
+            dpdp_compliant=dpdp_compliant,
+            violations=violations,
+            recommendation=recommendation,  # type: ignore[arg-type]
+            provenance=provenance,
+            gaps=gaps,
         )
-        
-        if not result.get("success", False):
-            return {
-                "success": False,
-                "error": result.get("error", "Unknown error"),
-            }
-        
-        # Parse response (placeholder)
-        
-        # Provenance tracking
-        provenance = {
-            "source": "compliance-monitor agent",
-            "mcp_servers": ["compliance-rules"],
-            "tools_used": ["check_aadhaar_act", "check_dpdp"],
-            "regulatory_framework": ["Aadhaar Act 2019", "DPDP Act 2019"],
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-        }
-        
-        return {
-            "aadhaar_act_compliant": True,
-            "dpdp_compliant": True,
-            "violations": [],
-            "recommendation": "auto_approve",
-            "provenance": provenance,
-        }
-    
+
+    def _build_metadata(
+        self,
+        document_type: str,
+        document: DocumentVerificationEvidence,
+        fraud: FraudVerificationEvidence,
+        compliance: ComplianceVerificationEvidence,
+    ) -> VerificationMetadata:
+        blocking_gaps = [
+            *[gap for gap in document.gaps if gap.blocking],
+            *[gap for gap in fraud.gaps if gap.blocking],
+            *[gap for gap in compliance.gaps if gap.blocking],
+        ]
+
+        evidence_status = "complete"
+        if blocking_gaps:
+            evidence_status = "missing"
+        elif document.gaps or fraud.gaps or compliance.gaps:
+            evidence_status = "partial"
+
+        if blocking_gaps:
+            decision = "manual_review"
+            reason = "Explicit evidence or provenance is missing for one or more verification stages."
+        elif compliance.recommendation == "block" or compliance.violations:
+            decision = "reject"
+            reason = "Compliance violations were detected in the backend verification contract."
+        elif fraud.recommendation == "block" or (fraud.risk_score is not None and fraud.risk_score > 0.7):
+            decision = "reject"
+            risk_score = fraud.risk_score if fraud.risk_score is not None else 0.0
+            reason = f"Fraud risk exceeded the rejection threshold ({risk_score:.2f})."
+        elif fraud.recommendation == "manual_review":
+            decision = "manual_review"
+            reason = "Fraud analysis requested manual review."
+        elif document.confidence is not None and document.confidence < 0.6:
+            decision = "manual_review"
+            reason = f"Document evidence confidence is below threshold ({document.confidence:.2f})."
+        elif compliance.aadhaar_act_compliant is False or compliance.dpdp_compliant is False:
+            decision = "reject"
+            reason = "Compliance contract marked the verification as non-compliant."
+        else:
+            decision = "approve"
+            reason = "Explicit document, fraud, and compliance contracts passed all approval rules."
+
+        assumptions = [
+            "Approval is allowed only when every stage returns an explicit structured contract.",
+            "Missing contracts or provenance never auto-approve a verification.",
+            "Fraud risk > 0.7 rejects the verification.",
+            "Document confidence < 0.6 downgrades the verification to manual review.",
+            f"Document type: {document_type}",
+        ]
+
+        return VerificationMetadata(
+            decision=decision,  # type: ignore[arg-type]
+            reason=reason,
+            evidence_status=evidence_status,  # type: ignore[arg-type]
+            document=document,
+            fraud=fraud,
+            compliance=compliance,
+            blocking_gaps=blocking_gaps,
+            assumptions=assumptions,
+        )
+
     async def orchestrate_verification(
         self,
         wallet_address: str,
@@ -410,250 +794,115 @@ Return as JSON with:
         document_data: bytes,
         verification_data: Optional[AadhaarVerificationData | PanVerificationData],
     ) -> VerificationStatus:
-        """Orchestrate complete verification workflow using Orchestrator agent.
-        
-        Args:
-            wallet_address: User's wallet address
-            document_type: Type of document (aadhaar, pan)
-            document_data: Raw document data
-            verification_data: Additional verification data
-        
-        Returns:
-            Verification status with progress tracking and provenance
-            
-        Workflow:
-            1. Validate document (Document Validator agent)
-            2. Detect fraud (Fraud Detection agent)
-            3. Check compliance (Compliance Monitor agent)
-            4. Aggregate results
-            5. Make decision (approve, reject, manual review)
-            
-        Kepler-grade features:
-        - Provenance tracking at each step
-        - Evidence chain included in response
-        - Assumptions documented
-        - Context Graph integration for decision learning
-        """
+        """Orchestrate the complete verification workflow."""
         verification_id = f"{document_type}_{wallet_address}"
-        
-        # Initialize verification status
-        status = VerificationStatus(
-            verification_id=verification_id,
-            wallet_address=wallet_address,
-            current_step=VerificationStep.document_received,
-            steps=[VerificationStep.document_received],
-            progress=0.0,
-            created_at=datetime.utcnow().isoformat() + "Z",
-            updated_at=datetime.utcnow().isoformat() + "Z",
+        status = self.verification_records.get(verification_id)
+        if status is None:
+            status = self._build_verification_status(verification_id, wallet_address)
+            self.verification_records[verification_id] = status
+
+        self._record_step(status, VerificationStep.parsing, 0.2)
+        document = await self.validate_document(document_data, document_type, verification_data)
+
+        self._record_step(status, VerificationStep.fraud_check, 0.4)
+        fraud = await self.detect_fraud(document, document_type)
+
+        self._record_step(status, VerificationStep.compliance_check, 0.6)
+        compliance = await self.check_compliance(document, document_type, verification_data)
+
+        self._record_step(status, VerificationStep.blockchain_upload, 0.8)
+        metadata = self._build_metadata(document_type, document, fraud, compliance)
+
+        await self.complete_verification(
+            verification_id,
+            metadata.decision,
+            metadata,
         )
-        
-        # Step 1: Document validation
-        status.current_step = VerificationStep.parsing
-        status.progress = 0.2
-        status.steps.append(VerificationStep.parsing)
-        status.updated_at = datetime.utcnow().isoformat() + "Z"
-        
-        document_result = await self.validate_document(document_data, document_type)
-        
-        if not document_result.get("success", False):
-            status.current_step = VerificationStep.complete
-            status.progress = 1.0
-            status.updated_at = datetime.utcnow().isoformat() + "Z"
-            return status
-        
-        # Step 2: Fraud detection
-        status.current_step = VerificationStep.fraud_check
-        status.progress = 0.4
-        status.steps.append(VerificationStep.fraud_check)
-        status.updated_at = datetime.utcnow().isoformat() + "Z"
-        
-        fraud_result = await self.detect_fraud(document_result["fields"], document_type)
-        
-        # Step 3: Compliance check
-        status.current_step = VerificationStep.compliance_check
-        status.progress = 0.6
-        status.steps.append(VerificationStep.compliance_check)
-        status.updated_at = datetime.utcnow().isoformat() + "Z"
-        
-        compliance_result = await self.check_compliance(document_result["fields"], document_type)
-        
-        # Step 4: Aggregation and decision
-        status.current_step = VerificationStep.blockchain_upload
-        status.progress = 0.8
-        status.steps.append(VerificationStep.blockchain_upload)
-        status.updated_at = datetime.utcnow().isoformat() + "Z"
-        
-        # Make decision
-        risk_score = fraud_result.get("risk_score", 0.0)
-        aadhaar_compliant = compliance_result.get("aadhaar_act_compliant", True)
-        dpdp_compliant = compliance_result.get("dpdp_compliant", True)
-        document_confidence = document_result["fields"].get("confidence", 0.0)
-        
-        # Decision logic with documented assumptions
-        if risk_score > 0.7:
-            decision = "reject"
-            reason = f"High fraud risk ({risk_score:.2f})"
-        elif not aadhaar_compliant or not dpdp_compliant:
-            decision = "reject"
-            reason = "Compliance violation detected"
-        elif document_confidence < 0.6:
-            decision = "manual_review"
-            reason = f"Low OCR quality ({document_confidence:.2f})"
-        else:
-            decision = "approve"
-            reason = "All checks passed"
-        
-        # Create provenance data (Kepler-grade)
-        provenance = ProvenanceData(
-            decision=decision,
-            ocr_evidence=document_result.get("provenance"),
-            fraud_evidence=fraud_result.get("provenance"),
-            compliance_evidence=compliance_result.get("provenance"),
-            assumptions=[
-                f"Risk threshold: 0.7 (risk_score > 0.7 → reject)",
-                f"OCR quality threshold: 0.6 (confidence < 0.6 → manual_review)",
-                "Aadhaar Act 2019 and DPDP Act 2019 compliance required",
-                f"Document type: {document_type}",
-            ],
-        )
-        
-        # Complete verification
-        status.current_step = VerificationStep.complete
-        status.progress = 1.0
-        status.steps.append(VerificationStep.complete)
-        status.updated_at = datetime.utcnow().isoformat() + "Z"
-        
-        # Store decision with provenance in metadata
-        status.metadata = {
-            "decision": decision,
-            "reason": reason,
-            "provenance": provenance.to_dict(),
-        }
-        
-        # Store verification record
-        self.verification_records[verification_id] = status
-        
-        return status
-    
+        return self.verification_records[verification_id]
+
     async def get_verification_status(
         self,
         verification_id: str,
     ) -> Optional[VerificationStatus]:
-        """Get verification status by ID.
-        
-        Args:
-            verification_id: Unique verification identifier
-        
-        Returns:
-            Verification status if exists, None otherwise
-        """
+        """Get verification status by ID."""
         return self.verification_records.get(verification_id)
-    
+
     async def create_verification(
         self,
         wallet_address: str,
         document_type: str,
         verification_data: Optional[AadhaarVerificationData | PanVerificationData],
     ) -> str:
-        """Create verification request and initialize status.
-        
-        Args:
-            wallet_address: User's wallet address
-            document_type: Type of document (aadhaar, pan)
-            verification_data: Additional verification data
-        
-        Returns:
-            Verification ID for tracking
-        """
+        """Create verification request and initialize status."""
+        del verification_data
         verification_id = f"{document_type}_{wallet_address}"
-        
-        status = VerificationStatus(
-            verification_id=verification_id,
-            wallet_address=wallet_address,
-            current_step=VerificationStep.document_received,
-            steps=[VerificationStep.document_received],
-            progress=0.0,
-            created_at=datetime.utcnow().isoformat() + "Z",
-            updated_at=datetime.utcnow().isoformat() + "Z",
+        self.verification_records[verification_id] = self._build_verification_status(
+            verification_id,
+            wallet_address,
         )
-        
-        self.verification_records[verification_id] = status
-        
         return verification_id
-    
+
     async def update_verification_progress(
         self,
         verification_id: str,
         current_step: VerificationStep,
         progress: float,
     ) -> None:
-        """Update verification progress.
-        
-        Args:
-            verification_id: Unique verification identifier
-            current_step: Current step in workflow
-            progress: Progress percentage (0.0-1.0)
-        """
+        """Update verification progress."""
         if verification_id not in self.verification_records:
             return
-        
+
         status = self.verification_records[verification_id]
-        status.current_step = current_step
-        status.progress = progress
-        status.updated_at = datetime.utcnow().isoformat() + "Z"
-        status.steps.append(current_step)
-    
+        self._record_step(status, current_step, progress)
+
     async def complete_verification(
         self,
         verification_id: str,
         decision: str,
-        result_data: Dict[str, Any],
+        metadata: VerificationMetadata,
     ) -> None:
-        """Mark verification as complete with decision.
-        
-        Args:
-            verification_id: Unique verification identifier
-            decision: Final decision (approve, reject, manual_review)
-            result_data: Results from agents (OCR, fraud, compliance)
-        """
+        """Mark verification as complete with the final decision contract."""
         if verification_id not in self.verification_records:
             return
-        
+
         status = self.verification_records[verification_id]
+        if status.steps:
+            status.steps[-1].status = StepStatus.completed
+
         status.current_step = VerificationStep.complete
         status.progress = 1.0
-        status.updated_at = datetime.utcnow().isoformat() + "Z"
-        status.steps.append(VerificationStep.complete)
-        
-        # Store decision in metadata with provenance
-        if "provenance" not in result_data:
-            result_data["provenance"] = {}
-        
-        status.metadata = {
-            "decision": decision,
-            "result_data": result_data,
-        }
-    
+        status.updated_at = self._timestamp()
+        status.steps.append(
+            VerificationStepDetail(
+                name=VerificationStep.complete.value,
+                status=StepStatus.completed,
+            )
+        )
+
+        if decision == "approve":
+            status.status = "verified"
+            status.error = None
+        elif decision == "manual_review":
+            status.status = "manual_review"
+            status.error = metadata.reason
+        else:
+            status.status = "failed"
+            status.error = metadata.reason
+
+        status.metadata = metadata
+
     async def cleanup_expired_verifications(self, days: int = 7) -> int:
-        """Clean up old verification records.
-        
-        Args:
-            days: Age threshold for cleanup (default: 7 days)
-        
-        Returns:
-            Number of records cleaned up
-        """
+        """Clean up old verification records."""
         cleaned = 0
-        cutoff_time = datetime.utcnow().timestamp() - (days * 86400)
-        
-        for vid, status in list(self.verification_records.items()):
-            created_time = datetime.fromisoformat(status.created_at.replace('Z', '+00:00')).timestamp()
+        cutoff_time = datetime.now(timezone.utc).timestamp() - (days * 86400)
+
+        for verification_id, status in list(self.verification_records.items()):
+            created_time = datetime.fromisoformat(status.created_at.replace("Z", "+00:00")).timestamp()
             if created_time < cutoff_time:
-                del self.verification_records[vid]
+                del self.verification_records[verification_id]
                 cleaned += 1
-        
+
         return cleaned
 
 
-# Global agent manager instance
 agent_manager = AgentManager()

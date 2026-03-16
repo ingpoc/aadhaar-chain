@@ -26,6 +26,28 @@ Identity verification platform using Solana blockchain + Claude Agent SDK + MCP 
 
 ## 💡 Important Decisions Made
 
+### 2026-03-17 Verification Trust Contract
+1. **Do not fabricate backend verification outputs**
+   - Decision: Removed placeholder OCR/fraud/compliance results from `gateway/app/agent_manager.py`.
+   - Reasoning: Backend-driven status is not trustworthy if it promotes missing agent output into fake approvals.
+   - Outcome: Verification now records typed evidence, provenance, and explicit blocking gaps.
+
+2. **Manual review is the default for missing primary evidence**
+   - Decision: If the gateway only receives self-asserted request payload fields instead of raw document bytes, the verification terminates as `manual_review`.
+   - Reasoning: Submitted form data is not equivalent to observed document evidence.
+   - Outcome: Current Aadhaar/PAN flows surface `primary_document_missing` until a real upload/evidence path is wired through.
+
+3. **Approval requires complete contracts from all stages**
+   - Decision: Auto-approval now requires explicit structured contracts for document parsing, fraud analysis, and compliance.
+   - Reasoning: Missing provenance or unstructured agent replies must never silently downgrade into “safe”.
+   - Outcome: `VerificationMetadata` now carries `document`, `fraud`, `compliance`, `blocking_gaps`, and `evidence_status`.
+
+4. **Runtime gaps found during verification hardening**
+   - `ApiResponse.message` needed a default because several routes construct responses without one.
+   - `mcp/agents.py` was missing `List` import.
+   - Local `mcp/` needed package-safe loading because the top-level `mcp` name can collide with installed packages.
+   - `pytest` required `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` in this environment because a globally loaded `anchorpy` plugin depends on `pytest_xprocess`.
+
 ### Architecture Decisions
 1. **Tech Stack**
    - Frontend: Next.js 15, TypeScript, Tailwind CSS, shadcn/ui
