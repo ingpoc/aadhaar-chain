@@ -1,6 +1,5 @@
 'use client';
 
-import { useState } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { WalletInfo } from '@/components/wallet/WalletInfo';
 import { IdentityCard } from '@/components/identity/IdentityCard';
@@ -10,7 +9,6 @@ import Link from 'next/link';
 
 export default function DashboardPage() {
   const { connected } = useWallet();
-  const [hasIdentity] = useState(false);
 
   return (
     <div className="space-y-6">
@@ -48,7 +46,7 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {connected && hasIdentity && (
+      {connected && (
         <Card className="metric-card">
           <CardHeader>
             <CardTitle>Quick Actions</CardTitle>

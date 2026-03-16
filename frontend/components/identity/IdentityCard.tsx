@@ -1,51 +1,48 @@
 'use client';
 
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { useEffect, useState } from 'react';
-
-interface Identity {
-  did: string;
-  reputation: number;
-}
+import axios from 'axios';
+import { identityApi } from '@/lib/api';
+import type { Identity } from '@/lib/types';
 
 export function IdentityCard() {
   const { publicKey, connected } = useWallet();
-  const [identity] = useState<Identity | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [identity, setIdentity] = useState<Identity | null>(null);
 
   useEffect(() => {
-    if (!connected) {
+    if (!connected || !publicKey) {
       return;
     }
-    // TODO: Fetch identity from Solana program
-    // For now, show placeholder
+
+    let cancelled = false;
+    const walletAddress = publicKey.toBase58();
+
+    identityApi.getIdentity(walletAddress)
+      .then((result) => {
+        if (!cancelled) {
+          setIdentity(result);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          if (axios.isAxiosError(error) && error.response?.status === 404) {
+            setIdentity(null);
+          } else {
+            console.error('Failed to load identity', error);
+          }
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [publicKey, connected]);
 
-  // Set loading to false when not connected or after effect runs
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setLoading(false);
-  }, [connected]);
+  const activeIdentity = connected ? identity : null;
 
-  if (loading) {
-    return (
-      <Card className="metric-card">
-        <CardHeader>
-          <CardTitle className="text-lg">Identity Status</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="flex items-center gap-2">
-            <div className="animate-spin h-4 w-4 border-2 border-primary border-t-transparent rounded-full" />
-            <span className="text-muted-foreground text-sm">Loading...</span>
-          </div>
-        </CardContent>
-      </Card>
-    );
-  }
-
-  if (!identity) {
+  if (!activeIdentity) {
     return (
       <Card className="metric-card">
         <CardHeader>
@@ -54,10 +51,12 @@ export function IdentityCard() {
         <CardContent className="space-y-4">
           <div className="flex items-center gap-2 text-muted-foreground">
             <span className="status-dot-muted" />
-            <span className="text-sm">No identity found</span>
+            <span className="text-sm">{connected ? 'No identity found' : 'Wallet not connected'}</span>
           </div>
           <p className="text-sm text-muted-foreground">
-            Create your decentralized identity to get started.
+            {connected
+              ? 'Create your decentralized identity to get started.'
+              : 'Connect your wallet to load or create an identity anchor.'}
           </p>
         </CardContent>
       </Card>
@@ -72,22 +71,34 @@ export function IdentityCard() {
       <CardContent className="space-y-4">
         <div className="data-row">
           <span className="data-label">DID</span>
-          <span className="data-value">{identity.did}</span>
-        </div>
-
-        <div className="card-section">
-          <p className="data-label mb-2">Verifications</p>
-          <div className="flex flex-wrap gap-2">
-            <Badge className="badge-verified">Aadhaar</Badge>
-            <Badge className="badge-verified">PAN</Badge>
-          </div>
+          <span className="data-value">{activeIdentity.did}</span>
         </div>
 
         <div className="data-row">
-          <span className="data-label">Reputation</span>
-          <span className="metric-value text-xl">{identity.reputation}</span>
+          <span className="data-label">Owner</span>
+          <span className="data-value">{activeIdentity.owner}</span>
+        </div>
+
+        <div className="data-row">
+          <span className="data-label">Commitment</span>
+          <span className="data-value">
+            {truncate(activeIdentity.commitment)}
+          </span>
+        </div>
+
+        <div className="data-row">
+          <span className="data-label">Verification Bitmap</span>
+          <span className="metric-value text-xl">{activeIdentity.verificationBitmap}</span>
         </div>
       </CardContent>
     </Card>
   );
+}
+
+function truncate(value: string, size = 10): string {
+  if (value.length <= size * 2) {
+    return value;
+  }
+
+  return `${value.slice(0, size)}...${value.slice(-size)}`;
 }

@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
+import { identityApi } from '@/lib/api';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -10,8 +11,8 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { useRouter } from 'next/navigation';
 
 export default function CreateIdentityPage() {
-  const { connected } = useWallet();
-  const [did, setDid] = useState('');
+  const { connected, publicKey } = useWallet();
+  const [seed, setSeed] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const router = useRouter();
@@ -24,8 +25,8 @@ export default function CreateIdentityPage() {
       return;
     }
 
-    if (!did.trim()) {
-      setError('Please enter a DID identifier');
+    if (!publicKey) {
+      setError('Wallet public key is unavailable');
       return;
     }
 
@@ -33,14 +34,11 @@ export default function CreateIdentityPage() {
     setError('');
 
     try {
-      // TODO: Implement actual Solana transaction
-      // 1. Generate DID document
-      // 2. Create commitment hash
-      // 3. Sign transaction
-      // 4. Submit to Solana program
-
-      // Simulate API call
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      const commitment = await buildCommitment(
+        publicKey.toBase58(),
+        seed.trim() || `${publicKey.toBase58()}:${Date.now()}`
+      );
+      await identityApi.createIdentity(publicKey.toBase58(), { commitment });
 
       alert('Identity created successfully!');
       router.push('/dashboard');
@@ -57,7 +55,7 @@ export default function CreateIdentityPage() {
         <div>
           <h1>Create Identity</h1>
           <p className="text-muted-foreground">
-            Create your decentralized identity on Solana
+            Create your wallet-bound identity anchor
           </p>
         </div>
       </div>
@@ -72,24 +70,24 @@ export default function CreateIdentityPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>DID Configuration</CardTitle>
+          <CardTitle>Identity Commitment</CardTitle>
           <CardDescription>
-            Your Decentralized Identifier (DID) will be registered on Solana
+            Your DID is derived from your wallet. This step creates the initial identity commitment.
           </CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="did">DID Identifier</Label>
+              <Label htmlFor="seed">Commitment Seed</Label>
               <Input
-                id="did"
-                placeholder="did:solana:..."
-                value={did}
-                onChange={(e) => setDid(e.target.value)}
+                id="seed"
+                placeholder="Optional local seed for the commitment"
+                value={seed}
+                onChange={(e) => setSeed(e.target.value)}
                 disabled={!connected || loading}
               />
               <p className="text-xs text-muted-foreground">
-                Leave empty to auto-generate a DID based on your wallet address
+                Leave empty to auto-generate a commitment seed from your wallet and the current timestamp.
               </p>
             </div>
 
@@ -108,10 +106,10 @@ export default function CreateIdentityPage() {
               <Button
                 type="button"
                 variant="outline"
-                onClick={() => setDid(`did:solana:${Date.now()}`)}
+                onClick={() => setSeed(`${publicKey?.toBase58() ?? 'wallet'}:${Date.now()}`)}
                 disabled={!connected}
               >
-                Auto-Generate
+                Auto-Generate Seed
               </Button>
             </div>
           </form>
@@ -123,12 +121,22 @@ export default function CreateIdentityPage() {
           <CardTitle>What happens next?</CardTitle>
         </CardHeader>
         <CardContent className="space-y-2 text-sm text-muted-foreground">
-          <p>1. Your DID will be registered on Solana blockchain</p>
-          <p>2. A commitment hash will be stored on-chain</p>
-          <p>3. Your personal data stays encrypted off-chain (IPFS)</p>
-          <p>4. You can start adding verifications (Aadhaar, PAN, etc.)</p>
+          <p>1. A DID is derived from your wallet address</p>
+          <p>2. A commitment is created for the identity anchor</p>
+          <p>3. Raw identity material stays off-chain</p>
+          <p>4. You can then add verification state and consented claims</p>
         </CardContent>
       </Card>
     </div>
   );
+}
+
+async function buildCommitment(walletAddress: string, seed: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(`${walletAddress}:${seed}`);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const hash = Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+  return `sha256:${hash}`;
 }
