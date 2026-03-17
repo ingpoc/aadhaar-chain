@@ -292,3 +292,32 @@ Before making compliance decisions:
   - evidence completeness is visible
   - consent is summarized without leaking raw verification metadata
   - audit references are visible
+
+## 2026-03-17 Document Extraction Quality Recovery
+
+### Root Cause
+- The gateway document stage was still asking the document-validator agent to reason over a truncated base64 prefix instead of real OCR text.
+- The gateway fallback extractor drifted away from the `document-processor` MCP server and only scraped printable bytes, which allowed image/PDF binaries to masquerade as text or produced low-signal field extraction.
+- The gateway runtime was also stale: `gateway/venv` pointed at an old filesystem path, OCR packages were not installed in the active environment, and `tesseract` was missing from the machine.
+
+### Decision
+- Create a single shared document-processing implementation in `gateway/app/document_processing.py` and use it from both the gateway and `mcp-servers/document-processor/server.py`.
+- Make the gateway document stage tool-backed by default: OCR/text extraction plus deterministic field parsing now forms the primary evidence contract, instead of the LLM parsing truncated base64.
+- Treat OCR runtime failure as an explicit provenance failure and treat unreadable documents as explicit evidence gaps, rather than collapsing both cases into `missing_contract`.
+- Repair the gateway execution environment so local verification matches the code:
+  - rebuild `gateway/venv`
+  - install `requirements.txt`
+  - install `pytest`
+  - install the `tesseract` system binary
+
+### Verification Evidence
+- `./venv/bin/python -m py_compile app/*.py tests/*.py ../mcp-servers/document-processor/server.py` passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ./venv/bin/pytest -q` passed with `13 passed`.
+- Runtime API validation on live FastAPI routes with synthetic image uploads now returns tool-backed document provenance:
+  - Aadhaar: extracted `name`, `dob`, and `uid` from PNG evidence with `model=document-processor-local`
+  - PAN: extracted `name`, `dob`, and `pan_number` from PNG evidence with `model=document-processor-local`
+- A matching Aadhaar submission and a matching PAN submission both reached `status=verified` with `evidence_status=complete` once the submitted claims matched the extracted document fields.
+
+### Residual Gap
+- Fraud and compliance are still falling back because the Claude SDK path is returning `Unknown message type: rate_limit_event` instead of a stable structured contract.
+- Browser submission through the live Chrome session is still best driven over direct CDP attach; the built-in DevTools MCP browser remains isolated from the user's real wallet session.

@@ -21,3 +21,6 @@ python-multipart==0.0.10
 pytesseract==0.3.10
 pillow==11.1.0
 google-cloud-vision==3.7.1
+
+# Test runtime
+pytest==9.0.2

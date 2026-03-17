@@ -119,27 +119,9 @@ def test_validate_document_uses_uploaded_source_metadata() -> None:
         content_type="application/pdf",
     )
 
-    async def fake_invoke_agent(*args, **kwargs):
-        del args, kwargs
-        return (
-            {
-                "document_type": "aadhaar",
-                "fields": {
-                    "name": "Alice Example",
-                    "dob": "1990-01-01",
-                    "uid": "123456789012",
-                },
-                "confidence": 0.96,
-                "warnings": [],
-            },
-            _provenance("document-validator"),
-        )
-
-    manager.invoke_agent = fake_invoke_agent  # type: ignore[method-assign]
-
     evidence = asyncio.run(
         manager.validate_document(
-            b"%PDF-1.4 test document",
+            b"UIDAI\nAlice Example\n01/01/1990\n1234 5678 9012",
             "aadhaar",
             verification,
             source,
@@ -169,12 +151,6 @@ def test_validate_document_falls_back_to_deterministic_contract_when_agent_retur
         content_type="text/plain",
     )
 
-    async def fake_invoke_agent(*args, **kwargs):
-        del args, kwargs
-        return None, _provenance("document-validator", status="missing_contract")
-
-    manager.invoke_agent = fake_invoke_agent  # type: ignore[method-assign]
-
     evidence = asyncio.run(
         manager.validate_document(
             b"UIDAI\nAlice Example\n01/01/1990\n1234 5678 9012",
@@ -185,11 +161,55 @@ def test_validate_document_falls_back_to_deterministic_contract_when_agent_retur
     )
 
     assert evidence.provenance.status == "completed"
-    assert evidence.provenance.model == "deterministic-fallback"
+    assert evidence.provenance.model == "document-processor-local"
     assert evidence.input_kind == "raw_document"
     assert evidence.extracted_fields["uid"] == "123456789012"
-    assert any("deterministic fallback" in warning.lower() for warning in evidence.warnings)
-    assert all(gap.code != "document_contract_missing" for gap in evidence.gaps)
+    assert evidence.extracted_fields["name"] == "Alice Example"
+    assert all(gap.code != "document_text_missing" for gap in evidence.gaps)
+
+
+def test_validate_document_reports_processor_runtime_failure() -> None:
+    manager = AgentManager()
+    verification = AadhaarVerificationData(
+        name="Alice Example",
+        dob="1990-01-01",
+        uid="123456789012",
+        consent_provided=True,
+    )
+    source = manager.build_document_source(
+        "upload",
+        b"fake-image-bytes",
+        file_name="aadhaar.png",
+        content_type="image/png",
+    )
+
+    with patch(
+        "app.agent_manager.extract_document_contract",
+        return_value=type(
+            "DocumentResult",
+            (),
+            {
+                "detected_document_type": "aadhaar",
+                "text_method": "ocr_unavailable",
+                "fields": {"name": None, "dob": None, "uid": None, "address": None},
+                "confidence": 0.0,
+                "warnings": ["OCR dependencies are unavailable in the gateway runtime."],
+                "runtime_error": "OCR dependencies are unavailable in the gateway runtime.",
+                "text": "",
+            },
+        )(),
+    ):
+        evidence = asyncio.run(
+            manager.validate_document(
+                b"fake-image-bytes",
+                "aadhaar",
+                verification,
+                source,
+            )
+        )
+
+    assert evidence.provenance.status == "failed"
+    assert any(gap.code == "document_processor_failed" for gap in evidence.gaps)
 
 
 def test_create_sdk_client_returns_distinct_instances_per_call() -> None:

@@ -28,6 +28,7 @@ from claude_agent_sdk.types import (
 )
 
 from app.mcp_config import DEFAULT_MCP_SERVERS
+from app.document_processing import extract_document_contract
 from app.models import (
     AadhaarVerificationData,
     AgentRunProvenance,
@@ -237,50 +238,41 @@ class AgentManager:
                 return candidate
         return None
 
-    def _fallback_document_payload(self, document_data: bytes, document_type: str) -> Dict[str, Any]:
-        text = self._extract_printable_text(document_data)
-        warnings: list[str] = []
-        confidence = 0.25
-
-        if not text.strip():
-            warnings.append("No readable text could be extracted from the supplied document bytes.")
-
-        if document_type == "aadhaar":
-            uid_match = re.search(r"\b(\d{4}[ ]?\d{4}[ ]?\d{4})\b", text)
-            dob_match = re.search(r"\b(\d{2}[/-]\d{2}[/-]\d{4})\b", text)
-            address_match = re.search(r"(?:address|addr)[:\s-]+(.+)", text, re.IGNORECASE)
-            fields = {
-                "name": self._extract_name_candidate(text, ["aadhaar", "uidai", "government", "address", "dob"]),
-                "dob": dob_match.group(1) if dob_match else None,
-                "uid": uid_match.group(1).replace(" ", "") if uid_match else None,
-                "address": address_match.group(1).strip() if address_match else None,
-            }
-        else:
-            pan_match = re.search(r"\b([A-Z]{5}\d{4}[A-Z])\b", text.upper())
-            dob_match = re.search(r"\b(\d{2}[/-]\d{2}[/-]\d{4})\b", text)
-            fields = {
-                "name": self._extract_name_candidate(
-                    text,
-                    ["permanent account number", "income tax", "pan", "dob"],
-                ),
-                "dob": dob_match.group(1) if dob_match else None,
-                "pan_number": pan_match.group(1) if pan_match else None,
-            }
-
-        found_fields = sum(1 for value in fields.values() if value)
-        if found_fields:
-            confidence = 0.45
-        missing_field_warnings = [
-            f"Missing {field}" for field, value in fields.items() if field != "address" and not value
+    def _build_document_processor_provenance(
+        self,
+        document_type: str,
+        payload: Dict[str, Any],
+        runtime_error: Optional[str],
+    ) -> AgentRunProvenance:
+        status = "failed" if runtime_error else "completed"
+        timestamp = self._timestamp()
+        tools = [
+            AgentToolTrace(
+                tool_name="ocr_document",
+                status="failed" if runtime_error else "completed",
+                output_preview=payload.get("text_method"),
+            ),
+            AgentToolTrace(
+                tool_name="detect_document_type",
+                status="failed" if runtime_error else "completed",
+                output_preview=str(payload.get("detected_document_type")),
+            ),
+            AgentToolTrace(
+                tool_name=f"extract_{document_type}_fields",
+                status="failed" if runtime_error else "completed",
+                output_preview=json.dumps(payload.get("fields", {}))[:200],
+            ),
         ]
-        warnings.extend(missing_field_warnings)
-
-        return {
-            "document_type": document_type,
-            "fields": fields,
-            "confidence": confidence,
-            "warnings": warnings,
-        }
+        return AgentRunProvenance(
+            agent_id=AgentType.DOCUMENT_VALIDATOR.value,
+            status=status,  # type: ignore[arg-type]
+            started_at=timestamp,
+            completed_at=timestamp,
+            model="document-processor-local",
+            tools=tools,
+            structured_output=payload,
+            error=runtime_error,
+        )
 
     def build_document_source(
         self,
@@ -636,58 +628,25 @@ class AgentManager:
                 gaps=[gap],
             )
 
-        document_b64 = base64.b64encode(document_data).decode("utf-8")
-        prompt = f"""Validate this {document_type} document.
-
-Document data (base64): {document_b64[:1000]}...
-
-Return only JSON with this exact shape:
-{{
-  "document_type": "{document_type}",
-  "fields": {{
-    "name": "string or null",
-    "dob": "string or null",
-    "{'uid' if document_type == 'aadhaar' else 'pan_number'}": "string or null"
-  }},
-  "confidence": 0.0,
-  "warnings": ["string"]
-}}
-
-If OCR fails or fields are missing, still return the same JSON shape with null field values,
-low confidence, and warnings that explain what could not be extracted. Do not return prose.
-"""
-
-        payload: Optional[Dict[str, Any]]
-        provenance: AgentRunProvenance
-        try:
-            payload, provenance = await asyncio.wait_for(
-                self.invoke_agent(AgentType.DOCUMENT_VALIDATOR, prompt),
-                timeout=12,
-            )
-        except asyncio.TimeoutError:
-            payload = None
-            started_at = self._timestamp()
-            provenance = self._failed_provenance(
-                AgentType.DOCUMENT_VALIDATOR.value,
-                started_at,
-                "Document validator timed out before returning a structured contract.",
-            )
-
-        used_deterministic_fallback = False
-        if payload is None:
-            payload = self._fallback_document_payload(document_data, document_type)
-            used_deterministic_fallback = True
-            provenance = AgentRunProvenance(
-                agent_id=AgentType.DOCUMENT_VALIDATOR.value,
-                status="completed",
-                started_at=provenance.started_at,
-                completed_at=self._timestamp(),
-                model="deterministic-fallback",
-                tools=provenance.tools,
-                response_preview=provenance.response_preview,
-                structured_output=payload,
-                error=provenance.error,
-            )
+        processed = extract_document_contract(
+            document_data,
+            expected_document_type=document_type,
+            mime_type=document_source.content_type if document_source else None,
+            file_name=document_source.file_name if document_source else None,
+        )
+        payload: Dict[str, Any] = {
+            "document_type": document_type,
+            "detected_document_type": processed.detected_document_type,
+            "text_method": processed.text_method,
+            "fields": processed.fields,
+            "confidence": processed.confidence,
+            "warnings": processed.warnings,
+        }
+        provenance = self._build_document_processor_provenance(
+            document_type,
+            payload,
+            processed.runtime_error,
+        )
 
         gaps: list[VerificationGap] = []
         fields: Dict[str, Any] = {}
@@ -703,57 +662,52 @@ low confidence, and warnings that explain what could not be extracted. Do not re
                 )
             )
 
-        if used_deterministic_fallback:
-            warnings.append(
-                "Document extraction used deterministic fallback because the primary document-validator contract was unavailable."
+        if provenance.status == "failed":
+            gaps.append(
+                self._gap(
+                    "document",
+                    "document_processor_failed",
+                    provenance.error or "Document processor invocation failed.",
+                )
             )
+        raw_fields = payload.get("fields")
+        if isinstance(raw_fields, dict):
+            fields = {key: value for key, value in raw_fields.items() if value not in (None, "")}
 
-        if provenance.status == "failed" and not used_deterministic_fallback:
-            gaps.append(
-                self._gap(
-                    "document",
-                    "document_agent_failed",
-                    provenance.error or "Document validator invocation failed.",
-                )
-            )
-        elif payload is None:
-            gaps.append(
-                self._gap(
-                    "document",
-                    "document_contract_missing",
-                    provenance.error or "Document validator did not return a structured evidence contract.",
-                )
-            )
+        raw_warnings = payload.get("warnings")
+        if isinstance(raw_warnings, list):
+            warnings.extend(str(item) for item in raw_warnings)
+
+        raw_confidence = payload.get("confidence")
+        if isinstance(raw_confidence, (int, float)):
+            confidence = float(raw_confidence)
         else:
-            raw_fields = payload.get("fields")
-            if isinstance(raw_fields, dict):
-                fields = {key: value for key, value in raw_fields.items() if value not in (None, "")}
-
-            raw_warnings = payload.get("warnings")
-            if isinstance(raw_warnings, list):
-                warnings.extend(str(item) for item in raw_warnings)
-
-            raw_confidence = payload.get("confidence")
-            if isinstance(raw_confidence, (int, float)):
-                confidence = float(raw_confidence)
-            else:
-                gaps.append(
-                    self._gap(
-                        "document",
-                        "document_confidence_missing",
-                        "Document validator did not provide a numeric confidence score.",
-                    )
+            gaps.append(
+                self._gap(
+                    "document",
+                    "document_confidence_missing",
+                    "Document processor did not provide a numeric confidence score.",
                 )
+            )
 
-            returned_type = payload.get("document_type")
-            if returned_type not in (None, document_type):
-                gaps.append(
-                    self._gap(
-                        "document",
-                        "document_type_mismatch",
-                        f"Document validator reported {returned_type!r} instead of {document_type!r}.",
-                    )
+        returned_type = payload.get("detected_document_type")
+        if returned_type not in (None, document_type, "unknown"):
+            gaps.append(
+                self._gap(
+                    "document",
+                    "document_type_mismatch",
+                    f"Document processor detected {returned_type!r} instead of {document_type!r}.",
                 )
+            )
+
+        if not processed.text.strip() and not processed.runtime_error:
+            gaps.append(
+                self._gap(
+                    "document",
+                    "document_text_missing",
+                    "Document processor could not extract readable text from the uploaded evidence.",
+                )
+            )
 
         missing_fields = [field for field in required_fields if not fields.get(field)]
         if missing_fields:
