@@ -265,3 +265,30 @@ Before making compliance decisions:
 ### Residual Gap
 - The current document fallback extractor still misidentifies names on low-signal synthetic docs by preferring header text such as `UNIQUE IDENTIFICATION AUTHORITY OF INDIA` or `GOVT OF INDIA`.
 - That is now an extraction-quality problem, not a contract/provenance problem. It should be handled in a separate follow-up branch.
+
+## 2026-03-17 Trust Substrate Anchor
+
+### Decision
+- `aadhaar-chain` is the trust substrate, and downstream consumers must read a constrained trust surface rather than raw verification metadata.
+- `VerificationStatus.metadata` remains the stable internal truth contract inside the repo.
+- Public trust consumers must use `GET /api/identity/{wallet_address}/trust`, which exposes only:
+  - workflow status and decision
+  - evidence completeness
+  - consent scope/purpose/reference
+  - attestation summary/reference
+  - revocation status
+  - review status
+  - audit receipt references
+
+### Explicit Rejections
+- Raw document bytes, OCR output, extracted PII, and full agent payloads must never become the downstream integration contract.
+- Verification completion does not imply credential issuance.
+- Manual review is a first-class governance state, not an implementation failure.
+
+### Verification Evidence
+- Backend route tests now confirm the trust surface redacts internal document/fraud/compliance evidence payloads.
+- Live dashboard validation in the attached Chrome Beta session shows the first consumer reading trust artifacts from the trust surface:
+  - PAN and Aadhaar appear as trust artifacts
+  - evidence completeness is visible
+  - consent is summarized without leaking raw verification metadata
+  - audit references are visible

@@ -136,6 +136,66 @@ class VerificationMetadata(BaseModel):
     assumptions: List[str] = Field(default_factory=list)
 
 
+class ConsentArtifact(BaseModel):
+    """Public consent summary exposed to trust consumers."""
+    status: Literal["pending", "granted", "missing", "not_required"]
+    scope: Optional[str] = None
+    purpose: Optional[str] = None
+    reference: Optional[str] = None
+
+
+class AttestationArtifact(BaseModel):
+    """Stable trust artifact for downstream credential/attestation consumers."""
+    status: Literal["pending", "not_issued", "issued", "revoked"]
+    credential_type: str
+    reference: Optional[str] = None
+
+
+class RevocationArtifact(BaseModel):
+    """Revocation status for any downstream trust artifact."""
+    status: Literal["pending", "not_applicable", "active", "revoked"]
+    reference: Optional[str] = None
+
+
+class ReviewArtifact(BaseModel):
+    """Manual review or approval status without exposing internal evidence payloads."""
+    status: Literal["pending", "manual_review_required", "approved", "rejected"]
+    reference: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class AuditReceiptReference(BaseModel):
+    """Reference to a durable backend trust or audit record."""
+    kind: Literal["verification_record", "decision_record", "consent_record"]
+    reference: str
+    created_at: str
+
+
+class TrustVerificationSummary(BaseModel):
+    """Downstream-safe trust view for one verification workflow."""
+    document_type: Literal["aadhaar", "pan"]
+    verification_id: str
+    workflow_status: Literal["pending", "processing", "verified", "failed", "manual_review"]
+    decision: Optional[Literal["approve", "reject", "manual_review"]] = None
+    reason: Optional[str] = None
+    evidence_status: Optional[Literal["complete", "partial", "missing"]] = None
+    consent: ConsentArtifact
+    attestation: AttestationArtifact
+    revocation: RevocationArtifact
+    review: ReviewArtifact
+    audit_receipts: List[AuditReceiptReference] = Field(default_factory=list)
+
+
+class TrustReadSurface(BaseModel):
+    """Stable public trust contract for downstream portfolio consumers."""
+    trust_version: Literal["v1"] = "v1"
+    wallet_address: str
+    did: str
+    verification_bitmap: int = 0
+    updated_at: str
+    verifications: List[TrustVerificationSummary] = Field(default_factory=list)
+
+
 class VerificationStatus(BaseModel):
     """Status of verification process."""
     verification_id: str

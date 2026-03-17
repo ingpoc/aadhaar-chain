@@ -3,10 +3,17 @@ from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Uploa
 from typing import Optional
 
 from app.models import (
+    AuditReceiptReference,
+    AttestationArtifact,
+    ConsentArtifact,
     IdentityData,
     CreateIdentityRequest,
     CreateIdentityResponse,
     DocumentEvidenceSource,
+    ReviewArtifact,
+    RevocationArtifact,
+    TrustReadSurface,
+    TrustVerificationSummary,
     UpdateIdentityRequest,
     VerificationStatus,
     VerificationStep,
@@ -132,6 +139,22 @@ async def get_verification_status(
     return ApiResponse(
         success=True,
         data=status.model_dump()
+    )
+
+
+@router.get("/{wallet_address}/trust", response_model=ApiResponse, tags=["identity"])
+async def get_trust_surface(
+    wallet_address: str,
+):
+    """Expose a downstream-safe trust view without leaking raw verification evidence."""
+    if wallet_address not in identities:
+        raise HTTPException(status_code=404, detail="Identity not found")
+
+    identity = identities[wallet_address]
+    trust_surface = _build_trust_surface(identity)
+    return ApiResponse(
+        success=True,
+        data=trust_surface.model_dump(),
     )
 
 
@@ -289,6 +312,125 @@ def _get_timestamp() -> str:
 def _build_did(wallet_address: str) -> str:
     """Build a stable DID-like identifier from the wallet address."""
     return f"did:solana:{wallet_address}"
+
+
+def _build_trust_surface(identity: IdentityData) -> TrustReadSurface:
+    wallet_verifications = [
+        status
+        for status in agent_manager.verification_records.values()
+        if status.wallet_address == identity.owner
+    ]
+    wallet_verifications.sort(key=lambda status: status.updated_at, reverse=True)
+    latest_update = wallet_verifications[0].updated_at if wallet_verifications else identity.updated_at
+
+    return TrustReadSurface(
+        wallet_address=identity.owner,
+        did=identity.did,
+        verification_bitmap=identity.verification_bitmap,
+        updated_at=latest_update,
+        verifications=[
+            _to_trust_verification_summary(status)
+            for status in wallet_verifications
+        ],
+    )
+
+
+def _to_trust_verification_summary(status: VerificationStatus) -> TrustVerificationSummary:
+    document_type = "aadhaar" if status.verification_id.startswith("aadhaar_") else "pan"
+    metadata = status.metadata
+    consent = _build_consent_artifact(status, document_type)
+    review = _build_review_artifact(status)
+    audit_receipts = [
+        AuditReceiptReference(
+            kind="verification_record",
+            reference=f"verification:{status.verification_id}",
+            created_at=status.created_at,
+        )
+    ]
+    if metadata is not None:
+        audit_receipts.append(
+            AuditReceiptReference(
+                kind="decision_record",
+                reference=f"decision:{status.verification_id}",
+                created_at=status.updated_at,
+            )
+        )
+        if consent.reference:
+            audit_receipts.append(
+                AuditReceiptReference(
+                    kind="consent_record",
+                    reference=consent.reference,
+                    created_at=status.created_at,
+                )
+            )
+
+    return TrustVerificationSummary(
+        document_type=document_type,  # type: ignore[arg-type]
+        verification_id=status.verification_id,
+        workflow_status=status.status,
+        decision=metadata.decision if metadata else None,
+        reason=metadata.reason if metadata else status.error,
+        evidence_status=metadata.evidence_status if metadata else None,
+        consent=consent,
+        attestation=AttestationArtifact(
+            status="not_issued" if metadata else "pending",
+            credential_type=document_type,
+            reference=None,
+        ),
+        revocation=RevocationArtifact(
+            status="not_applicable" if metadata else "pending",
+            reference=None,
+        ),
+        review=review,
+        audit_receipts=audit_receipts,
+    )
+
+
+def _build_consent_artifact(
+    status: VerificationStatus,
+    document_type: str,
+) -> ConsentArtifact:
+    if document_type != "aadhaar":
+        return ConsentArtifact(status="not_required")
+
+    if status.metadata is None:
+        return ConsentArtifact(
+            status="pending",
+            scope="aadhaar_identity_verification",
+            purpose="identity_verification",
+        )
+
+    consent_provided = bool(
+        status.metadata.document.submitted_claims.get("consent_provided", False)
+    )
+    return ConsentArtifact(
+        status="granted" if consent_provided else "missing",
+        scope="aadhaar_identity_verification",
+        purpose="identity_verification",
+        reference=f"consent:{status.verification_id}" if consent_provided else None,
+    )
+
+
+def _build_review_artifact(status: VerificationStatus) -> ReviewArtifact:
+    if status.status == "manual_review":
+        return ReviewArtifact(
+            status="manual_review_required",
+            reference=f"review:{status.verification_id}",
+            reason=status.error,
+        )
+    if status.status == "verified":
+        return ReviewArtifact(
+            status="approved",
+            reference=f"review:{status.verification_id}",
+            reason=status.metadata.reason if status.metadata else None,
+        )
+    if status.status == "failed":
+        return ReviewArtifact(
+            status="rejected",
+            reference=f"review:{status.verification_id}",
+            reason=status.error,
+        )
+    return ReviewArtifact(status="pending")
 
 
 async def _read_uploaded_document(

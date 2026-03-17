@@ -133,6 +133,59 @@ export interface VerificationMetadata {
   assumptions: string[];
 }
 
+export interface ConsentArtifact {
+  status: 'pending' | 'granted' | 'missing' | 'not_required';
+  scope?: string;
+  purpose?: string;
+  reference?: string;
+}
+
+export interface AttestationArtifact {
+  status: 'pending' | 'not_issued' | 'issued' | 'revoked';
+  credentialType: string;
+  reference?: string;
+}
+
+export interface RevocationArtifact {
+  status: 'pending' | 'not_applicable' | 'active' | 'revoked';
+  reference?: string;
+}
+
+export interface ReviewArtifact {
+  status: 'pending' | 'manual_review_required' | 'approved' | 'rejected';
+  reference?: string;
+  reason?: string;
+}
+
+export interface AuditReceiptReference {
+  kind: 'verification_record' | 'decision_record' | 'consent_record';
+  reference: string;
+  createdAt: string;
+}
+
+export interface TrustVerificationSummary {
+  documentType: 'aadhaar' | 'pan';
+  verificationId: string;
+  workflowStatus: VerificationStatus['status'];
+  decision?: VerificationMetadata['decision'];
+  reason?: string;
+  evidenceStatus?: VerificationMetadata['evidenceStatus'];
+  consent: ConsentArtifact;
+  attestation: AttestationArtifact;
+  revocation: RevocationArtifact;
+  review: ReviewArtifact;
+  auditReceipts: AuditReceiptReference[];
+}
+
+export interface TrustReadSurface {
+  trustVersion: 'v1';
+  walletAddress: string;
+  did: string;
+  verificationBitmap: number;
+  updatedAt: string;
+  verifications: TrustVerificationSummary[];
+}
+
 export interface VerificationStatus {
   verificationId: string;
   status: 'pending' | 'processing' | 'verified' | 'failed' | 'manual_review';

@@ -1,5 +1,8 @@
 import axios, { AxiosInstance, AxiosError, InternalAxiosRequestConfig } from 'axios';
 import type {
+  AuditReceiptReference,
+  AttestationArtifact,
+  ConsentArtifact,
   Identity,
   CreateIdentityRequest,
   CreateIdentityResponse,
@@ -10,6 +13,10 @@ import type {
   DocumentEvidenceSource,
   DocumentVerificationEvidence,
   FraudVerificationEvidence,
+  RevocationArtifact,
+  ReviewArtifact,
+  TrustReadSurface,
+  TrustVerificationSummary,
   VerificationGap,
   VerificationMetadata,
   PanVerificationData,
@@ -129,6 +136,59 @@ interface BackendVerificationMetadata {
   compliance: BackendComplianceVerificationEvidence;
   blocking_gaps: BackendVerificationGap[];
   assumptions: string[];
+}
+
+interface BackendConsentArtifact {
+  status: ConsentArtifact['status'];
+  scope?: string;
+  purpose?: string;
+  reference?: string;
+}
+
+interface BackendAttestationArtifact {
+  status: AttestationArtifact['status'];
+  credential_type: string;
+  reference?: string;
+}
+
+interface BackendRevocationArtifact {
+  status: RevocationArtifact['status'];
+  reference?: string;
+}
+
+interface BackendReviewArtifact {
+  status: ReviewArtifact['status'];
+  reference?: string;
+  reason?: string;
+}
+
+interface BackendAuditReceiptReference {
+  kind: AuditReceiptReference['kind'];
+  reference: string;
+  created_at: string;
+}
+
+interface BackendTrustVerificationSummary {
+  document_type: TrustVerificationSummary['documentType'];
+  verification_id: string;
+  workflow_status: TrustVerificationSummary['workflowStatus'];
+  decision?: TrustVerificationSummary['decision'];
+  reason?: string;
+  evidence_status?: TrustVerificationSummary['evidenceStatus'];
+  consent: BackendConsentArtifact;
+  attestation: BackendAttestationArtifact;
+  revocation: BackendRevocationArtifact;
+  review: BackendReviewArtifact;
+  audit_receipts: BackendAuditReceiptReference[];
+}
+
+interface BackendTrustReadSurface {
+  trust_version: TrustReadSurface['trustVersion'];
+  wallet_address: string;
+  did: string;
+  verification_bitmap: number;
+  updated_at: string;
+  verifications: BackendTrustVerificationSummary[];
 }
 
 // API base URL from env or default
@@ -320,6 +380,77 @@ function toVerificationStatus(
   };
 }
 
+function toConsentArtifact(consent: BackendConsentArtifact): ConsentArtifact {
+  return {
+    status: consent.status,
+    scope: consent.scope,
+    purpose: consent.purpose,
+    reference: consent.reference,
+  };
+}
+
+function toAttestationArtifact(attestation: BackendAttestationArtifact): AttestationArtifact {
+  return {
+    status: attestation.status,
+    credentialType: attestation.credential_type,
+    reference: attestation.reference,
+  };
+}
+
+function toRevocationArtifact(revocation: BackendRevocationArtifact): RevocationArtifact {
+  return {
+    status: revocation.status,
+    reference: revocation.reference,
+  };
+}
+
+function toReviewArtifact(review: BackendReviewArtifact): ReviewArtifact {
+  return {
+    status: review.status,
+    reference: review.reference,
+    reason: review.reason,
+  };
+}
+
+function toAuditReceiptReference(
+  receipt: BackendAuditReceiptReference
+): AuditReceiptReference {
+  return {
+    kind: receipt.kind,
+    reference: receipt.reference,
+    createdAt: receipt.created_at,
+  };
+}
+
+function toTrustVerificationSummary(
+  summary: BackendTrustVerificationSummary
+): TrustVerificationSummary {
+  return {
+    documentType: summary.document_type,
+    verificationId: summary.verification_id,
+    workflowStatus: summary.workflow_status,
+    decision: summary.decision,
+    reason: summary.reason,
+    evidenceStatus: summary.evidence_status,
+    consent: toConsentArtifact(summary.consent),
+    attestation: toAttestationArtifact(summary.attestation),
+    revocation: toRevocationArtifact(summary.revocation),
+    review: toReviewArtifact(summary.review),
+    auditReceipts: summary.audit_receipts.map(toAuditReceiptReference),
+  };
+}
+
+function toTrustReadSurface(surface: BackendTrustReadSurface): TrustReadSurface {
+  return {
+    trustVersion: surface.trust_version,
+    walletAddress: surface.wallet_address,
+    did: surface.did,
+    verificationBitmap: surface.verification_bitmap,
+    updatedAt: surface.updated_at,
+    verifications: surface.verifications.map(toTrustVerificationSummary),
+  };
+}
+
 export const identityApi = {
   // Get identity by wallet address
   async getIdentity(walletAddress: string): Promise<Identity> {
@@ -354,6 +485,14 @@ export const identityApi = {
     );
     if (!data.data) throw new Error(data.error?.message || 'Failed to update commitment');
     return toIdentity(data.data);
+  },
+
+  async getTrustSurface(walletAddress: string): Promise<TrustReadSurface> {
+    const { data } = await apiClient.get<ApiResponse<BackendTrustReadSurface>>(
+      `/api/identity/${walletAddress}/trust`
+    );
+    if (!data.data) throw new Error(data.error?.message || 'Failed to fetch trust surface');
+    return toTrustReadSurface(data.data);
   },
 };
 
