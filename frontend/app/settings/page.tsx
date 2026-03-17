@@ -1,123 +1,163 @@
 'use client';
 
 import { useWallet } from '@solana/wallet-adapter-react';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+
+import { PageHeader } from '@/components/layout/page-header';
 import { Button } from '@/components/ui/button';
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+import { EmptyState } from '@/components/ui/empty-state';
 import { Input } from '@/components/ui/input';
+import { KeyValueList } from '@/components/ui/key-value-list';
 import { Label } from '@/components/ui/label';
-import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Notice } from '@/components/ui/notice';
 
 export default function SettingsPage() {
   const { connected, publicKey } = useWallet();
 
   const handleExportData = () => {
-    // TODO: Implement data export (GDPR compliance)
-    alert('Data export feature coming soon');
+    window.alert('Data export feature coming soon');
   };
 
   const handleDeleteIdentity = () => {
-    if (confirm('Are you sure you want to delete your identity? This action cannot be undone.')) {
-      // TODO: Implement identity deletion
-      alert('Identity deletion feature coming soon');
+    if (
+      window.confirm(
+        'Are you sure you want to delete your identity? This action cannot be undone.'
+      )
+    ) {
+      window.alert('Identity deletion feature coming soon');
     }
   };
 
   return (
-    <div className="space-y-6">
-      <h1>Settings</h1>
+    <div className="page-stack">
+      <PageHeader
+        eyebrow="System settings"
+        title="Wallet and privacy settings"
+        description="Review the connected wallet, configure recovery details, and inspect the operational environment used by the authenticated app."
+      />
 
-      {!connected && (
-        <Alert className="border-yellow-200 bg-yellow-50 dark:bg-yellow-950/20">
-          <AlertDescription className="text-yellow-800 dark:text-yellow-200">
-            Please connect your wallet to access settings
-          </AlertDescription>
-        </Alert>
-      )}
-
-      {connected && (
+      {!connected ? (
+        <EmptyState
+          title="Connect a wallet to access settings"
+          description="Settings are scoped to the current wallet and only become meaningful once the ownership surface is active."
+        />
+      ) : (
         <>
-          <Card>
-            <CardHeader>
-              <CardTitle>Wallet Information</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Address</span>
-                <span className="font-mono text-sm">{publicKey?.toBase58()}</span>
-              </div>
-            </CardContent>
-          </Card>
+          <div className="section-grid">
+            <Card>
+              <CardHeader>
+                <CardTitle>Wallet information</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <KeyValueList
+                  items={[
+                    {
+                      label: 'Address',
+                      value: publicKey?.toBase58() ?? 'Unknown',
+                      valueClassName: 'font-mono text-xs md:text-sm',
+                    },
+                    {
+                      label: 'Network',
+                      value: 'Solana Devnet',
+                    },
+                  ]}
+                />
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <CardTitle>Recovery settings</CardTitle>
+                <CardDescription>
+                  Configure a recovery contact for the wallet-bound identity surface.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="field-stack">
+                  <Label htmlFor="recovery-email">Recovery email</Label>
+                  <Input
+                    id="recovery-email"
+                    type="email"
+                    placeholder="recovery@example.com"
+                  />
+                </div>
+                <Button>Save recovery settings</Button>
+              </CardContent>
+            </Card>
+          </div>
 
           <Card>
             <CardHeader>
-              <CardTitle>Recovery Settings</CardTitle>
+              <CardTitle>Data and privacy</CardTitle>
               <CardDescription>
-                Set up recovery options for your identity
+                Manage exports and high-risk lifecycle actions for the identity record.
               </CardDescription>
             </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="space-y-2">
-                <Label htmlFor="recovery-email">Recovery Email</Label>
-                <Input id="recovery-email" type="email" placeholder="recovery@example.com" />
-              </div>
-              <Button>Save Recovery Settings</Button>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Data & Privacy</CardTitle>
-              <CardDescription>
-                Manage your data and privacy preferences
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="flex justify-between items-center">
-                <div>
-                  <p className="font-medium">Export Data</p>
+            <CardContent className="space-y-6">
+              <div className="flex flex-col gap-4 rounded-[1.5rem] border border-border/80 p-5 md:flex-row md:items-center md:justify-between">
+                <div className="space-y-1">
+                  <p className="text-sm font-semibold tracking-tight text-foreground">
+                    Export data
+                  </p>
                   <p className="text-sm text-muted-foreground">
-                    Download all your data (GDPR compliance)
+                    Download your current wallet-linked data for portability and audit.
                   </p>
                 </div>
                 <Button variant="outline" onClick={handleExportData}>
-                  Export
+                  Export data
                 </Button>
               </div>
-              <div className="border-t pt-4">
-                <div className="flex justify-between items-center">
-                  <div>
-                    <p className="font-medium text-destructive">Delete Identity</p>
-                    <p className="text-sm text-muted-foreground">
-                      Permanently delete your identity and all associated data
-                    </p>
-                  </div>
-                  <Button variant="destructive" onClick={handleDeleteIdentity}>
-                    Delete
-                  </Button>
+
+              <Notice tone="warning" title="Danger zone">
+                Identity deletion is irreversible. This action should stay behind a dedicated
+                confirmation flow before shipping to production.
+              </Notice>
+
+              <div className="flex flex-col gap-4 rounded-[1.5rem] border border-destructive/20 bg-destructive-soft/60 p-5 md:flex-row md:items-center md:justify-between">
+                <div className="space-y-1">
+                  <p className="text-sm font-semibold tracking-tight text-foreground">
+                    Delete identity
+                  </p>
+                  <p className="text-sm text-muted-foreground">
+                    Permanently remove the identity and associated local references.
+                  </p>
                 </div>
+                <Button variant="destructive" onClick={handleDeleteIdentity}>
+                  Delete identity
+                </Button>
               </div>
             </CardContent>
           </Card>
 
           <Card>
             <CardHeader>
-              <CardTitle>Network Settings</CardTitle>
+              <CardTitle>Network settings</CardTitle>
               <CardDescription>
-                Configure blockchain connection
+                Blockchain connectivity values currently used by the frontend.
               </CardDescription>
             </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="space-y-2">
-                <Label>RPC Endpoint</Label>
-                <Input
-                  value={process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.devnet.solana.com'}
-                  disabled
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>Network</Label>
-                <Input value="Devnet" disabled />
-              </div>
+            <CardContent>
+              <KeyValueList
+                items={[
+                  {
+                    label: 'RPC endpoint',
+                    value:
+                      process.env.NEXT_PUBLIC_SOLANA_RPC_URL ??
+                      'https://api.devnet.solana.com',
+                    valueClassName: 'font-mono text-xs md:text-sm',
+                  },
+                  {
+                    label: 'Network',
+                    value: 'Devnet',
+                  },
+                ]}
+              />
             </CardContent>
           </Card>
         </>

@@ -1,0 +1,152 @@
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary-strong: var(--primary-strong);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-saffron: var(--saffron);
+  --color-saffron-foreground: var(--saffron-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-warning-soft: var(--warning-soft);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-success-soft: var(--success-soft);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-destructive-soft: var(--destructive-soft);
+  --font-sans: var(--font-inter);
+  --font-serif: var(--font-instrument-serif);
+  --font-mono: var(--font-ibm-plex-mono);
+  --font-data: var(--font-ibm-plex-mono);
+  --radius-sm: calc(var(--radius) - 8px);
+  --radius-md: calc(var(--radius) - 4px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --radius-3xl: calc(var(--radius) + 12px);
+}
+
+:root {
+  --radius: 1rem;
+  --app-shell: 72rem;
+
+  --cream: #faf7f0;
+  --card-cream: #fffdf8;
+  --charcoal: #161615;
+  --ink-soft: rgba(22, 22, 21, 0.72);
+
+  --primary: #0052a5;
+  --primary-strong: #003f82;
+  --primary-foreground: #ffffff;
+  --saffron: #ff9933;
+  --saffron-foreground: #ffffff;
+
+  --warning: #b56a1b;
+  --warning-foreground: #6f3a00;
+  --warning-soft: rgba(255, 153, 51, 0.14);
+
+  --success: #138808;
+  --success-foreground: #ffffff;
+  --success-soft: rgba(19, 136, 8, 0.12);
+
+  --destructive: #b83a2f;
+  --destructive-foreground: #ffffff;
+  --destructive-soft: rgba(184, 58, 47, 0.12);
+
+  --background: var(--cream);
+  --foreground: var(--charcoal);
+  --card: var(--card-cream);
+  --card-foreground: var(--charcoal);
+  --popover: var(--card-cream);
+  --popover-foreground: var(--charcoal);
+  --secondary: rgba(22, 22, 21, 0.05);
+  --secondary-foreground: var(--charcoal);
+  --muted: rgba(22, 22, 21, 0.06);
+  --muted-foreground: rgba(22, 22, 21, 0.62);
+  --accent: rgba(0, 82, 165, 0.08);
+  --accent-foreground: var(--charcoal);
+  --border: rgba(22, 22, 21, 0.1);
+  --border-strong: rgba(22, 22, 21, 0.16);
+  --input: rgba(22, 22, 21, 0.12);
+  --ring: rgba(0, 82, 165, 0.28);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+
+  ::selection {
+    background: rgba(0, 82, 165, 0.14);
+    color: var(--charcoal);
+  }
+
+  h1,
+  h2,
+  h3 {
+    @apply font-serif font-normal tracking-tight text-foreground;
+  }
+
+  h1 {
+    font-size: clamp(2.35rem, 5vw, 4.5rem);
+    line-height: 0.98;
+    letter-spacing: -0.04em;
+  }
+
+  h2 {
+    font-size: clamp(1.85rem, 4vw, 3.2rem);
+    line-height: 1.02;
+    letter-spacing: -0.035em;
+  }
+
+  h3 {
+    font-size: clamp(1.4rem, 2.5vw, 2rem);
+    line-height: 1.1;
+    letter-spacing: -0.03em;
+  }
+
+  h4,
+  h5,
+  h6,
+  button,
+  input,
+  textarea,
+  select {
+    @apply font-sans;
+  }
+
+  p,
+  li,
+  td,
+  th,
+  label {
+    @apply tracking-tight;
+  }
+
+  a {
+    @apply transition-colors;
+  }
+}

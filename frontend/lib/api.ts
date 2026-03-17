@@ -453,11 +453,11 @@ function toTrustReadSurface(surface: BackendTrustReadSurface): TrustReadSurface 
 
 export const identityApi = {
   // Get identity by wallet address
-  async getIdentity(walletAddress: string): Promise<Identity> {
+  async getIdentity(walletAddress: string): Promise<Identity | null> {
     const { data } = await apiClient.get<ApiResponse<BackendIdentity>>(
       `/api/identity/${walletAddress}`
     );
-    if (!data.data) throw new Error(data.error?.message || 'Failed to fetch identity');
+    if (!data.data) return null;
     return toIdentity(data.data);
   },
 

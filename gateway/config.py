@@ -16,7 +16,16 @@ class Settings(BaseSettings):
     port: int = 8000
 
     # CORS (accept both comma-separated string and list)
-    cors_origins: Union[str, list[str]] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    cors_origins: Union[str, list[str]] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3002",
+        "http://127.0.0.1:3002",
+        "http://localhost:3003",
+        "http://127.0.0.1:3003",
+        "http://localhost:3004",
+        "http://127.0.0.1:3004",
+    ]
     cors_allow_credentials: bool = True
     cors_allow_methods: list[str] = ["*"]
     cors_allow_headers: list[str] = ["*"]

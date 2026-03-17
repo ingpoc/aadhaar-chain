@@ -1,16 +1,25 @@
 'use client';
 
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { useWallet } from '@solana/wallet-adapter-react';
 import { useEffect, useState } from 'react';
-import axios from 'axios';
+import { useWallet } from '@solana/wallet-adapter-react';
+
 import { identityApi } from '@/lib/api';
 import type { Identity, TrustReadSurface } from '@/lib/types';
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+import { EmptyState } from '@/components/ui/empty-state';
+import { KeyValueList } from '@/components/ui/key-value-list';
+import { StatusBadge, formatStatusLabel } from '@/components/ui/status-badge';
 
 export function IdentityCard() {
   const { publicKey, connected } = useWallet();
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [trustSurface, setTrustSurface] = useState<TrustReadSurface | null>(null);
+
   const walletAddress = publicKey?.toBase58();
 
   useEffect(() => {
@@ -20,8 +29,17 @@ export function IdentityCard() {
 
     let cancelled = false;
 
-    identityApi.getIdentity(walletAddress)
+    identityApi
+      .getIdentity(walletAddress)
       .then(async (result) => {
+        if (!result) {
+          if (!cancelled) {
+            setIdentity(null);
+            setTrustSurface(null);
+          }
+          return;
+        }
+
         if (!cancelled) {
           setIdentity(result);
         }
@@ -31,7 +49,7 @@ export function IdentityCard() {
           if (!cancelled) {
             setTrustSurface(trust);
           }
-        } catch (error: unknown) {
+        } catch (error) {
           if (!cancelled) {
             console.error('Failed to load trust surface', error);
             setTrustSurface(null);
@@ -39,20 +57,17 @@ export function IdentityCard() {
         }
       })
       .catch((error: unknown) => {
-        if (!cancelled) {
-          if (axios.isAxiosError(error) && error.response?.status === 404) {
-            setIdentity(null);
-            setTrustSurface(null);
-          } else {
-            console.error('Failed to load identity', error);
-          }
+        if (cancelled) {
+          return;
         }
+
+        console.error('Failed to load identity', error);
       });
 
     return () => {
       cancelled = true;
     };
-  }, [walletAddress, connected]);
+  }, [connected, walletAddress]);
 
   const activeIdentity =
     connected && identity?.owner === walletAddress ? identity : null;
@@ -61,84 +76,116 @@ export function IdentityCard() {
 
   if (!activeIdentity) {
     return (
-      <Card className="metric-card">
-        <CardHeader>
-          <CardTitle className="text-lg">Identity Status</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex items-center gap-2 text-muted-foreground">
-            <span className="status-dot-muted" />
-            <span className="text-sm">{connected ? 'No identity found' : 'Wallet not connected'}</span>
-          </div>
-          <p className="text-sm text-muted-foreground">
-            {connected
-              ? 'Create your decentralized identity to get started.'
-              : 'Connect your wallet to load or create an identity anchor.'}
-          </p>
-        </CardContent>
-      </Card>
+      <EmptyState
+        title="No identity anchor yet"
+        description="Create your wallet-bound identity to start collecting verification artifacts and downstream credentials."
+      />
     );
   }
 
+  const latestVerification = activeTrustSurface?.verifications[0];
+
   return (
-    <Card className="metric-card">
+    <Card>
       <CardHeader>
-        <CardTitle className="text-lg">Identity Status</CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="data-row">
-          <span className="data-label">DID</span>
-          <span className="data-value">{activeIdentity.did}</span>
-        </div>
-
-        <div className="data-row">
-          <span className="data-label">Owner</span>
-          <span className="data-value">{activeIdentity.owner}</span>
-        </div>
-
-        <div className="data-row">
-          <span className="data-label">Commitment</span>
-          <span className="data-value">
-            {truncate(activeIdentity.commitment)}
-          </span>
-        </div>
-
-        <div className="data-row">
-          <span className="data-label">Verification Bitmap</span>
-          <span className="metric-value text-xl">{activeIdentity.verificationBitmap}</span>
-        </div>
-
-        {activeTrustSurface && activeTrustSurface.verifications.length > 0 && (
-          <div className="card-section space-y-3">
-            <p className="data-label">Trust Artifacts</p>
-            {activeTrustSurface.verifications.map((verification) => (
-              <div key={verification.verificationId} className="rounded-md border border-border p-3 space-y-2">
-                <div className="data-row">
-                  <span className="data-label">{verification.documentType.toUpperCase()}</span>
-                  <span className="data-value">
-                    {verification.review.status === 'manual_review_required'
-                      ? 'Manual Review'
-                      : formatLabel(verification.workflowStatus)}
-                  </span>
-                </div>
-                <div className="data-row">
-                  <span className="data-label">Evidence</span>
-                  <span className="data-value">
-                    {verification.evidenceStatus ? formatLabel(verification.evidenceStatus) : 'Pending'}
-                  </span>
-                </div>
-                <div className="data-row">
-                  <span className="data-label">Consent</span>
-                  <span className="data-value">{formatLabel(verification.consent.status)}</span>
-                </div>
-                <div className="data-row">
-                  <span className="data-label">Audit Ref</span>
-                  <span className="data-value">{verification.auditReceipts[0]?.reference ?? 'Pending'}</span>
-                </div>
-              </div>
-            ))}
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+          <div className="space-y-2">
+            <CardTitle>Identity anchor</CardTitle>
+            <p className="text-sm text-muted-foreground">
+              Canonical identity record and the trust artifacts attached to it.
+            </p>
           </div>
-        )}
+          <StatusBadge
+            status={latestVerification?.workflowStatus ?? 'pending'}
+            label={
+              latestVerification
+                ? formatStatusLabel(latestVerification.workflowStatus)
+                : 'Awaiting verification'
+            }
+          />
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-6">
+        <KeyValueList
+          items={[
+            {
+              label: 'DID',
+              value: activeIdentity.did,
+              valueClassName: 'font-mono text-xs md:text-sm',
+            },
+            {
+              label: 'Owner',
+              value: activeIdentity.owner,
+              valueClassName: 'font-mono text-xs md:text-sm',
+            },
+            {
+              label: 'Commitment',
+              value: truncate(activeIdentity.commitment),
+              valueClassName: 'font-mono text-xs md:text-sm',
+            },
+            {
+              label: 'Verification bitmap',
+              value: String(activeIdentity.verificationBitmap),
+              valueClassName: 'font-mono tabular-nums text-base',
+            },
+          ]}
+        />
+
+        {activeTrustSurface?.verifications.length ? (
+          <div className="space-y-3">
+            <p className="page-eyebrow">Trust artifacts</p>
+            <div className="space-y-3">
+              {activeTrustSurface.verifications.map((verification) => (
+                <div
+                  key={verification.verificationId}
+                  className="list-panel space-y-4"
+                >
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                    <div>
+                      <p className="text-sm font-semibold tracking-tight text-foreground">
+                        {verification.documentType.toUpperCase()} verification
+                      </p>
+                      <p className="mt-1 text-sm text-muted-foreground">
+                        {verification.reason ?? 'Verification artifact recorded on the trust surface.'}
+                      </p>
+                    </div>
+                    <StatusBadge
+                      status={
+                        verification.review.status === 'manual_review_required'
+                          ? verification.review.status
+                          : verification.workflowStatus
+                      }
+                    />
+                  </div>
+
+                  <KeyValueList
+                    items={[
+                      {
+                        label: 'Evidence',
+                        value: verification.evidenceStatus
+                          ? formatStatusLabel(verification.evidenceStatus)
+                          : 'Pending',
+                      },
+                      {
+                        label: 'Consent',
+                        value: formatStatusLabel(verification.consent.status),
+                      },
+                      {
+                        label: 'Attestation',
+                        value: formatStatusLabel(verification.attestation.status),
+                      },
+                      {
+                        label: 'Audit reference',
+                        value: verification.auditReceipts[0]?.reference ?? 'Pending',
+                        valueClassName: 'font-mono text-xs',
+                      },
+                    ]}
+                  />
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   );
@@ -150,8 +197,4 @@ function truncate(value: string, size = 10): string {
   }
 
   return `${value.slice(0, size)}...${value.slice(-size)}`;
-}
-
-function formatLabel(value: string): string {
-  return value.replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
 }

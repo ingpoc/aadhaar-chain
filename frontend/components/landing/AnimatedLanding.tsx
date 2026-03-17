@@ -1,6 +1,8 @@
 'use client';
 
 import { useEffect } from 'react';
+import Link from 'next/link';
+import type { ReactNode } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import gsap from 'gsap';
 import ScrollTrigger from 'gsap/ScrollTrigger';
@@ -14,11 +16,12 @@ import {
   useNavbarHideOnScroll,
 } from './useGsapAnimations';
 import { Navbar } from './Navbar';
+import { Button } from '@/components/ui/button';
 
 gsap.registerPlugin(ScrollTrigger);
 
 const HeroSection = () => (
-  <section className="hero min-h-screen flex flex-col items-center justify-center relative p-4 overflow-hidden bg-[var(--cream)]">
+  <section className="hero landing-hero">
     <svg
       viewBox="0 0 1000 1000"
       fill="none"
@@ -57,44 +60,34 @@ const HeroSection = () => (
       </g>
     </svg>
 
-    <h1 className="hero-title landing-h1 text-center relative z-10 text-[var(--charcoal)]">
-      <span className="block">
-        <span className="word" style={{ display: 'inline-block', opacity: 0, transform: 'translateY(100%)' }}>
-          Imagine
+    <div className="landing-hero-copy">
+      <h1 className="hero-title landing-h1 text-center">
+        <span className="block">
+          <span className="landing-word word">Imagine</span>
         </span>
-      </span>
-      <span className="block">
-        <span className="word" style={{ display: 'inline-block', opacity: 0, transform: 'translateY(100%)' }}>
-          a world
+        <span className="block">
+          <span className="landing-word word">a world</span>
         </span>
-      </span>
-      <span className="block">
-        <span className="word" style={{ display: 'inline-block', opacity: 0, transform: 'translateY(100%)' }}>
-          where
+        <span className="block">
+          <span className="landing-word word">where</span>
         </span>
-      </span>
-      <span className="block">
-        <span className="word" style={{ display: 'inline-block', opacity: 0, transform: 'translateY(100%)' }}>
-          identity
+        <span className="block">
+          <span className="landing-word word">identity</span>
         </span>
-      </span>
-      <span className="block">
-        <span className="word" style={{ display: 'inline-block', opacity: 0, transform: 'translateY(100%)' }}>
-          travels
+        <span className="block">
+          <span className="landing-word word">travels</span>
         </span>
-      </span>
-      <span className="block">
-        <span className="word" style={{ display: 'inline-block', opacity: 0, transform: 'translateY(100%)' }}>
-          freely.
+        <span className="block">
+          <span className="landing-word word">freely.</span>
         </span>
-      </span>
-    </h1>
+      </h1>
 
-    <p className="hero-subtitle text-center max-w-[700px] mt-8 opacity-0 text-[var(--charcoal)] text-base md:text-lg">
-      Government-grade verification meets self-sovereign ownership—
-      <br />
-      unlocking human potential across borders, forever.
-    </p>
+      <p className="hero-subtitle landing-subtitle opacity-0">
+        Government-grade verification meets self-sovereign ownership.
+        <br />
+        Unlock human potential across borders without losing control.
+      </p>
+    </div>
 
     <div className="scroll-indicator absolute bottom-8 opacity-0 flex flex-col items-center gap-2 text-xs uppercase tracking-widest text-[var(--charcoal)]">
       <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
@@ -113,28 +106,28 @@ const HeroSection = () => (
 
 interface ChapterSectionProps {
   number: number;
-  title: string;
   label: string;
   description: {
     title: string;
     paragraphs: string[];
   };
   isLight: boolean;
-  children: React.ReactNode;
+  children: ReactNode;
 }
 
-const ChapterSection = ({ number, title, label, description, isLight, children }: ChapterSectionProps) => (
-  <section className={`chapter ${isLight ? 'light' : 'dark'} min-h-screen flex items-center justify-center relative p-6 md:p-12 ${isLight ? 'bg-[var(--cream)] text-[var(--charcoal)]' : 'bg-[var(--charcoal)] text-[var(--cream)]'}`}>
-    <span className={`chapter-number absolute top-4 left-4 md:top-8 md:left-8 font-serif italic opacity-[0.08] font-normal`}
-          style={{ fontSize: 'clamp(6rem, 15vw, 12rem)', lineHeight: 1 }}>
+const ChapterSection = ({ number, label, description, isLight, children }: ChapterSectionProps) => (
+  <section
+    className={`chapter landing-section ${isLight ? 'landing-section-light light' : 'landing-section-dark landing-spotlight-target'}`}
+  >
+    <span className="chapter-number landing-chapter-number">
       {String(number).padStart(2, '0')}
     </span>
 
-    <div className="chapter-inner grid grid-cols-1 md:grid-cols-2 gap-8 md:gap-12 max-w-6xl w-full relative z-10">
+    <div className="chapter-inner landing-chapter-grid relative z-10">
       {number % 2 === 0 ? (
         <>
           {children}
-          <div className="chapter-content">
+          <div className="chapter-content landing-chapter-content">
             <p className="chapter-label text-xs md:text-sm font-semibold uppercase tracking-[0.2em] opacity-50 mb-4 flex items-center gap-4">
               <span className="w-10 h-px bg-current opacity-50"></span>
               {label}
@@ -149,7 +142,7 @@ const ChapterSection = ({ number, title, label, description, isLight, children }
         </>
       ) : (
         <>
-          <div className="chapter-content">
+          <div className="chapter-content landing-chapter-content">
             <p className="chapter-label text-xs md:text-sm font-semibold uppercase tracking-[0.2em] opacity-50 mb-4 flex items-center gap-4">
               <span className="w-10 h-px bg-current opacity-50"></span>
               {label}
@@ -169,11 +162,11 @@ const ChapterSection = ({ number, title, label, description, isLight, children }
 );
 
 interface IllustrationProps {
-  children: React.ReactNode;
+  children: ReactNode;
 }
 
 const Illustration = ({ children }: IllustrationProps) => (
-  <div className="illustration relative h-80 md:h-96 flex items-center justify-center">{children}</div>
+  <div className="illustration landing-illustration">{children}</div>
 );
 
 export const AnimatedLanding = () => {
@@ -227,7 +220,6 @@ export const AnimatedLanding = () => {
       {/* Chapter 1: Vision */}
       <ChapterSection
         number={1}
-        title="The Vision"
         label="The Vision"
         isLight={true}
         description={{
@@ -272,7 +264,6 @@ export const AnimatedLanding = () => {
       {/* Chapter 2: Technology */}
       <ChapterSection
         number={2}
-        title="The Technology"
         label="The Technology"
         isLight={false}
         description={{
@@ -325,7 +316,6 @@ export const AnimatedLanding = () => {
       {/* Chapter 3: Impact */}
       <ChapterSection
         number={3}
-        title="The Impact"
         label="The Impact"
         isLight={true}
         description={{
@@ -374,7 +364,6 @@ export const AnimatedLanding = () => {
       {/* Chapter 4: Revolution */}
       <ChapterSection
         number={4}
-        title="The Revolution"
         label="The Revolution"
         isLight={false}
         description={{
@@ -430,7 +419,7 @@ export const AnimatedLanding = () => {
       </ChapterSection>
 
       {/* Finale */}
-      <section className="finale bg-[var(--charcoal)] text-[var(--cream)] min-h-screen flex flex-col items-center justify-center text-center gap-12 p-8 md:p-32">
+      <section className="finale landing-finale">
         <div className="finale-illustration w-80 h-80 md:w-96 md:h-96">
           <svg viewBox="0 0 500 500" fill="none" className="w-full h-full">
             {/* Person silhouette */}
@@ -459,7 +448,7 @@ export const AnimatedLanding = () => {
           </svg>
         </div>
 
-        <div className="max-w-2xl">
+        <div className="landing-finale-copy">
           <p className="landing-label mb-4 text-[var(--cream)] opacity-50">Ready for the future?</p>
           <h2 className="landing-h2 mb-8 text-[var(--cream)]">
             Own Your Identity.
@@ -471,12 +460,9 @@ export const AnimatedLanding = () => {
             <br />
             The revolution starts with you.
           </p>
-          <a
-            href="/identity/create"
-            className="inline-block px-12 py-5 bg-[var(--cream)] text-[var(--charcoal)] font-semibold text-lg hover:shadow-lg hover:-translate-y-1 transition-all duration-300 rounded-sm"
-          >
-            Join the Revolution
-          </a>
+          <Button asChild size="lg" className="bg-background text-foreground hover:bg-card">
+            <Link href="/identity/create">Join the revolution</Link>
+          </Button>
         </div>
       </section>
     </>

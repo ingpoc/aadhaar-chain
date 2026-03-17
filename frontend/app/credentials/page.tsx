@@ -1,99 +1,105 @@
 'use client';
 
 import { useWallet } from '@solana/wallet-adapter-react';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
+import { CreditCard } from 'lucide-react';
+
+import { PageHeader } from '@/components/layout/page-header';
 import { Button } from '@/components/ui/button';
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+import { EmptyState } from '@/components/ui/empty-state';
+import { KeyValueList } from '@/components/ui/key-value-list';
+import { StatusBadge } from '@/components/ui/status-badge';
+
+const credentials = [
+  {
+    id: 'cred-001',
+    type: 'Aadhaar Verification',
+    issuer: 'UIDAI',
+    issuedAt: '2024-01-15',
+    status: 'verified',
+  },
+  {
+    id: 'cred-002',
+    type: 'PAN Verification',
+    issuer: 'Income Tax Department',
+    issuedAt: '2024-01-16',
+    status: 'verified',
+  },
+];
 
 export default function CredentialsPage() {
   const { connected } = useWallet();
 
-  // Placeholder credentials data
-  const credentials = [
-    {
-      id: 'cred-001',
-      type: 'Aadhaar Verification',
-      issuer: 'UIDAI',
-      issuedAt: '2024-01-15',
-      status: 'valid',
-    },
-    {
-      id: 'cred-002',
-      type: 'PAN Verification',
-      issuer: 'Income Tax Department',
-      issuedAt: '2024-01-16',
-      status: 'valid',
-    },
-  ];
-
-  if (!connected) {
-    return (
-      <div className="space-y-6">
-        <h1>Credentials</h1>
-        <Card className="border-yellow-200 bg-yellow-50 dark:bg-yellow-950/20">
-          <CardContent className="pt-6">
-            <p className="text-yellow-800 dark:text-yellow-200">
-              Please connect your wallet to view your credentials.
-            </p>
-          </CardContent>
-        </Card>
-      </div>
-    );
-  }
-
   return (
-    <div className="space-y-6">
-      <div className="flex justify-between items-center">
-        <h1>Credentials</h1>
-        <Button variant="outline">Add Credential</Button>
-      </div>
+    <div className="page-stack">
+      <PageHeader
+        eyebrow="Credential registry"
+        title="Issued credentials"
+        description="Inspect the placeholder credential inventory and the metadata that downstream verifiers would eventually consume."
+        actions={
+          connected ? (
+            <Button variant="outline" disabled>
+              Issuance coming soon
+            </Button>
+          ) : undefined
+        }
+      />
 
-      {credentials.length === 0 ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>No Credentials</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-muted-foreground">
-              You don&apos;t have any credentials yet. Complete a verification to earn your first credential.
-            </p>
-          </CardContent>
-        </Card>
+      {!connected ? (
+        <EmptyState
+          title="Wallet connection required"
+          description="Credential views stay bound to the active wallet so that identity ownership and issuance history remain aligned."
+          icon={CreditCard}
+        />
+      ) : credentials.length === 0 ? (
+        <EmptyState
+          title="No credentials issued yet"
+          description="Complete an Aadhaar or PAN verification and the credential registry will populate from the trust surface."
+          icon={CreditCard}
+        />
       ) : (
-        <div className="grid md:grid-cols-2 gap-4">
-          {credentials.map((cred) => (
-            <Card key={cred.id}>
+        <div className="grid gap-4 lg:grid-cols-2">
+          {credentials.map((credential) => (
+            <Card key={credential.id}>
               <CardHeader>
-                <div className="flex justify-between items-start">
-                  <div>
-                    <CardTitle>{cred.type}</CardTitle>
-                    <CardDescription>Issued by {cred.issuer}</CardDescription>
+                <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="space-y-2">
+                    <CardTitle>{credential.type}</CardTitle>
+                    <CardDescription>Issued by {credential.issuer}</CardDescription>
                   </div>
-                  <Badge variant={cred.status === 'valid' ? 'default' : 'destructive'}>
-                    {cred.status}
-                  </Badge>
+                  <StatusBadge status={credential.status} />
                 </div>
               </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="text-sm space-y-1">
-                  <div className="flex justify-between">
-                    <span className="text-muted-foreground">Issued</span>
-                    <span>{new Date(cred.issuedAt).toLocaleDateString()}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-muted-foreground">ID</span>
-                    <span className="font-mono text-xs">{cred.id}</span>
-                  </div>
-                </div>
-                <div className="flex gap-2">
-                  <Button variant="outline" size="sm" className="flex-1">
-                    View
-                  </Button>
-                  <Button variant="outline" size="sm" className="flex-1">
-                    Share
-                  </Button>
-                </div>
+              <CardContent>
+                <KeyValueList
+                  items={[
+                    {
+                      label: 'Issued',
+                      value: new Date(credential.issuedAt).toLocaleDateString(),
+                    },
+                    {
+                      label: 'Credential ID',
+                      value: credential.id,
+                      valueClassName: 'font-mono text-xs',
+                    },
+                  ]}
+                />
               </CardContent>
+              <CardFooter className="gap-3">
+                <Button variant="outline" size="sm" className="flex-1">
+                  View
+                </Button>
+                <Button variant="outline" size="sm" className="flex-1">
+                  Share
+                </Button>
+              </CardFooter>
             </Card>
           ))}
         </div>

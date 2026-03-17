@@ -193,6 +193,14 @@ class TrustReadSurface(BaseModel):
     did: str
     verification_bitmap: int = 0
     updated_at: str
+    trust_state: Literal[
+        "identity_present_unverified",
+        "verified",
+        "manual_review",
+        "revoked_or_blocked",
+    ]
+    high_trust_eligible: bool = False
+    state_reason: Optional[str] = None
     verifications: List[TrustVerificationSummary] = Field(default_factory=list)
 
 
@@ -238,6 +246,18 @@ class UpdateIdentityRequest(BaseModel):
     """Request to update mutable identity fields."""
     commitment: Optional[str] = None
     verification_bitmap: Optional[int] = Field(default=None, ge=0)
+
+
+class TrustFixtureRequest(BaseModel):
+    """Local development request for seeding deterministic trust states."""
+    fixture_state: Literal[
+        "no_identity",
+        "identity_present_unverified",
+        "verified",
+        "manual_review",
+        "revoked_or_blocked",
+    ]
+    document_type: Literal["aadhaar", "pan"] = "aadhaar"
 
 
 # --- Verification Request Models ---

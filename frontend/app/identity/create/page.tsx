@@ -1,14 +1,21 @@
 'use client';
 
 import { useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { useWallet } from '@solana/wallet-adapter-react';
+
 import { identityApi } from '@/lib/api';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { PageHeader } from '@/components/layout/page-header';
+import { Notice } from '@/components/ui/notice';
 import { Button } from '@/components/ui/button';
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Alert, AlertDescription } from '@/components/ui/alert';
-import { useRouter } from 'next/navigation';
 
 export default function CreateIdentityPage() {
   const { connected, publicKey } = useWallet();
@@ -17,16 +24,16 @@ export default function CreateIdentityPage() {
   const [error, setError] = useState('');
   const router = useRouter();
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
 
     if (!connected) {
-      setError('Please connect your wallet first');
+      setError('Please connect your wallet first.');
       return;
     }
 
     if (!publicKey) {
-      setError('Wallet public key is unavailable');
+      setError('Wallet public key is unavailable.');
       return;
     }
 
@@ -38,9 +45,8 @@ export default function CreateIdentityPage() {
         publicKey.toBase58(),
         seed.trim() || `${publicKey.toBase58()}:${Date.now()}`
       );
-      await identityApi.createIdentity(publicKey.toBase58(), { commitment });
 
-      alert('Identity created successfully!');
+      await identityApi.createIdentity(publicKey.toBase58(), { commitment });
       router.push('/dashboard');
     } catch {
       setError('Failed to create identity. Please try again.');
@@ -50,66 +56,58 @@ export default function CreateIdentityPage() {
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex justify-between items-center">
-        <div>
-          <h1>Create Identity</h1>
-          <p className="text-muted-foreground">
-            Create your wallet-bound identity anchor
-          </p>
-        </div>
-      </div>
+    <div className="page-stack">
+      <PageHeader
+        eyebrow="Identity setup"
+        title="Create an identity anchor"
+        description="Bind the current wallet to a commitment-backed identity record that downstream verifications can update without exposing raw identity material on-chain."
+      />
 
-      {!connected && (
-        <Alert className="border-yellow-200 bg-yellow-50 dark:bg-yellow-950/20">
-          <AlertDescription className="text-yellow-800 dark:text-yellow-200">
-            Please connect your wallet to continue
-          </AlertDescription>
-        </Alert>
-      )}
+      {!connected ? (
+        <Notice tone="warning" title="Wallet required">
+          Please connect your wallet before creating an identity anchor.
+        </Notice>
+      ) : null}
 
       <Card>
         <CardHeader>
-          <CardTitle>Identity Commitment</CardTitle>
-          <CardDescription>
-            Your DID is derived from your wallet. This step creates the initial identity commitment.
-          </CardDescription>
+          <CardTitle>Commitment seed</CardTitle>
         </CardHeader>
         <CardContent>
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <div className="space-y-2">
-              <Label htmlFor="seed">Commitment Seed</Label>
+          <form onSubmit={handleSubmit} className="space-y-5">
+            <div className="field-stack">
+              <Label htmlFor="seed">Commitment seed</Label>
               <Input
                 id="seed"
                 placeholder="Optional local seed for the commitment"
                 value={seed}
-                onChange={(e) => setSeed(e.target.value)}
+                onChange={(event) => setSeed(event.target.value)}
                 disabled={!connected || loading}
               />
-              <p className="text-xs text-muted-foreground">
-                Leave empty to auto-generate a commitment seed from your wallet and the current timestamp.
+              <p className="text-sm text-muted-foreground">
+                Leave this empty to derive a seed from the current wallet and timestamp.
               </p>
             </div>
 
-            {error && (
-              <Alert className="border-red-200 bg-red-50 dark:bg-red-950/20">
-                <AlertDescription className="text-red-800 dark:text-red-200">
-                  {error}
-                </AlertDescription>
-              </Alert>
-            )}
+            {error ? (
+              <Notice tone="destructive" title="Unable to create identity">
+                {error}
+              </Notice>
+            ) : null}
 
-            <div className="flex gap-3">
+            <div className="page-actions">
               <Button type="submit" disabled={!connected || loading}>
-                {loading ? 'Creating...' : 'Create Identity'}
+                {loading ? 'Creating identity...' : 'Create identity'}
               </Button>
               <Button
                 type="button"
                 variant="outline"
-                onClick={() => setSeed(`${publicKey?.toBase58() ?? 'wallet'}:${Date.now()}`)}
-                disabled={!connected}
+                disabled={!connected || loading}
+                onClick={() =>
+                  setSeed(`${publicKey?.toBase58() ?? 'wallet'}:${Date.now()}`)
+                }
               >
-                Auto-Generate Seed
+                Auto-generate seed
               </Button>
             </div>
           </form>
@@ -118,13 +116,15 @@ export default function CreateIdentityPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>What happens next?</CardTitle>
+          <CardTitle>What happens next</CardTitle>
         </CardHeader>
-        <CardContent className="space-y-2 text-sm text-muted-foreground">
-          <p>1. A DID is derived from your wallet address</p>
-          <p>2. A commitment is created for the identity anchor</p>
-          <p>3. Raw identity material stays off-chain</p>
-          <p>4. You can then add verification state and consented claims</p>
+        <CardContent>
+          <ol className="space-y-3 text-sm text-muted-foreground">
+            <li>1. AadhaarChain derives a DID from the connected wallet.</li>
+            <li>2. A commitment is produced from the wallet and local seed.</li>
+            <li>3. The resulting identity anchor is written without raw identity material.</li>
+            <li>4. Verification workflows can then attach trust state and consented claims.</li>
+          </ol>
         </CardContent>
       </Card>
     </div>
@@ -134,9 +134,10 @@ export default function CreateIdentityPage() {
 async function buildCommitment(walletAddress: string, seed: string): Promise<string> {
   const encoder = new TextEncoder();
   const bytes = encoder.encode(`${walletAddress}:${seed}`);
-  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const digest = await crypto.subtle.digest('SHA-256', bytes as BufferSource);
   const hash = Array.from(new Uint8Array(digest))
     .map((byte) => byte.toString(16).padStart(2, '0'))
     .join('');
+
   return `sha256:${hash}`;
 }
