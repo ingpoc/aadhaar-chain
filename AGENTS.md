@@ -2,7 +2,7 @@
 
 ## Instruction Inheritance
 
-- Read `/Users/gurusharan/Documents/remote-claude/CodexWorkspace/AGENTS.md` first for portfolio-wide governance.
+- Read `../AGENTS.md` first for portfolio-wide governance.
 - This file adds only `aadhaar-chain`-specific execution guidance.
 - If this file conflicts with the root workspace `AGENTS.md`, the root file wins unless it explicitly allows a repo-local exception.
 
