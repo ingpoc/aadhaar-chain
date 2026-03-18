@@ -1,0 +1,200 @@
+@layer components {
+  .landing-navbar {
+    transform: translateY(0);
+    will-change: transform;
+  }
+
+  .landing-hero {
+    @apply relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-24;
+  }
+
+  .landing-shell {
+    width: min(100%, var(--app-shell));
+    margin-inline: auto;
+  }
+
+  .landing-hero-copy {
+    @apply relative z-10 mx-auto max-w-4xl text-center;
+  }
+
+  .landing-word {
+    display: inline-block;
+    opacity: 0;
+    transform: translateY(100%);
+  }
+
+  .landing-h1 {
+    @apply font-serif font-normal text-foreground;
+    font-size: clamp(3.5rem, 11vw, 8rem);
+    line-height: 0.92;
+    letter-spacing: -0.055em;
+  }
+
+  .landing-h2 {
+    @apply font-serif font-normal;
+    font-size: clamp(2.1rem, 6vw, 4.75rem);
+    line-height: 0.95;
+    letter-spacing: -0.04em;
+  }
+
+  .landing-label {
+    @apply text-xs font-semibold uppercase tracking-[0.22em];
+  }
+
+  .landing-subtitle {
+    @apply mx-auto mt-8 max-w-2xl text-base text-[color:var(--ink-soft)] md:text-lg;
+  }
+
+  .landing-section {
+    @apply relative flex min-h-screen items-center justify-center px-6 py-20 md:px-10 md:py-24;
+  }
+
+  .landing-section-light {
+    background: var(--background);
+    color: var(--foreground);
+  }
+
+  .landing-section-dark,
+  .landing-finale {
+    background: var(--charcoal);
+    color: var(--cream);
+  }
+
+  .landing-chapter-grid {
+    @apply grid grid-cols-1 items-center gap-10 md:grid-cols-2 md:gap-16;
+    width: min(100%, var(--app-shell));
+  }
+
+  .landing-chapter-number {
+    @apply pointer-events-none absolute left-4 top-4 font-serif italic opacity-[0.08] md:left-8 md:top-8;
+    font-size: clamp(5.5rem, 15vw, 12rem);
+    line-height: 1;
+  }
+
+  .landing-chapter-content {
+    @apply max-w-xl;
+  }
+
+  .landing-illustration {
+    @apply relative flex h-[20rem] items-center justify-center md:h-[28rem];
+  }
+
+  .landing-illustration svg {
+    @apply h-full w-full max-w-[34rem];
+  }
+
+  .landing-finale {
+    @apply flex min-h-screen flex-col items-center justify-center gap-12 px-8 py-20 text-center md:px-16 md:py-32;
+  }
+
+  .landing-finale-copy {
+    @apply max-w-2xl;
+  }
+
+  .progress-bar {
+    position: fixed;
+    inset: 0 auto auto 0;
+    width: 100%;
+    height: 3px;
+    transform-origin: left;
+    background: var(--primary);
+    z-index: 70;
+  }
+
+  .spotlight-layer {
+    position: fixed;
+    inset: 0;
+    height: 100vh;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+    z-index: 40;
+    background: radial-gradient(
+      circle 320px at var(--mouse-x, 50%) var(--mouse-y, 50%),
+      rgba(250, 247, 240, 0.16) 0%,
+      transparent 70%
+    );
+  }
+
+  .spotlight-layer.active {
+    opacity: 1;
+  }
+
+  .cursor-outer,
+  .cursor-inner {
+    position: fixed;
+    pointer-events: none;
+    border-radius: 9999px;
+    z-index: 60;
+  }
+
+  .cursor-outer {
+    width: 38px;
+    height: 38px;
+    border: 1.5px solid var(--charcoal);
+    opacity: 0.45;
+    mix-blend-mode: difference;
+  }
+
+  .cursor-inner {
+    width: 8px;
+    height: 8px;
+    background: var(--charcoal);
+    opacity: 0.85;
+  }
+
+  .fill-path {
+    opacity: 0;
+    transform-origin: center;
+    vector-effect: non-scaling-stroke;
+  }
+
+  .draw-path {
+    opacity: 0;
+    fill: none;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .label-path {
+    opacity: 0;
+    font-size: 14px;
+    font-weight: 500;
+    text-anchor: middle;
+    pointer-events: none;
+  }
+
+  .fragmented-identity .fill-path,
+  .unified-identity .fill-path {
+    opacity: 0;
+  }
+
+  .scroll-indicator {
+    @apply absolute bottom-8 flex flex-col items-center gap-2 text-[0.65rem] font-semibold uppercase tracking-[0.24em] text-foreground;
+    animation: landing-bounce 2s infinite;
+  }
+}
+
+@keyframes landing-bounce {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+
+  50% {
+    transform: translateY(6px);
+  }
+}
+
+@media (hover: none) {
+  .cursor-outer,
+  .cursor-inner {
+    display: none;
+  }
+}
+
+body:has(.wallet-adapter-modal) .spotlight-layer,
+body:has(.wallet-adapter-modal) .cursor-outer,
+body:has(.wallet-adapter-modal) .cursor-inner {
+  display: none;
+}

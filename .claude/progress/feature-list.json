@@ -126,7 +126,7 @@
     },
     {
       "id": "feat-005e",
-      "description": "Bidirectional wallet-based routing (connect→dashboard, disconnect→landing)",
+      "description": "Bidirectional wallet-based routing (connect\u2192dashboard, disconnect\u2192landing)",
       "priority": "P0",
       "status": "completed",
       "phase": 4,
@@ -156,7 +156,7 @@
       "id": "feat-006",
       "description": "FastAPI gateway scaffold with config and health endpoint",
       "priority": "P0",
-      "status": "pending",
+      "status": "completed",
       "phase": 5,
       "acceptance_criteria": [
         "gateway/ directory structure created",
@@ -170,7 +170,7 @@
       "id": "feat-007",
       "description": "Pydantic models for identity, verification, and credentials",
       "priority": "P0",
-      "status": "pending",
+      "status": "completed",
       "phase": 5,
       "acceptance_criteria": [
         "Identity model matching frontend types",
@@ -184,7 +184,7 @@
       "id": "feat-008",
       "description": "Document Processor MCP tools with Tesseract OCR",
       "priority": "P0",
-      "status": "pending",
+      "status": "completed",
       "phase": 5,
       "acceptance_criteria": [
         "@tool decorated ocr function",
@@ -199,7 +199,7 @@
       "id": "feat-009",
       "description": "Pattern Analyzer and Compliance Rules MCP tools",
       "priority": "P1",
-      "status": "pending",
+      "status": "completed",
       "phase": 5,
       "acceptance_criteria": [
         "detect_tampering tool (image hash, metadata checks)",
@@ -213,7 +213,7 @@
       "id": "feat-010",
       "description": "Agent definitions for Document Validator, Fraud Detection, Compliance",
       "priority": "P0",
-      "status": "pending",
+      "status": "completed",
       "phase": 5,
       "acceptance_criteria": [
         "AgentDefinition for document-validator with MCP tools",
@@ -227,12 +227,12 @@
       "id": "feat-011",
       "description": "Orchestrator agent with verification workflow",
       "priority": "P0",
-      "status": "pending",
+      "status": "completed",
       "phase": 5,
       "acceptance_criteria": [
         "ClaudeAgentOptions with Task tool enabled",
         "Subagent coordination flow",
-        "verify_aadhaar workflow (parse → fraud → compliance)",
+        "verify_aadhaar workflow (parse \u2192 fraud \u2192 compliance)",
         "verify_pan workflow",
         "Result aggregation and decision logic"
       ]
@@ -336,17 +336,17 @@
   "summary": {
     "total": 22,
     "by_priority": {
-      "P0": 12,
-      "P1": 10
+      "P0": 13,
+      "P1": 9
     },
     "by_status": {
-      "pending": 11,
+      "pending": 9,
       "in_progress": 0,
-      "completed": 11
+      "completed": 16
     },
     "by_phase": {
       "1-4": "Frontend (completed)",
-      "5": "Backend + Agent SDK",
+      "5": "Backend + Agent SDK (in progress)",
       "6": "Solana Service Layer",
       "7": "Solana Programs",
       "8": "Integration"

@@ -1,0 +1,26 @@
+# FastAPI and ASGI server
+fastapi==0.115.4
+uvicorn[standard]==0.32.0
+pydantic==2.10.3
+pydantic-settings==2.6.1
+python-dotenv==1.0.1
+
+# Claude Agent SDK
+# Optional for local browser validation; the gateway degrades gracefully when absent.
+
+# Solana SDK
+solders==0.23.0
+
+# HTTP client
+httpx==0.27.0
+
+# CORS middleware
+python-multipart==0.0.10
+
+# MCP tools
+pytesseract==0.3.10
+pillow==11.1.0
+google-cloud-vision==3.7.1
+
+# Test runtime
+pytest==8.4.2

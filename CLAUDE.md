@@ -1,167 +1,137 @@
-# Identity & Asset Tokenization Platform
+# Agent SDK Integration
 
-Self-sovereign identity and asset tokenization infrastructure on Solana, powered by Claude Agent SDK.
+## Purpose
+Manage Claude Agent SDK integration for aadhaar-chain verification workflows.
 
-> **Purpose:** See `.summary/PURPOSE.md` for the complete problem statement, two-phase vision, and market opportunity.
+## Components
 
-## Vision
+### Agent Manager (`gateway/app/agent_manager.py`)
+**Service:** AgentManager
+**Purpose:** Orchestrates agent invocations and manages verification workflows
 
-**Phase 1 (Current):** Credential Tokenization
+**Methods:**
+- `initialize_agents()` - Initialize Claude Agent SDK and MCP servers
+- `validate_document()` - Call Document Validator agent (OCR, field extraction)
+- `detect_fraud()` - Call Fraud Detection agent (risk scoring, tampering checks)
+- `check_compliance()` - Call Compliance Monitor agent (Aadhaar Act, DPDP Act)
+- `orchestrate_verification()` - Full workflow orchestration (parse → fraud → compliance → decision)
+- `get_verification_status()` - Get verification status by ID
+- `create_verification()` - Create new verification request
+- `update_verification_progress()` - Update progress (0.0-1.0)
+- `complete_verification()` - Mark complete with decision
 
-- Pull credentials via API Setu (Aadhaar, PAN, DL, Land Records, Education)
-- Store as verified tokens on Solana
-- Grant selective, time-bound access to services
+**Data Models:**
+- `AgentType` enum - DOCUMENT_VALIDATOR, FRAUD_DETECTION, COMPLIANCE_MONITOR, ORCHESTRATOR
+- `AgentTask` - Task tracking with created_at, completed_at, result, error
 
-**Phase 2 (Roadmap):** Asset Tokenization Foundation
-
-- Verified identity enables asset tokenization (real estate, credentials)
-- Maharashtra ₹50T opportunity: identity layer for tokenized state
-- BlackRock's "missing guardrail": digital identity verification
-
-**Positioning:** Layer 1 of the tokenization stack. Before assets can be tokenized, ownership must be verified.
-
-## Architecture
-
-| Layer | Component | Lines |
-|-------|-----------|-------|
-| 2 | Agent Layer (4 Claude agents) | ~400 |
-| 1 | FastAPI Gateway | ~500 |
-| 0 | Solana Programs (2) | ~350 |
-
-## Project Structure
-
-```text
-├── frontend/          # Next.js 15 + wallet integration
-├── programs/          # Solana Anchor programs
-├── agents/            # Claude Agent SDK agents
-├── mcp-servers/       # 4 MCP servers
-├── gateway/           # FastAPI backend
-└── scripts/           # Build, deploy, test
+**Workflow:**
+```
+1. Document Upload → Validate Document (Document Validator)
+2. Fraud Check → Detect Tampering (Fraud Detection)
+3. Compliance Check → Legal Validation (Compliance Monitor)
+4. Decision → Approve, Reject, or Manual Review (Orchestrator)
 ```
 
-## Commands
+**Decision Logic:**
+- Risk score > 0.7 → REJECT
+- Not Aadhaar Act or DPDP compliant → REJECT
+- OCR confidence < 0.6 → MANUAL REVIEW
+- Otherwise → APPROVE
 
-| Task | Command |
-|------|---------|
-| Dev server | `cd frontend && npm run dev` |
-| Build programs | `anchor build` |
-| Deploy devnet | `anchor deploy --provider.cluster devnet` |
-| Run tests | `npm test` |
-| Start gateway | `cd gateway && uvicorn app.main:app --reload` |
+### Verification Routes (`gateway/app/routes.py`)
+**Base Path:** `/api/identity`
 
-## Agents
+**Endpoints:**
+- `POST /{wallet_address}/aadhaar` - Create Aadhaar verification
+- `POST /{wallet_address}/pan` - Create PAN verification
+- `GET /status/{verification_id}` - Get verification status
+- `GET /{wallet_address}` - Get identity data
+- `POST /{wallet_address}` - Update identity data
+- `POST /verify/aadhaar` - Verify Aadhaar with full workflow
+- `POST /verify/pan` - Verify PAN with full workflow
 
-| Agent | Purpose | MCP |
-|-------|---------|-----|
-| Document Validator | Parse Aadhaar/PAN docs | document-processor |
-| Fraud Detection | Tampering, watchlists | pattern-analyzer |
-| Compliance Monitor | Aadhaar Act, DPDP | compliance-rules |
-| Orchestrator | Workflow coordination | all |
+**Features:**
+- Agent manager integration
+- Progress tracking with steps
+- Decision storage in verification metadata
+- In-memory verification records store
 
-## MCP Servers
+### Gateway (`gateway/main.py`)
+**Startup:**
+- Initialize Claude Agent SDK
+- Connect to MCP servers (document-processor, pattern-analyzer, compliance-rules)
+- Load agent definitions
 
-| Server | Language | Purpose |
-|--------|----------|---------|
-| document-processor | Python | OCR, field extraction |
-| solana-interaction | TypeScript | Blockchain ops |
-| apisetu-integration | Python | Real govt API |
-| ipfs-storage | TypeScript | Encrypted blobs |
+**Health Check:** `/health`
+- Returns service status, version, and health status
 
-## Solana Programs
+## Testing
 
-| Program | Instructions |
-|---------|--------------|
-| identity-core | create_identity, update_commitment, set_verification_bit, recover_identity |
-| credential-vault | issue_credential, revoke_credential, verify_zk_proof |
+### Test Suite (`gateway/tests/test_agent_manager.py`)
+**Tests:**
+- `test_create_verification` - Create new verification request
+- `test_get_verification_status` - Get status by ID
+- `test_validate_document_mock` - Document validation (mock)
+- `test_detect_fraud_mock` - Fraud detection (mock)
+- `test_check_compliance_mock` - Compliance check (mock)
+- `test_orchestrate_verification_mock` - Full workflow (mock)
+- `test_update_verification_progress` - Progress tracking
+- `test_cleanup_expired_verifications` - Record cleanup
+- `test_agent_initialization` - Agent setup verification
 
-## Environment Variables
-
-| Variable | Purpose |
-|----------|---------|
-| SOLANA_RPC_URL | Solana cluster endpoint |
-| ANTHROPIC_API_KEY | Claude API access |
-| IPFS_GATEWAY_URL | IPFS storage |
-| APISETU_CLIENT_ID | API Setu credentials |
-
-## Development Flow
-
-1. Start Solana localnet: `solana-test-validator`
-2. Deploy programs: `anchor deploy`
-3. Start frontend: `cd frontend && npm run dev`
-4. Start gateway: `cd gateway && uvicorn app.main:app --reload`
-
-## Token Efficiency
-
-**CRITICAL**: Proactively use token-efficient MCP tools BEFORE expensive operations.
-
-| Instead of | Use This | When | Savings |
-| :--- | :--- | :--- | :--- |
-| `Bash` (code exec) | `mcp__token-efficient__execute_code` | Python/Bash/Node code | 98% |
-| `Bash` (load CSV) | `mcp__token-efficient__process_csv` | >50 rows, filtering | 99% |
-| `Bash` (grep logs) | `mcp__token-efficient__process_logs` | Pattern matching | 95% |
-| `Read` (large files) | `Read` with offset/limit | Files >100 lines | 90% |
-| Multiple CSVs | `mcp__token-efficient__batch_process_csv` | 2-5 files | 80% |
-
-**Priority Rule**: If operation processes >50 items, MUST use token-efficient MCP.
-
-**Available Tools**:
-
-- `execute_code` - Python/Bash/Node in sandbox
-- `process_csv` - Filter, aggregate, paginate CSV
-- `batch_process_csv` - Multiple CSVs with same filter
-- `process_logs` - Pattern match with pagination
-- `search_tools` - Find MCP tools by keyword (95% savings)
-
-## Bug Fix Verification
-
-**CRITICAL**: Human verification required before logging successful decision traces.
-
-### Workflow
-
-```text
-Bug Found → Query Context Graph → No trace?
-                                      ↓
-                        Fix issue → Browser test → Agent: "Fixed!"
-                                                    ↓
-                                    AskUserQuestion (verify)
-                                                    ↓
-                         ┌──────────────────┬────────────────┬────────────────┐
-                         │                  │                │                │
-                      YES (Fixed)        NO (Broken)    EXPLAIN          OTHER
-                         │                  │                │                │
-                    Log trace          Try again        Get details      Handle case
-                  outcome="success"      with fix          │               appropriately
-                                                        Retry fix
+**Run Tests:**
+```bash
+cd gateway
+pytest tests/test_agent_manager.py -v
 ```
 
-### User Verification Prompt
+## Next Steps
 
-```python
-AskUserQuestion(
-    questions=[{
-        "question": "I've fixed the issue. Can you verify in browser that it's resolved?",
-        "header": "Verify Fix",
-        "options": [
-            {"label": "Yes, fixed", "description": "Issue is resolved, log to decision traces"},
-            {"label": "No, still broken", "description": "Issue persists, try again"},
-            {"label": "Explain more", "description": "Provide additional context"}
-        ],
-        "multiSelect": False
-    }]
-)
-```
+### feat-011: Orchestrator Agent Workflow
+**Goal:** Implement actual agent-to-agent coordination using Task tool
 
-### Rules
+**Tasks:**
+1. Setup Claude Agent SDK (API keys, MCP server connections)
+2. Create agent instances from `mcp/agents.py`
+3. Implement Task tool invocations
+4. Add error handling for agent failures
+5. Store decision traces in Context Graph
+6. Replace mock implementations with real agent calls
 
-| Action | When | Outcome |
-| :--- | :--- | :--- |
-| Log trace with `outcome: "success"` | User confirms "Yes, fixed" | ✅ Allowed |
-| Log trace with `outcome: "failure"` | Multiple failed attempts | ✅ Allowed |
-| Log trace with `outcome: "pending"` | Before user verification | ✅ Allowed |
-| Log trace with `outcome: "success"` | Without user verification | ❌ Blocked |
+**Success Criteria:**
+- Can invoke Document Validator agent
+- Can invoke Fraud Detection agent
+- Can invoke Compliance Monitor agent
+- Can use Task tool for subagent coordination
+- Can handle agent errors gracefully
+- Can store decisions in Context Graph
 
-### Context Graph Clean Data
+## Current Status
 
-- Only verified fixes logged as `success`
-- Prevents garbage data in learning system
-- Human is ultimate source of truth
+**Completed:**
+- ✅ Agent manager service (mock implementations)
+- ✅ Verification routes with agent integration
+- ✅ Test suite
+- ✅ Decision logic (approve/reject/manual review)
+- ✅ Progress tracking
+
+**Pending (feat-011):**
+- Real Claude Agent SDK integration
+- MCP server connections
+- Actual agent invocations
+- Context Graph integration
+
+## Notes
+
+### Mock vs Real Implementation
+Current implementation uses mock data for agent results (OCR, fraud, compliance). Next feature (feat-011) will integrate real Claude Agent SDK and MCP server calls.
+
+### Performance Considerations
+- In-memory verification records (for development)
+- Production: Use Redis or PostgreSQL
+- Agent initialization: Cache instances (avoid re-initializing)
+- MCP connections: Reuse connections across invocations
+
+---
+
+**Last Updated:** 2026-02-03 17:10 UTC

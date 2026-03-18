@@ -370,7 +370,7 @@ export const useSpotlightObserver = () => {
       { threshold: [0, 0.2, 0.4, 0.6, 0.8, 1] }
     );
 
-    document.querySelectorAll('.dark').forEach((section) => {
+    document.querySelectorAll('.landing-spotlight-target').forEach((section) => {
       observer.observe(section);
     });
 
@@ -381,7 +381,7 @@ export const useSpotlightObserver = () => {
 // Navbar hide on scroll
 export const useNavbarHideOnScroll = () => {
   useEffect(() => {
-    const navbar = document.querySelector('.navbar');
+    const navbar = document.querySelector('.landing-navbar');
     if (!navbar) return;
 
     let lastScrollY = 0;
@@ -393,14 +393,14 @@ export const useNavbarHideOnScroll = () => {
 
       if (scrollDirection === 'down' && currentScrollY > 100) {
         if (tl) tl.kill();
-        tl = gsap.to('.navbar', {
+        tl = gsap.to('.landing-navbar', {
           y: -100,
           duration: 0.3,
           ease: 'power2.inOut',
         });
       } else {
         if (tl) tl.kill();
-        tl = gsap.to('.navbar', {
+        tl = gsap.to('.landing-navbar', {
           y: 0,
           duration: 0.3,
           ease: 'power2.inOut',

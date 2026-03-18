@@ -1,99 +1,164 @@
 'use client';
 
+import { useEffect, useState } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
+import { CreditCard } from 'lucide-react';
+
+import { identityApi } from '@/lib/api';
+import type { TrustReadSurface, TrustVerificationSummary } from '@/lib/types';
+import { PageHeader } from '@/components/layout/page-header';
+import { Notice } from '@/components/ui/notice';
 import { Button } from '@/components/ui/button';
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+import { EmptyState } from '@/components/ui/empty-state';
+import { KeyValueList } from '@/components/ui/key-value-list';
+import { StatusBadge } from '@/components/ui/status-badge';
+
+const issuerByDocumentType: Record<TrustVerificationSummary['documentType'], string> = {
+  aadhaar: 'UIDAI',
+  pan: 'Income Tax Department',
+};
 
 export default function CredentialsPage() {
-  const { connected } = useWallet();
+  const { connected, publicKey } = useWallet();
+  const [trustSurface, setTrustSurface] = useState<TrustReadSurface | null>(null);
+  const [loadedWalletAddress, setLoadedWalletAddress] = useState<string | null>(null);
+  const [error, setError] = useState('');
 
-  // Placeholder credentials data
-  const credentials = [
-    {
-      id: 'cred-001',
-      type: 'Aadhaar Verification',
-      issuer: 'UIDAI',
-      issuedAt: '2024-01-15',
-      status: 'valid',
-    },
-    {
-      id: 'cred-002',
-      type: 'PAN Verification',
-      issuer: 'Income Tax Department',
-      issuedAt: '2024-01-16',
-      status: 'valid',
-    },
-  ];
+  const walletAddress = publicKey?.toBase58() ?? null;
 
-  if (!connected) {
-    return (
-      <div className="space-y-6">
-        <h1>Credentials</h1>
-        <Card className="border-yellow-200 bg-yellow-50 dark:bg-yellow-950/20">
-          <CardContent className="pt-6">
-            <p className="text-yellow-800 dark:text-yellow-200">
-              Please connect your wallet to view your credentials.
-            </p>
-          </CardContent>
-        </Card>
-      </div>
-    );
-  }
+  useEffect(() => {
+    if (!connected || !walletAddress) {
+      return;
+    }
+
+    let cancelled = false;
+    const loadTrustSurface = async () => {
+      try {
+        const surface = await identityApi.getTrustSurface(walletAddress);
+        if (!cancelled) {
+          setTrustSurface(surface);
+          setLoadedWalletAddress(walletAddress);
+          setError('');
+        }
+      } catch (loadError) {
+        if (!cancelled) {
+          console.error('Failed to load credential trust surface', loadError);
+          setTrustSurface(null);
+          setLoadedWalletAddress(walletAddress);
+          setError('Unable to load the trust surface for this wallet.');
+        }
+      }
+    };
+
+    void loadTrustSurface();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [connected, walletAddress]);
+
+  const isLoadingTrustSurface =
+    Boolean(connected && walletAddress) && loadedWalletAddress !== walletAddress && !error;
+  const verifications = trustSurface?.verifications ?? [];
+  const issuedCredentials = verifications.filter(
+    (verification) => verification.attestation.status === 'issued'
+  );
+  const pendingCredentialReason = verifications[0]?.reason;
 
   return (
-    <div className="space-y-6">
-      <div className="flex justify-between items-center">
-        <h1>Credentials</h1>
-        <Button variant="outline">Add Credential</Button>
-      </div>
+    <div className="page-stack">
+      <PageHeader
+        eyebrow="Credential registry"
+        title="Issued credentials"
+        description="Inspect wallet-bound credentials that were actually issued from the trust surface rather than placeholder demo data."
+        actions={
+          connected ? (
+            <Button variant="outline" disabled>
+              Issuance follows approved verification
+            </Button>
+          ) : undefined
+        }
+      />
 
-      {credentials.length === 0 ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>No Credentials</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-muted-foreground">
-              You don&apos;t have any credentials yet. Complete a verification to earn your first credential.
-            </p>
-          </CardContent>
-        </Card>
+      {!connected ? (
+        <EmptyState
+          title="Wallet connection required"
+          description="Credential views stay bound to the active wallet so that identity ownership and issuance history remain aligned."
+          icon={CreditCard}
+        />
+      ) : isLoadingTrustSurface ? (
+        <Notice tone="neutral" title="Loading credentials">
+          Fetching the current wallet-bound trust surface.
+        </Notice>
+      ) : error ? (
+        <Notice tone="destructive" title="Credential registry unavailable">
+          {error}
+        </Notice>
+      ) : issuedCredentials.length === 0 ? (
+        <>
+          <EmptyState
+            title="No credentials issued yet"
+            description="Approved verification must issue an attestation before anything appears in the credential registry."
+            icon={CreditCard}
+          />
+          {verifications.length ? (
+            <Notice tone="warning" title="Verification artifacts exist, but issuance is still blocked">
+              {pendingCredentialReason ??
+                'The current verification state has not produced an issued credential yet.'}
+            </Notice>
+          ) : null}
+        </>
       ) : (
-        <div className="grid md:grid-cols-2 gap-4">
-          {credentials.map((cred) => (
-            <Card key={cred.id}>
+        <div className="grid gap-4 lg:grid-cols-2">
+          {issuedCredentials.map((credential) => (
+            <Card key={credential.verificationId}>
               <CardHeader>
-                <div className="flex justify-between items-start">
-                  <div>
-                    <CardTitle>{cred.type}</CardTitle>
-                    <CardDescription>Issued by {cred.issuer}</CardDescription>
+                <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="space-y-2">
+                    <CardTitle>{credential.documentType.toUpperCase()} credential</CardTitle>
+                    <CardDescription>
+                      Issued by {issuerByDocumentType[credential.documentType]}
+                    </CardDescription>
                   </div>
-                  <Badge variant={cred.status === 'valid' ? 'default' : 'destructive'}>
-                    {cred.status}
-                  </Badge>
+                  <StatusBadge status={credential.attestation.status} />
                 </div>
               </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="text-sm space-y-1">
-                  <div className="flex justify-between">
-                    <span className="text-muted-foreground">Issued</span>
-                    <span>{new Date(cred.issuedAt).toLocaleDateString()}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-muted-foreground">ID</span>
-                    <span className="font-mono text-xs">{cred.id}</span>
-                  </div>
-                </div>
-                <div className="flex gap-2">
-                  <Button variant="outline" size="sm" className="flex-1">
-                    View
-                  </Button>
-                  <Button variant="outline" size="sm" className="flex-1">
-                    Share
-                  </Button>
-                </div>
+              <CardContent>
+                <KeyValueList
+                  items={[
+                    {
+                      label: 'Verification workflow',
+                      value: credential.workflowStatus,
+                    },
+                    {
+                      label: 'Credential reference',
+                      value: credential.attestation.reference ?? 'Pending reference',
+                      valueClassName: 'font-mono text-xs',
+                    },
+                    {
+                      label: 'Audit reference',
+                      value: credential.auditReceipts[0]?.reference ?? 'Pending audit reference',
+                      valueClassName: 'font-mono text-xs',
+                    },
+                  ]}
+                />
               </CardContent>
+              <CardFooter className="gap-3">
+                <Button variant="outline" size="sm" className="flex-1" disabled>
+                  View
+                </Button>
+                <Button variant="outline" size="sm" className="flex-1" disabled>
+                  Share
+                </Button>
+              </CardFooter>
             </Card>
           ))}
         </div>

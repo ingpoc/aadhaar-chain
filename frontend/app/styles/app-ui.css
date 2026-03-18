@@ -1,0 +1,75 @@
+@layer components {
+  .app-shell {
+    width: min(100%, var(--app-shell));
+    margin-inline: auto;
+    padding-inline: 1rem;
+  }
+
+  .app-main {
+    padding-block: 1.5rem 3rem;
+  }
+
+  .page-stack {
+    @apply space-y-8;
+  }
+
+  .page-header {
+    @apply flex flex-col gap-4 md:flex-row md:items-end md:justify-between;
+  }
+
+  .page-header-copy {
+    @apply max-w-3xl space-y-2;
+  }
+
+  .page-eyebrow {
+    @apply text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground;
+  }
+
+  .page-actions {
+    @apply flex flex-wrap items-center gap-3;
+  }
+
+  .section-grid {
+    @apply grid gap-6 md:grid-cols-2;
+  }
+
+  .action-grid {
+    @apply grid gap-4 md:grid-cols-3;
+  }
+
+  .detail-stack {
+    @apply space-y-4;
+  }
+
+  .field-stack {
+    @apply space-y-2;
+  }
+
+  .inline-status {
+    @apply flex items-center gap-2;
+  }
+
+  .card-interactive {
+    @apply transition-[transform,border-color,box-shadow] duration-200 hover:-translate-y-px hover:border-border-strong hover:shadow-[0_22px_48px_rgba(22,22,21,0.08)];
+  }
+
+  .list-panel {
+    @apply rounded-3xl border border-border/80 bg-background/70 p-5;
+  }
+}
+
+@media (min-width: 640px) {
+  .app-shell {
+    padding-inline: 1.5rem;
+  }
+
+  .app-main {
+    padding-block: 2rem 4rem;
+  }
+}
+
+@media (min-width: 1024px) {
+  .app-shell {
+    padding-inline: 2rem;
+  }
+}

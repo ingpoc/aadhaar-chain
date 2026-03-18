@@ -11,7 +11,7 @@ export interface WalletState {
   fetchBalance: (connection: Connection, publicKey: PublicKey) => Promise<void>;
 }
 
-export const useWalletStore = create<WalletState>((set, get) => ({
+export const useWalletStore = create<WalletState>((set) => ({
   address: null,
   balance: 0,
   isConnected: false,

@@ -1,223 +1,324 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import Link from 'next/link';
 import { useWallet } from '@solana/wallet-adapter-react';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { CheckCircle2, Upload, XCircle } from 'lucide-react';
+
+import { verificationApi } from '@/lib/api';
+import type { VerificationStatus } from '@/lib/types';
+import { PageHeader } from '@/components/layout/page-header';
+import { VerificationFlowShell } from '@/components/verification/verification-flow-shell';
+import { VerificationEvidenceSummary } from '@/components/verification/verification-evidence-summary';
+import { VerificationProgressCard } from '@/components/verification/verification-progress-card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Alert, AlertDescription } from '@/components/ui/alert';
-import { Progress } from '@/components/ui/progress';
-import { CheckCircle2, Loader2, Upload } from 'lucide-react';
+import { Notice } from '@/components/ui/notice';
+import { StatusBadge } from '@/components/ui/status-badge';
 
-type VerificationStep = 'upload' | 'details' | 'processing' | 'complete';
+type ViewStep = 'upload' | 'details' | 'processing' | 'complete' | 'review' | 'error';
 
 export default function VerifyPanPage() {
-  const { connected } = useWallet();
-  const [step, setStep] = useState<VerificationStep>('upload');
+  const { connected, publicKey } = useWallet();
+  const [step, setStep] = useState<ViewStep>('upload');
   const [panNumber, setPanNumber] = useState('');
   const [name, setName] = useState('');
   const [dob, setDob] = useState('');
   const [file, setFile] = useState<File | null>(null);
-  const [progress, setProgress] = useState(0);
+  const [verificationId, setVerificationId] = useState('');
+  const [status, setStatus] = useState<VerificationStatus | null>(null);
   const [error, setError] = useState('');
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFile = e.target.files?.[0];
-    if (selectedFile) {
-      setFile(selectedFile);
-    }
-  };
-
-  const handleSubmitDocument = () => {
-    if (!file) {
-      setError('Please upload your PAN card');
+  useEffect(() => {
+    if (step !== 'processing' || !verificationId) {
       return;
     }
+
+    let cancelled = false;
+
+    const poll = async () => {
+      try {
+        const nextStatus = await verificationApi.getStatus(verificationId);
+        if (cancelled) {
+          return;
+        }
+
+        setStatus(nextStatus);
+
+        if (nextStatus.status === 'verified') {
+          setStep('complete');
+        } else if (nextStatus.status === 'manual_review') {
+          setError(nextStatus.metadata?.reason || nextStatus.error || 'Manual review required.');
+          setStep('review');
+        } else if (nextStatus.status === 'failed') {
+          setError(
+            nextStatus.metadata?.reason ||
+              nextStatus.error ||
+              nextStatus.decision ||
+              'Verification failed.'
+          );
+          setStep('error');
+        }
+      } catch (pollError) {
+        if (!cancelled) {
+          console.error('Failed to poll PAN verification status', pollError);
+          setError('Failed to fetch verification status.');
+          setStep('error');
+        }
+      }
+    };
+
+    poll();
+    const interval = window.setInterval(poll, 1200);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [step, verificationId]);
+
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    setFile(event.target.files?.[0] ?? null);
+    setError('');
+  };
+
+  const handleContinue = () => {
+    if (!connected) {
+      setError('Please connect your wallet to continue.');
+      return;
+    }
+
+    if (!file) {
+      setError('Please upload a PAN document.');
+      return;
+    }
+
+    setError('');
     setStep('details');
   };
 
-  const handleSubmitDetails = async () => {
-    if (!panNumber.match(/[A-Z]{5}[0-9]{4}[A-Z]{1}/)) {
-      setError('Please enter a valid PAN number (e.g., ABCDE1234F)');
-      return;
-    }
-    if (!name || !dob) {
-      setError('Please fill in all fields');
+  const handleSubmitVerification = async () => {
+    if (!connected || !publicKey) {
+      setError('Please connect your wallet to continue.');
       return;
     }
 
-    setStep('processing');
+    if (!file) {
+      setError('Please upload a PAN document.');
+      return;
+    }
+
+    if (!panNumber || !name || !dob) {
+      setError('PAN number, full name, and date of birth are required.');
+      return;
+    }
+
     setError('');
-    setProgress(0);
 
-    const interval = setInterval(() => {
-      setProgress((prev) => {
-        if (prev >= 100) {
-          clearInterval(interval);
-          return 100;
-        }
-        return prev + 10;
+    try {
+      const response = await verificationApi.submitPan(publicKey.toBase58(), {
+        panNumber,
+        name,
+        dob,
+        documentFile: file,
       });
-    }, 500);
 
-    setTimeout(() => {
-      clearInterval(interval);
-      setProgress(100);
-      setStep('complete');
-    }, 5000);
+      setVerificationId(response.verificationId);
+      setStatus(null);
+      setStep('processing');
+    } catch (submissionError) {
+      console.error('Failed to submit PAN verification', submissionError);
+      setError('Failed to submit PAN verification.');
+    }
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex justify-between items-center">
-        <div>
-          <h1>PAN Verification</h1>
-          <p className="text-muted-foreground">
-            Verify your identity using PAN card
-          </p>
-        </div>
-      </div>
+    <div className="page-stack">
+      <PageHeader
+        eyebrow="Verification workflow"
+        title="Verify PAN"
+        description="Use the same trust pipeline to upload PAN evidence, submit matching claims, and observe the backend verification stages in one standardized surface."
+      />
 
-      {!connected && (
-        <Alert className="border-yellow-200 bg-yellow-50 dark:bg-yellow-950/20">
-          <AlertDescription className="text-yellow-800 dark:text-yellow-200">
-            Please connect your wallet to continue
-          </AlertDescription>
-        </Alert>
-      )}
+      {!connected ? (
+        <Notice tone="warning" title="Wallet required">
+          Please connect your wallet before starting the PAN verification flow.
+        </Notice>
+      ) : null}
 
-      {step === 'upload' && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Upload PAN Card</CardTitle>
-            <CardDescription>
-              Upload your PAN card (PDF or image)
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="border-2 border-dashed rounded-lg p-8 text-center">
-              <input
+      {step === 'upload' ? (
+        <VerificationFlowShell
+          title="Upload supporting document"
+          description="Use a clear image or PDF of the PAN card that the verification pipeline should evaluate."
+          icon={Upload}
+          badge={<StatusBadge tone="neutral" label="Step 1" />}
+        >
+          <div className="detail-stack">
+            <div className="field-stack">
+              <Label htmlFor="pan-file">PAN document</Label>
+              <Input
+                id="pan-file"
+                name="pan-file"
                 type="file"
-                accept=".pdf,image/*"
-                onChange={handleFileUpload}
-                className="hidden"
-                id="pan-upload"
-              />
-              <label htmlFor="pan-upload" className="cursor-pointer">
-                <Upload className="mx-auto h-12 w-12 text-muted-foreground mb-4" />
-                <p className="text-sm text-muted-foreground">
-                  {file ? file.name : 'Click to upload or drag and drop'}
-                </p>
-              </label>
-            </div>
-
-            {error && (
-              <Alert className="border-red-200 bg-red-50 dark:bg-red-950/20">
-                <AlertDescription className="text-red-800 dark:text-red-200">
-                  {error}
-                </AlertDescription>
-              </Alert>
-            )}
-
-            <Button onClick={handleSubmitDocument} disabled={!connected || !file}>
-              Continue
-            </Button>
-          </CardContent>
-        </Card>
-      )}
-
-      {step === 'details' && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Confirm Details</CardTitle>
-            <CardDescription>
-              Enter the details as they appear on your PAN card
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="space-y-2">
-              <Label htmlFor="pan">PAN Number</Label>
-              <Input
-                id="pan"
-                placeholder="ABCDE1234F"
-                value={panNumber}
-                onChange={(e) => setPanNumber(e.target.value.toUpperCase())}
-                maxLength={10}
-                className="uppercase"
+                accept="image/*,application/pdf"
+                onChange={handleFileChange}
               />
             </div>
 
-            <div className="space-y-2">
-              <Label htmlFor="name">Name as per PAN</Label>
-              <Input
-                id="name"
-                placeholder="Full name"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-              />
+            {file ? (
+              <Notice tone="success" title="Evidence attached">
+                {file.name}
+              </Notice>
+            ) : null}
+
+            {error ? (
+              <Notice tone="destructive" title="Unable to continue">
+                {error}
+              </Notice>
+            ) : null}
+
+            <div className="page-actions">
+              <Button onClick={handleContinue} disabled={!connected}>
+                Continue
+              </Button>
+            </div>
+          </div>
+        </VerificationFlowShell>
+      ) : null}
+
+      {step === 'details' ? (
+        <VerificationFlowShell
+          title="Verification details"
+          description="Provide the claims that should match the uploaded PAN document."
+          badge={<StatusBadge tone="neutral" label="Step 2" />}
+        >
+          <div className="detail-stack">
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="field-stack">
+                <Label htmlFor="pan-number">PAN number</Label>
+                <Input
+                  id="pan-number"
+                  name="pan-number"
+                  placeholder="ABCDE1234F"
+                  autoComplete="off"
+                  value={panNumber}
+                  onChange={(event) => setPanNumber(event.target.value.toUpperCase())}
+                  maxLength={10}
+                  className="uppercase"
+                />
+              </div>
+
+              <div className="field-stack">
+                <Label htmlFor="name">Name as per PAN</Label>
+                <Input
+                  id="name"
+                  name="full-name"
+                  placeholder="Full name"
+                  autoComplete="name"
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                />
+              </div>
+
+              <div className="field-stack md:col-span-2">
+                <Label htmlFor="dob">Date of birth</Label>
+                <Input
+                  id="dob"
+                  name="date-of-birth"
+                  type="date"
+                  autoComplete="bday"
+                  value={dob}
+                  onChange={(event) => setDob(event.target.value)}
+                />
+              </div>
             </div>
 
-            <div className="space-y-2">
-              <Label htmlFor="dob">Date of Birth</Label>
-              <Input
-                id="dob"
-                type="date"
-                value={dob}
-                onChange={(e) => setDob(e.target.value)}
-              />
+            {error ? (
+              <Notice tone="destructive" title="Unable to submit verification">
+                {error}
+              </Notice>
+            ) : null}
+
+            <div className="page-actions">
+              <Button onClick={handleSubmitVerification} disabled={!connected}>
+                Submit verification
+              </Button>
+              <Button variant="outline" onClick={() => setStep('upload')}>
+                Back
+              </Button>
             </div>
+          </div>
+        </VerificationFlowShell>
+      ) : null}
 
-            {error && (
-              <Alert className="border-red-200 bg-red-50 dark:bg-red-950/20">
-                <AlertDescription className="text-red-800 dark:text-red-200">
-                  {error}
-                </AlertDescription>
-              </Alert>
-            )}
+      {step === 'processing' ? (
+        <VerificationProgressCard status={status} verificationId={verificationId} />
+      ) : null}
 
-            <Button onClick={handleSubmitDetails}>
-              Verify PAN
-            </Button>
-          </CardContent>
-        </Card>
-      )}
+      {step === 'complete' ? (
+        <VerificationFlowShell
+          tone="success"
+          icon={CheckCircle2}
+          title="Verification complete"
+          description={`PAN verification completed with decision: ${status?.decision ?? 'approve'}.`}
+          badge={<StatusBadge status={status?.decision ?? 'verified'} />}
+        >
+          <div className="detail-stack">
+            <Notice tone="success">
+              PAN verification finished successfully and the resulting trust state can now inform downstream workflows.
+            </Notice>
+            <VerificationEvidenceSummary status={status} />
+            <div className="page-actions">
+              <Button asChild>
+                <Link href="/dashboard">Return to dashboard</Link>
+              </Button>
+            </div>
+          </div>
+        </VerificationFlowShell>
+      ) : null}
 
-      {step === 'processing' && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Loader2 className="h-5 w-5 animate-spin" />
-              Processing Verification
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <Progress value={progress} className="h-2" />
-            <p className="text-sm text-muted-foreground text-center">
-              Verifying with NSDL database...
-            </p>
-          </CardContent>
-        </Card>
-      )}
+      {step === 'review' ? (
+        <VerificationFlowShell
+          tone="warning"
+          title="Manual review required"
+          description="The backend requires manual intervention before this verification can be approved."
+          badge={<StatusBadge status="manual_review" />}
+        >
+          <div className="detail-stack">
+            <Notice tone="warning">{status?.metadata?.reason || error}</Notice>
+            <VerificationEvidenceSummary status={status} />
+            <div className="page-actions">
+              <Button variant="outline" onClick={() => setStep('details')}>
+                Update details
+              </Button>
+              <Button asChild>
+                <Link href="/dashboard">Return to dashboard</Link>
+              </Button>
+            </div>
+          </div>
+        </VerificationFlowShell>
+      ) : null}
 
-      {step === 'complete' && (
-        <Card className="border-green-200 bg-green-50 dark:bg-green-950/20">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-green-800 dark:text-green-200">
-              <CheckCircle2 className="h-6 w-6" />
-              Verification Successful
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <p className="text-green-700 dark:text-green-300">
-              Your PAN has been successfully verified.
-            </p>
-            <Button asChild>
-              <a href="/dashboard">Return to Dashboard</a>
-            </Button>
-          </CardContent>
-        </Card>
-      )}
+      {step === 'error' ? (
+        <VerificationFlowShell
+          tone="destructive"
+          icon={XCircle}
+          title="Verification failed"
+          description="The verification workflow could not be completed."
+          badge={<StatusBadge status="failed" />}
+        >
+          <div className="detail-stack">
+            <Notice tone="destructive">{error || 'The verification workflow failed.'}</Notice>
+            <VerificationEvidenceSummary status={status} />
+            <div className="page-actions">
+              <Button variant="outline" onClick={() => setStep('details')}>
+                Retry
+              </Button>
+            </div>
+          </div>
+        </VerificationFlowShell>
+      ) : null}
     </div>
   );
 }
