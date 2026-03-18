@@ -1,10 +1,13 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useWallet } from '@solana/wallet-adapter-react';
+import axios from 'axios';
 
 import { identityApi } from '@/lib/api';
+import type { Identity } from '@/lib/types';
 import { PageHeader } from '@/components/layout/page-header';
 import { Notice } from '@/components/ui/notice';
 import { Button } from '@/components/ui/button';
@@ -21,8 +24,45 @@ export default function CreateIdentityPage() {
   const { connected, publicKey } = useWallet();
   const [seed, setSeed] = useState('');
   const [loading, setLoading] = useState(false);
+  const [loadingExistingIdentity, setLoadingExistingIdentity] = useState(false);
+  const [existingIdentity, setExistingIdentity] = useState<Identity | null>(null);
   const [error, setError] = useState('');
   const router = useRouter();
+  const walletAddress = publicKey?.toBase58() ?? null;
+
+  useEffect(() => {
+    if (!connected || !walletAddress) {
+      setExistingIdentity(null);
+      return;
+    }
+
+    let cancelled = false;
+    setLoadingExistingIdentity(true);
+    setError('');
+
+    identityApi
+      .getIdentity(walletAddress)
+      .then((identity) => {
+        if (!cancelled) {
+          setExistingIdentity(identity);
+        }
+      })
+      .catch((identityError) => {
+        if (!cancelled) {
+          console.error('Failed to load existing identity', identityError);
+          setExistingIdentity(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoadingExistingIdentity(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [connected, walletAddress]);
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -48,7 +88,12 @@ export default function CreateIdentityPage() {
 
       await identityApi.createIdentity(publicKey.toBase58(), { commitment });
       router.push('/dashboard');
-    } catch {
+    } catch (submitError) {
+      if (axios.isAxiosError(submitError) && submitError.response?.status === 409) {
+        router.push('/dashboard');
+        return;
+      }
+
       setError('Failed to create identity. Please try again.');
     } finally {
       setLoading(false);
@@ -67,6 +112,14 @@ export default function CreateIdentityPage() {
         <Notice tone="warning" title="Wallet required">
           Please connect your wallet before creating an identity anchor.
         </Notice>
+      ) : loadingExistingIdentity ? (
+        <Notice tone="neutral" title="Checking identity state">
+          Loading the current wallet-bound identity so the flow can stay idempotent for repeat visits.
+        </Notice>
+      ) : existingIdentity ? (
+        <Notice tone="warning" title="Identity anchor already exists">
+          This wallet already has an identity anchor. Review the existing record on the dashboard or continue with verification instead of creating a duplicate.
+        </Notice>
       ) : null}
 
       <Card>
@@ -82,7 +135,7 @@ export default function CreateIdentityPage() {
                 placeholder="Optional local seed for the commitment"
                 value={seed}
                 onChange={(event) => setSeed(event.target.value)}
-                disabled={!connected || loading}
+                disabled={!connected || loading || Boolean(existingIdentity)}
               />
               <p className="text-sm text-muted-foreground">
                 Leave this empty to derive a seed from the current wallet and timestamp.
@@ -96,19 +149,27 @@ export default function CreateIdentityPage() {
             ) : null}
 
             <div className="page-actions">
-              <Button type="submit" disabled={!connected || loading}>
+              <Button
+                type="submit"
+                disabled={!connected || loading || loadingExistingIdentity || Boolean(existingIdentity)}
+              >
                 {loading ? 'Creating identity...' : 'Create identity'}
               </Button>
               <Button
                 type="button"
                 variant="outline"
-                disabled={!connected || loading}
+                disabled={!connected || loading || loadingExistingIdentity || Boolean(existingIdentity)}
                 onClick={() =>
                   setSeed(`${publicKey?.toBase58() ?? 'wallet'}:${Date.now()}`)
                 }
               >
                 Auto-generate seed
               </Button>
+              {existingIdentity ? (
+                <Button type="button" variant="outline" asChild>
+                  <Link href="/dashboard">Review existing identity</Link>
+                </Button>
+              ) : null}
             </div>
           </form>
         </CardContent>

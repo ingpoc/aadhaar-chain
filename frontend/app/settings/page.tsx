@@ -1,5 +1,6 @@
 'use client';
 
+import { useMemo, useRef, useState } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 
 import { PageHeader } from '@/components/layout/page-header';
@@ -19,6 +20,50 @@ import { Notice } from '@/components/ui/notice';
 
 export default function SettingsPage() {
   const { connected, publicKey } = useWallet();
+  const walletAddress = publicKey?.toBase58() ?? null;
+  const recoveryEmailRef = useRef<HTMLInputElement | null>(null);
+  const [recoveryNotice, setRecoveryNotice] = useState<{
+    tone: 'success' | 'destructive';
+    message: string;
+  } | null>(null);
+  const storedRecoveryEmail = useMemo(() => {
+    if (!walletAddress || typeof window === 'undefined') {
+      return '';
+    }
+
+    return (
+      window.localStorage.getItem(`aadhaar-chain:recovery-email:${walletAddress}`) ?? ''
+    );
+  }, [walletAddress]);
+
+  const handleSaveRecoverySettings = () => {
+    if (!walletAddress) {
+      setRecoveryNotice({
+        tone: 'destructive',
+        message: 'Connect a wallet before saving recovery settings.',
+      });
+      return;
+    }
+
+    const nextEmail = recoveryEmailRef.current?.value.trim() ?? '';
+    if (!nextEmail) {
+      window.localStorage.removeItem(`aadhaar-chain:recovery-email:${walletAddress}`);
+      setRecoveryNotice({
+        tone: 'success',
+        message: 'Recovery email cleared for this local wallet session.',
+      });
+      return;
+    }
+
+    window.localStorage.setItem(
+      `aadhaar-chain:recovery-email:${walletAddress}`,
+      nextEmail
+    );
+    setRecoveryNotice({
+      tone: 'success',
+      message: 'Recovery email saved locally for this wallet.',
+    });
+  };
 
   const handleExportData = () => {
     window.alert('Data export feature coming soon');
@@ -82,12 +127,22 @@ export default function SettingsPage() {
                 <div className="field-stack">
                   <Label htmlFor="recovery-email">Recovery email</Label>
                   <Input
+                    key={walletAddress ?? 'no-wallet'}
                     id="recovery-email"
+                    name="recovery-email"
                     type="email"
+                    autoComplete="email"
                     placeholder="recovery@example.com"
+                    defaultValue={storedRecoveryEmail}
+                    ref={recoveryEmailRef}
                   />
                 </div>
-                <Button>Save recovery settings</Button>
+                {recoveryNotice ? (
+                  <Notice tone={recoveryNotice.tone} title="Recovery settings">
+                    {recoveryNotice.message}
+                  </Notice>
+                ) : null}
+                <Button onClick={handleSaveRecoverySettings}>Save recovery settings</Button>
               </CardContent>
             </Card>
           </div>

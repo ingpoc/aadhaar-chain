@@ -168,6 +168,7 @@ export default function VerifyAadhaarPage() {
               <Label htmlFor="aadhaar-file">Aadhaar document</Label>
               <Input
                 id="aadhaar-file"
+                name="aadhaar-file"
                 type="file"
                 accept="image/*,application/pdf"
                 onChange={handleFileChange}
@@ -207,7 +208,9 @@ export default function VerifyAadhaarPage() {
                 <Label htmlFor="aadhaar-number">Aadhaar number</Label>
                 <Input
                   id="aadhaar-number"
+                  name="aadhaar-number"
                   placeholder="12-digit Aadhaar number"
+                  autoComplete="off"
                   value={aadhaarNumber}
                   onChange={(event) =>
                     setAadhaarNumber(event.target.value.replace(/\D/g, '').slice(0, 12))
@@ -220,7 +223,9 @@ export default function VerifyAadhaarPage() {
                 <Label htmlFor="full-name">Full name</Label>
                 <Input
                   id="full-name"
+                  name="full-name"
                   placeholder="Name as per Aadhaar"
+                  autoComplete="name"
                   value={name}
                   onChange={(event) => setName(event.target.value)}
                 />
@@ -230,7 +235,9 @@ export default function VerifyAadhaarPage() {
                 <Label htmlFor="dob">Date of birth</Label>
                 <Input
                   id="dob"
+                  name="date-of-birth"
                   type="date"
+                  autoComplete="bday"
                   value={dob}
                   onChange={(event) => setDob(event.target.value)}
                 />
@@ -240,7 +247,9 @@ export default function VerifyAadhaarPage() {
                 <Label htmlFor="address">Address</Label>
                 <Input
                   id="address"
+                  name="address"
                   placeholder="Optional address"
+                  autoComplete="street-address"
                   value={address}
                   onChange={(event) => setAddress(event.target.value)}
                 />
@@ -249,6 +258,7 @@ export default function VerifyAadhaarPage() {
 
             <label className="flex items-start gap-3 rounded-[1.5rem] border border-border/80 bg-background/70 p-4">
               <input
+                name="verification-consent"
                 type="checkbox"
                 checked={consent}
                 onChange={(event) => setConsent(event.target.checked)}

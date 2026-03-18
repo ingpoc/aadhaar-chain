@@ -6,6 +6,14 @@
 - This file adds only `aadhaar-chain`-specific execution guidance.
 - If this file conflicts with the root workspace `AGENTS.md`, the root file wins unless it explicitly allows a repo-local exception.
 
+## Browser Testing
+
+- BEFORE browser testing AadhaarChain -> read `../docs/workflow/browser-testing-control-plane.md`
+- BEFORE running the same-user portfolio journey -> read `../docs/workflow/portfolio-browser-acceptance-loop.md`
+- Treat AadhaarChain as the first browser checkpoint in the portfolio flow because downstream trust consumers depend on its identity and trust state.
+- Critical browser routes for this repo: `/`, `/dashboard`, `/identity/create`, `/verify/aadhaar`, `/verify/pan`, `/credentials`, `/settings`
+- Local browser validation should confirm both the frontend and gateway are running before drawing product conclusions.
+
 # Agent SDK Integration
 
 ## Purpose

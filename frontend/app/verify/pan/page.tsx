@@ -159,6 +159,7 @@ export default function VerifyPanPage() {
               <Label htmlFor="pan-file">PAN document</Label>
               <Input
                 id="pan-file"
+                name="pan-file"
                 type="file"
                 accept="image/*,application/pdf"
                 onChange={handleFileChange}
@@ -198,7 +199,9 @@ export default function VerifyPanPage() {
                 <Label htmlFor="pan-number">PAN number</Label>
                 <Input
                   id="pan-number"
+                  name="pan-number"
                   placeholder="ABCDE1234F"
+                  autoComplete="off"
                   value={panNumber}
                   onChange={(event) => setPanNumber(event.target.value.toUpperCase())}
                   maxLength={10}
@@ -210,7 +213,9 @@ export default function VerifyPanPage() {
                 <Label htmlFor="name">Name as per PAN</Label>
                 <Input
                   id="name"
+                  name="full-name"
                   placeholder="Full name"
+                  autoComplete="name"
                   value={name}
                   onChange={(event) => setName(event.target.value)}
                 />
@@ -220,7 +225,9 @@ export default function VerifyPanPage() {
                 <Label htmlFor="dob">Date of birth</Label>
                 <Input
                   id="dob"
+                  name="date-of-birth"
                   type="date"
+                  autoComplete="bday"
                   value={dob}
                   onChange={(event) => setDob(event.target.value)}
                 />
