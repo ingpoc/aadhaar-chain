@@ -28,6 +28,7 @@ from claude_agent_sdk.types import (
 )
 
 from app.mcp_config import DEFAULT_MCP_SERVERS
+from app.runtime_config import resolve_runtime_policy
 from app.document_processing import extract_document_contract
 from app.models import (
     AadhaarVerificationData,
@@ -328,12 +329,19 @@ class AgentManager:
         agent_def = self.agents.get(agent_type)
         if agent_def is None:
             raise ValueError(f"Agent not found: {agent_type}")
+        runtime_policy = resolve_runtime_policy()
+        if not runtime_policy.runtime_available:
+            raise RuntimeError(runtime_policy.blocked_reason or "Claude Agent runtime is unavailable for AadhaarChain.")
 
         return ClaudeSDKClient(
             options=ClaudeAgentOptions(
                 system_prompt=agent_def.system_prompt,
                 mcp_servers=self._build_mcp_servers(agent_def.mcp_servers or []),
                 cwd=self.repo_root,
+                model=runtime_policy.model,
+                allowed_tools=agent_def.tools or [],
+                permission_mode="default",
+                cli_path=runtime_policy.claude_code_executable_path,
             )
         )
 

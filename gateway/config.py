@@ -1,4 +1,5 @@
 """Configuration management for aadhaar-chain gateway."""
+import os
 from pydantic_settings import BaseSettings
 from pydantic import field_validator
 from typing import Optional, Union
@@ -43,6 +44,10 @@ class Settings(BaseSettings):
     # Anthropic (Claude Agent SDK)
     anthropic_api_key: Optional[str] = None
     anthropic_base_url: Optional[str] = None
+    claude_agent_auth_mode: str = "auto"
+    claude_agent_allow_local_cli_auth: bool = True
+    claude_agent_model: str = "claude-haiku-4-5-20251001"
+    claude_code_executable: Optional[str] = None
 
     # Storage
     data_dir: str = "./data"
@@ -63,3 +68,12 @@ class Settings(BaseSettings):
 
 # Global settings instance
 settings = Settings()
+
+if settings.anthropic_api_key and not os.getenv("ANTHROPIC_API_KEY"):
+    os.environ["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
+
+if settings.anthropic_base_url and not os.getenv("ANTHROPIC_BASE_URL"):
+    os.environ["ANTHROPIC_BASE_URL"] = settings.anthropic_base_url
+
+if settings.claude_code_executable and not os.getenv("CLAUDE_CODE_EXECUTABLE"):
+    os.environ["CLAUDE_CODE_EXECUTABLE"] = settings.claude_code_executable

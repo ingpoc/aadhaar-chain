@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -222,12 +223,24 @@ def test_create_sdk_client_returns_distinct_instances_per_call() -> None:
             self.options = options
             created_clients.append(self)
 
-    with patch("app.agent_manager.ClaudeSDKClient", FakeClient):
+    runtime_policy = SimpleNamespace(
+        runtime_available=True,
+        auth_mode="local_cli",
+        model="claude-haiku-4-5-20251001",
+        blocked_reason=None,
+        claude_code_executable_path="/tmp/fake-claude",
+    )
+
+    with patch("app.agent_manager.ClaudeSDKClient", FakeClient), patch(
+        "app.agent_manager.resolve_runtime_policy",
+        return_value=runtime_policy,
+    ):
         first = manager._create_sdk_client(AgentType.DOCUMENT_VALIDATOR)
         second = manager._create_sdk_client(AgentType.DOCUMENT_VALIDATOR)
 
     assert first is not second
     assert len(created_clients) == 2
+    assert created_clients[0].options.model == "claude-haiku-4-5-20251001"
 
 
 def test_detect_fraud_falls_back_to_deterministic_contract_when_agent_returns_none() -> None:

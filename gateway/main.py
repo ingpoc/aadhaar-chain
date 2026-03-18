@@ -15,6 +15,7 @@ from app.models import (
 )
 from app.routes import router as identity_router
 from app.agent_manager import agent_manager
+from app.runtime_config import resolve_runtime_policy
 
 
 # Create FastAPI app
@@ -45,12 +46,18 @@ app.include_router(identity_router)
 @app.on_event("startup")
 async def startup_event():
     """Initialize Claude Agent SDK and agents on startup."""
-    # Initialize agent manager
+    runtime_policy = resolve_runtime_policy()
     await agent_manager.initialize_agents()
-    # TODO: Initialize Claude Agent SDK (requires API key)
-    # TODO: Connect to MCP servers (document-processor, pattern-analyzer, compliance-rules)
-    # TODO: Load agent definitions from mcp/agents.py
-    # TODO: Initialize actual agent instances (not mock data)
+    if runtime_policy.runtime_available:
+        print(
+            "✓ AadhaarChain Claude Agent runtime ready "
+            f"(auth={runtime_policy.auth_mode}, model={runtime_policy.model})"
+        )
+    else:
+        print(
+            "⚠ AadhaarChain Claude Agent runtime unavailable: "
+            f"{runtime_policy.blocked_reason}"
+        )
 
 
 # Health check endpoint
