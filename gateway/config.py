@@ -69,11 +69,13 @@ class Settings(BaseSettings):
 # Global settings instance
 settings = Settings()
 
-if settings.anthropic_api_key and not os.getenv("ANTHROPIC_API_KEY"):
-    os.environ["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
+def apply_runtime_environment() -> None:
+    """Propagate runtime settings into environment variables during startup."""
+    if settings.anthropic_api_key and not os.getenv("ANTHROPIC_API_KEY"):
+        os.environ["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
 
-if settings.anthropic_base_url and not os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ["ANTHROPIC_BASE_URL"] = settings.anthropic_base_url
+    if settings.anthropic_base_url and not os.getenv("ANTHROPIC_BASE_URL"):
+        os.environ["ANTHROPIC_BASE_URL"] = settings.anthropic_base_url
 
-if settings.claude_code_executable and not os.getenv("CLAUDE_CODE_EXECUTABLE"):
-    os.environ["CLAUDE_CODE_EXECUTABLE"] = settings.claude_code_executable
+    if settings.claude_code_executable and not os.getenv("CLAUDE_CODE_EXECUTABLE"):
+        os.environ["CLAUDE_CODE_EXECUTABLE"] = settings.claude_code_executable

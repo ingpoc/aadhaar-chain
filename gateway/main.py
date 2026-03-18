@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 
-from config import settings
+from config import apply_runtime_environment, settings
 from app.models import (
     AadhaarVerificationData,
     PanVerificationData,
@@ -46,6 +46,7 @@ app.include_router(identity_router)
 @app.on_event("startup")
 async def startup_event():
     """Initialize Claude Agent SDK and agents on startup."""
+    apply_runtime_environment()
     runtime_policy = resolve_runtime_policy()
     await agent_manager.initialize_agents()
     if runtime_policy.runtime_available:

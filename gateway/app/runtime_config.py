@@ -1,6 +1,7 @@
 """Claude Agent SDK runtime policy for aadhaar-chain internal agents."""
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 from dataclasses import dataclass
@@ -44,6 +45,7 @@ def _find_claude_code_executable() -> Optional[str]:
     return None
 
 
+@functools.lru_cache(maxsize=1)
 def resolve_runtime_policy() -> AgentRuntimePolicy:
     requested_auth_mode = (settings.claude_agent_auth_mode or "auto").strip().lower()
     if requested_auth_mode not in {"auto", "api_key", "local_cli", "bedrock", "vertex", "azure"}:
@@ -78,7 +80,7 @@ def resolve_runtime_policy() -> AgentRuntimePolicy:
             claude_code_executable_path=cli_path,
         )
 
-    if has_api_key:
+    if requested_auth_mode == "auto" and has_api_key:
         return AgentRuntimePolicy(
             runtime_available=True,
             auth_mode="api_key",
