@@ -2,6 +2,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../gateway"
+PORT="${PORT:-43101}"
 
 if command -v pyenv >/dev/null 2>&1; then
   PYTHON_BIN="$(pyenv which python3)"
@@ -22,19 +23,19 @@ else
   done
 fi
 
-# Kill existing gateway on port 8000
-lsof -ti:8000 | xargs kill -9 2>/dev/null || true
+# Kill existing gateway on the configured port
+lsof -ti:"$PORT" | xargs kill -9 2>/dev/null || true
 # Start gateway in background
 if [ -n "$PYTHONPATH_PREFIX" ]; then
-  nohup env PYTHONPATH="$PYTHONPATH_PREFIX${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" main.py > /tmp/gateway.log 2>&1 &
+  nohup env PORT="$PORT" PYTHONPATH="$PYTHONPATH_PREFIX${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" main.py > /tmp/gateway.log 2>&1 &
 else
-  nohup "$PYTHON_BIN" main.py > /tmp/gateway.log 2>&1 &
+  nohup env PORT="$PORT" "$PYTHON_BIN" main.py > /tmp/gateway.log 2>&1 &
 fi
 echo $! > /tmp/gateway.pid
 # Wait for health check
 for i in {1..10}; do
-    if curl -s http://127.0.0.1:8000/health >/dev/null 2>&1; then
-        echo "Gateway started: http://127.0.0.1:8000"
+    if curl -s "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+        echo "Gateway started: http://127.0.0.1:${PORT}"
         exit 0
     fi
     sleep 1
