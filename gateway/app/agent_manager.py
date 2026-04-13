@@ -30,7 +30,13 @@ try:
     )
     CLAUDE_AGENT_SDK_AVAILABLE = True
 except ModuleNotFoundError:
-    ClaudeAgentOptions = None  # type: ignore[assignment]
+    class ClaudeAgentOptions:  # type: ignore[no-redef]
+        """Minimal options shim for tests when the SDK package is unavailable."""
+
+        def __init__(self, **kwargs: Any) -> None:
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
     ClaudeSDKClient = None  # type: ignore[assignment]
     AssistantMessage = ResultMessage = TextBlock = ToolResultBlock = ToolUseBlock = object  # type: ignore[assignment]
     McpStdioServerConfig = Dict[str, Any]  # type: ignore[assignment]
@@ -335,7 +341,7 @@ class AgentManager:
         ClaudeSDKClient instances cannot safely service concurrent background tasks.
         Reusing them causes overlapping reads against the same subprocess transport.
         """
-        if not CLAUDE_AGENT_SDK_AVAILABLE or ClaudeAgentOptions is None or ClaudeSDKClient is None:
+        if ClaudeSDKClient is None:
             raise RuntimeError(
                 "Claude Agent SDK is not installed in this environment. "
                 "Run the gateway with deterministic fallback mode or install the SDK from the internal source."
