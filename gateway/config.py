@@ -26,6 +26,11 @@ class Settings(BaseSettings):
         "http://127.0.0.1:43103",
         "http://localhost:43105",
         "http://127.0.0.1:43105",
+        "https://aadharcha.in",
+        "https://www.aadharcha.in",
+        "https://ondcbuyer.aadharcha.in",
+        "https://ondcseller.aadharcha.in",
+        "https://flatwatch.aadharcha.in",
     ]
     cors_allow_credentials: bool = True
     cors_allow_methods: list[str] = ["*"]
@@ -46,6 +51,7 @@ class Settings(BaseSettings):
     anthropic_base_url: Optional[str] = None
     claude_agent_auth_mode: str = "auto"
     claude_agent_allow_local_cli_auth: bool = True
+    claude_agent_allow_deployed_cli_auth: bool = False
     claude_agent_model: str = "claude-haiku-4-5-20251001"
     claude_code_executable: Optional[str] = None
 

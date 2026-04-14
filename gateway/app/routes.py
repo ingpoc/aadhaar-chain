@@ -31,11 +31,20 @@ from app.models import (
 )
 
 from app.agent_manager import agent_manager
+from app.state_store import save_gateway_state
 
 
-# In-memory stores (for development)
+# Runtime stores hydrated on startup.
 verifications: dict[str, VerificationStatus] = {}
 identities: dict[str, IdentityData] = {}
+
+
+def persist_runtime_state() -> None:
+    """Persist identity and verification state after mutating operations."""
+    save_gateway_state(identities, agent_manager.verification_records)
+
+
+agent_manager.set_state_change_callback(persist_runtime_state)
 
 
 router = APIRouter(prefix="/api/identity", tags=["identity"])
@@ -278,6 +287,7 @@ async def create_identity(
         updated_at=_get_timestamp(),
     )
     identities[wallet_address] = identity
+    persist_runtime_state()
 
     return ApiResponse(
         success=True,
@@ -304,6 +314,7 @@ async def update_identity(
         identity.verification_bitmap = data.verification_bitmap
     
     identity.updated_at = _get_timestamp()
+    persist_runtime_state()
     
     return ApiResponse(
         success=True,
@@ -321,6 +332,7 @@ async def seed_trust_fixture(
     """Seed deterministic local trust states for downstream browser validation."""
     _ensure_local_fixture_access(request)
     trust_surface = _seed_trust_fixture(wallet_address, data.fixture_state, data.document_type)
+    persist_runtime_state()
     return ApiResponse(
         success=True,
         message=f"Fixture {data.fixture_state} applied",

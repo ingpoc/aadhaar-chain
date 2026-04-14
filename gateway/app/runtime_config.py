@@ -22,8 +22,8 @@ class AgentRuntimePolicy:
     claude_code_executable_path: Optional[str]
 
 
-def _is_non_production() -> bool:
-    return settings.debug or os.getenv("ENV", "development") != "production"
+def _allow_deployed_cli_auth() -> bool:
+    return bool(settings.claude_agent_allow_deployed_cli_auth)
 
 
 def _find_claude_code_executable() -> Optional[str]:
@@ -98,12 +98,15 @@ def resolve_runtime_policy() -> AgentRuntimePolicy:
                 blocked_reason="Claude Code CLI auth is disabled for this AadhaarChain runtime.",
                 claude_code_executable_path=cli_path,
             )
-        if not _is_non_production():
+        if os.getenv("ENV", "development") == "production" and not _allow_deployed_cli_auth():
             return AgentRuntimePolicy(
                 runtime_available=False,
                 auth_mode="unavailable",
                 model=settings.claude_agent_model,
-                blocked_reason="Claude Code CLI auth is restricted to non-production AadhaarChain runtimes.",
+                blocked_reason=(
+                    "Claude Code CLI auth is restricted to local/non-production AadhaarChain runtimes unless "
+                    "CLAUDE_AGENT_ALLOW_DEPLOYED_CLI_AUTH=true is set on the gateway host."
+                ),
                 claude_code_executable_path=cli_path,
             )
         if not cli_path:

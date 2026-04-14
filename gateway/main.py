@@ -13,9 +13,10 @@ from app.models import (
     VerificationStep,
     ApiResponse,
 )
-from app.routes import router as identity_router
+from app.routes import router as identity_router, identities
 from app.agent_manager import agent_manager
 from app.runtime_config import resolve_runtime_policy
+from app.state_store import load_gateway_state
 
 
 # Create FastAPI app
@@ -47,8 +48,19 @@ app.include_router(identity_router)
 async def startup_event():
     """Initialize Claude Agent SDK and agents on startup."""
     apply_runtime_environment()
+    persisted_identities, persisted_verifications = load_gateway_state()
+    identities.clear()
+    identities.update(persisted_identities)
+    agent_manager.verification_records.clear()
+    agent_manager.verification_records.update(persisted_verifications)
     runtime_policy = resolve_runtime_policy()
     await agent_manager.initialize_agents()
+    if persisted_identities or persisted_verifications:
+        print(
+            "✓ Loaded persisted AadhaarChain state "
+            f"(identities={len(persisted_identities)}, "
+            f"verifications={len(persisted_verifications)})"
+        )
     if runtime_policy.runtime_available:
         print(
             "✓ AadhaarChain Claude Agent runtime ready "
@@ -70,6 +82,50 @@ async def health_check() -> JSONResponse:
         "service": settings.app_name,
         "version": "1.0.0",
     }
+
+
+@app.get("/api/health", tags=["health"])
+async def api_health_check() -> JSONResponse:
+    """Legacy health alias for deployed probes and older consumers."""
+    return JSONResponse(content=await health_check())
+
+
+@app.get("/api/auth/me", tags=["auth"])
+async def auth_me() -> JSONResponse:
+    """Legacy auth compatibility endpoint for buyer/seller public deployments."""
+    return JSONResponse(
+        {
+            "success": True,
+            "message": "Public deployment has no authenticated identity session.",
+            "data": None,
+        }
+    )
+
+
+@app.get("/api/auth/validate", tags=["auth"])
+async def auth_validate() -> JSONResponse:
+    """Legacy auth validation endpoint for buyer/seller public deployments."""
+    return JSONResponse(
+        {
+            "success": True,
+            "data": {
+                "valid": False,
+                "user": None,
+            },
+        }
+    )
+
+
+@app.post("/api/auth/logout", tags=["auth"])
+async def auth_logout() -> JSONResponse:
+    """Legacy logout compatibility endpoint."""
+    return JSONResponse(
+        {
+            "success": True,
+            "message": "No active deployed session to revoke.",
+            "data": None,
+        }
+    )
 
 
 # Root endpoint
