@@ -8,7 +8,7 @@ from __future__ import annotations
 from enum import Enum
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 import base64
 import hashlib
 import importlib.util
@@ -98,6 +98,15 @@ class AgentManager:
         self.agents: Dict[AgentType, Any] = {}
         self.verification_records: Dict[str, VerificationStatus] = {}
         self.repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        self._state_change_callback: Optional[Callable[[], None]] = None
+
+    def set_state_change_callback(self, callback: Callable[[], None]) -> None:
+        """Register a persistence callback for stateful verification mutations."""
+        self._state_change_callback = callback
+
+    def _notify_state_changed(self) -> None:
+        if self._state_change_callback is not None:
+            self._state_change_callback()
 
     def _build_verification_status(
         self,
@@ -1139,6 +1148,7 @@ Return only JSON with this exact shape:
         if status is None:
             status = self._build_verification_status(verification_id, wallet_address)
             self.verification_records[verification_id] = status
+            self._notify_state_changed()
 
         self._record_step(status, VerificationStep.parsing, 0.2)
         document = await self.validate_document(
@@ -1184,6 +1194,7 @@ Return only JSON with this exact shape:
             verification_id,
             wallet_address,
         )
+        self._notify_state_changed()
         return verification_id
 
     async def update_verification_progress(
@@ -1198,6 +1209,7 @@ Return only JSON with this exact shape:
 
         status = self.verification_records[verification_id]
         self._record_step(status, current_step, progress)
+        self._notify_state_changed()
 
     async def complete_verification(
         self,
@@ -1234,6 +1246,7 @@ Return only JSON with this exact shape:
             status.error = metadata.reason
 
         status.metadata = metadata
+        self._notify_state_changed()
 
     async def cleanup_expired_verifications(self, days: int = 7) -> int:
         """Clean up old verification records."""
@@ -1245,6 +1258,9 @@ Return only JSON with this exact shape:
             if created_time < cutoff_time:
                 del self.verification_records[verification_id]
                 cleaned += 1
+
+        if cleaned:
+            self._notify_state_changed()
 
         return cleaned
 

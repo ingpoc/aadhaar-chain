@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from config import settings
 from main import app
 from app.models import (
     AgentRunProvenance,
@@ -16,6 +17,7 @@ from app.models import (
     VerificationStatus,
 )
 from app.routes import agent_manager, identities
+from app.state_store import load_gateway_state, save_gateway_state
 
 
 def _provenance(agent_id: str) -> AgentRunProvenance:
@@ -96,6 +98,72 @@ def test_get_identity_returns_empty_payload_when_missing() -> None:
     assert body["success"] is True
     assert body["message"] == "Identity not found"
     assert body["data"] is None
+
+
+def test_create_identity_persists_runtime_state(tmp_path) -> None:
+    identities.clear()
+    agent_manager.verification_records.clear()
+
+    original_data_dir = settings.data_dir
+    settings.data_dir = str(tmp_path)
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/api/identity/wallet-persisted",
+            json={"commitment": "sha256:persisted"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+
+        identities.clear()
+        agent_manager.verification_records.clear()
+        persisted_identities, persisted_verifications = load_gateway_state()
+
+        assert "wallet-persisted" in persisted_identities
+        assert persisted_identities["wallet-persisted"].commitment == "sha256:persisted"
+        assert persisted_verifications == {}
+    finally:
+        settings.data_dir = original_data_dir
+
+
+def test_save_gateway_state_round_trips_verifications(tmp_path) -> None:
+    original_data_dir = settings.data_dir
+    settings.data_dir = str(tmp_path)
+    try:
+        identity = IdentityData(
+            did="did:solana:wallet123",
+            owner="wallet123",
+            commitment="sha256:anchor",
+            verification_bitmap=0,
+            created_at="2026-03-17T00:00:00Z",
+            updated_at="2026-03-17T00:00:00Z",
+        )
+        verification = VerificationStatus(
+            verification_id="aadhaar_wallet123",
+            wallet_address="wallet123",
+            status="manual_review",
+            current_step="complete",
+            steps=[],
+            progress=1.0,
+            created_at="2026-03-17T00:00:00Z",
+            updated_at="2026-03-17T00:00:01Z",
+            error="manual review required",
+            metadata=None,
+        )
+
+        save_gateway_state(
+            {"wallet123": identity},
+            {"aadhaar_wallet123": verification},
+        )
+
+        persisted_identities, persisted_verifications = load_gateway_state()
+
+        assert persisted_identities["wallet123"].owner == "wallet123"
+        assert persisted_verifications["aadhaar_wallet123"].status == "manual_review"
+        assert persisted_verifications["aadhaar_wallet123"].wallet_address == "wallet123"
+    finally:
+        settings.data_dir = original_data_dir
 
 
 def test_get_trust_surface_redacts_internal_verification_evidence() -> None:

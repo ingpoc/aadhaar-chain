@@ -49,6 +49,7 @@ Thumbs.db
 # Logs
 *.log
 logs/
+data/
 
 # Testing
 .pytest_cache/
