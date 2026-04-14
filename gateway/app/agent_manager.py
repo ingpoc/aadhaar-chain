@@ -66,15 +66,20 @@ repo_root_for_imports = os.path.abspath(os.path.join(os.path.dirname(__file__), 
 if repo_root_for_imports not in sys.path:
     sys.path.insert(0, repo_root_for_imports)
 
-_agents_spec = importlib.util.spec_from_file_location(
-    "aadhaar_chain_mcp_agents",
-    os.path.join(repo_root_for_imports, "mcp", "agents.py"),
-)
-if _agents_spec is None or _agents_spec.loader is None:
-    raise ImportError("Unable to load aadhaar-chain agent definitions.")
-_agents_module = importlib.util.module_from_spec(_agents_spec)
-_agents_spec.loader.exec_module(_agents_module)
-get_all_agents = _agents_module.get_all_agents
+_agents_path = os.path.join(repo_root_for_imports, "mcp", "agents.py")
+if os.path.exists(_agents_path):
+    _agents_spec = importlib.util.spec_from_file_location(
+        "aadhaar_chain_mcp_agents",
+        _agents_path,
+    )
+    if _agents_spec is None or _agents_spec.loader is None:
+        raise ImportError("Unable to load aadhaar-chain agent definitions.")
+    _agents_module = importlib.util.module_from_spec(_agents_spec)
+    _agents_spec.loader.exec_module(_agents_module)
+    get_all_agents = _agents_module.get_all_agents
+else:
+    def get_all_agents() -> list[Any]:
+        return []
 
 
 class AgentType(str, Enum):
