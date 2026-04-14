@@ -72,6 +72,50 @@ async def health_check() -> JSONResponse:
     }
 
 
+@app.get("/api/health", tags=["health"])
+async def api_health_check() -> JSONResponse:
+    """Legacy health alias for deployed probes and older consumers."""
+    return JSONResponse(content=await health_check())
+
+
+@app.get("/api/auth/me", tags=["auth"])
+async def auth_me() -> JSONResponse:
+    """Legacy auth compatibility endpoint for buyer/seller public deployments."""
+    return JSONResponse(
+        {
+            "success": True,
+            "message": "Public deployment has no authenticated identity session.",
+            "data": None,
+        }
+    )
+
+
+@app.get("/api/auth/validate", tags=["auth"])
+async def auth_validate() -> JSONResponse:
+    """Legacy auth validation endpoint for buyer/seller public deployments."""
+    return JSONResponse(
+        {
+            "success": True,
+            "data": {
+                "valid": False,
+                "user": None,
+            },
+        }
+    )
+
+
+@app.post("/api/auth/logout", tags=["auth"])
+async def auth_logout() -> JSONResponse:
+    """Legacy logout compatibility endpoint."""
+    return JSONResponse(
+        {
+            "success": True,
+            "message": "No active deployed session to revoke.",
+            "data": None,
+        }
+    )
+
+
 # Root endpoint
 @app.get("/", tags=["root"])
 async def root() -> JSONResponse:
