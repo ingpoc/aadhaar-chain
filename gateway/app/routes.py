@@ -165,7 +165,10 @@ async def get_trust_surface(
 ):
     """Expose a downstream-safe trust view without leaking raw verification evidence."""
     if wallet_address not in identities:
-        raise HTTPException(status_code=404, detail="Identity not found")
+        return ApiResponse(
+            success=True,
+            data=_build_no_identity_trust_surface(wallet_address).model_dump(),
+        )
 
     identity = identities[wallet_address]
     trust_surface = _build_trust_surface(identity)
@@ -357,7 +360,7 @@ def _seed_trust_fixture(
     _clear_wallet_fixture(wallet_address)
 
     if fixture_state == "no_identity":
-        return None
+        return _build_no_identity_trust_surface(wallet_address)
 
     identities[wallet_address] = IdentityData(
         did=_build_did(wallet_address),
@@ -482,6 +485,19 @@ def _get_timestamp() -> str:
 def _build_did(wallet_address: str) -> str:
     """Build a stable DID-like identifier from the wallet address."""
     return f"did:solana:{wallet_address}"
+
+
+def _build_no_identity_trust_surface(wallet_address: str) -> TrustReadSurface:
+    return TrustReadSurface(
+        wallet_address=wallet_address,
+        did=_build_did(wallet_address),
+        verification_bitmap=0,
+        updated_at=_get_timestamp(),
+        trust_state="no_identity",
+        high_trust_eligible=False,
+        state_reason="No identity anchor exists for this wallet address.",
+        verifications=[],
+    )
 
 
 def _build_trust_surface(identity: IdentityData) -> TrustReadSurface:

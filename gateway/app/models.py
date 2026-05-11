@@ -194,6 +194,7 @@ class TrustReadSurface(BaseModel):
     verification_bitmap: int = 0
     updated_at: str
     trust_state: Literal[
+        "no_identity",
         "identity_present_unverified",
         "verified",
         "manual_review",

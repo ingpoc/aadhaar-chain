@@ -100,6 +100,23 @@ def test_get_identity_returns_empty_payload_when_missing() -> None:
     assert body["data"] is None
 
 
+def test_get_trust_surface_returns_no_identity_contract_when_missing() -> None:
+    identities.clear()
+    agent_manager.verification_records.clear()
+
+    client = TestClient(app)
+    response = client.get("/api/identity/missing-wallet/trust")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    trust = body["data"]
+    assert trust["wallet_address"] == "missing-wallet"
+    assert trust["trust_state"] == "no_identity"
+    assert trust["high_trust_eligible"] is False
+    assert trust["verifications"] == []
+
+
 def test_create_identity_persists_runtime_state(tmp_path) -> None:
     identities.clear()
     agent_manager.verification_records.clear()
@@ -308,7 +325,8 @@ def test_seed_trust_fixture_supports_full_local_matrix() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["success"] is True
-    assert body["data"] is None
+    assert body["data"]["trust_state"] == "no_identity"
+    assert body["data"]["high_trust_eligible"] is False
 
     identity_response = client.get(f"/api/identity/{wallet_address}")
     assert identity_response.status_code == 200
