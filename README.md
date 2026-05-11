@@ -22,3 +22,5 @@ Use `/trust` for downstream consumption. It exposes trust decisions, evidence co
 ## Architecture
 
 The governing trust-boundary decision is documented in [docs/architecture/trust-substrate-adr.md](docs/architecture/trust-substrate-adr.md).
+
+The Aadhaar/PAN evidence threat model is documented in [docs/architecture/aadhaar-pan-threat-model.md](docs/architecture/aadhaar-pan-threat-model.md).

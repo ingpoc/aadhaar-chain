@@ -1,5 +1,6 @@
 """Routes for identity operations with agent integration."""
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
+from time import monotonic
 from typing import Optional
 
 from app.models import (
@@ -9,13 +10,16 @@ from app.models import (
     ComplianceVerificationEvidence,
     ConsentArtifact,
     DocumentVerificationEvidence,
+    EvidenceAccessRequest,
     IdentityData,
     CreateIdentityRequest,
     CreateIdentityResponse,
     DocumentEvidenceSource,
     FraudVerificationEvidence,
     ReviewArtifact,
+    ReviewDecisionRequest,
     RevocationArtifact,
+    RevokeTrustRequest,
     StepStatus,
     TrustReadSurface,
     TrustReadSurfaceResponse,
@@ -32,12 +36,15 @@ from app.models import (
 )
 
 from app.agent_manager import agent_manager
+from app.evidence_store import store_encrypted_evidence
 from app.state_store import append_audit_event, save_gateway_state
+from config import settings
 
 
 # Runtime stores hydrated on startup.
 verifications: dict[str, VerificationStatus] = {}
 identities: dict[str, IdentityData] = {}
+verification_rate_buckets: dict[str, list[float]] = {}
 
 
 def persist_runtime_state() -> None:
@@ -67,6 +74,7 @@ async def create_aadhaar_verification(
     consent_provided: bool = Form(default=False),
 ):
     """Create Aadhaar card verification request and start agent workflow."""
+    _enforce_verification_rate_limit(wallet_address)
     data = AadhaarVerificationData(
         name=name,
         dob=dob,
@@ -82,12 +90,24 @@ async def create_aadhaar_verification(
         "aadhaar",
         data
     )
+    _store_evidence_if_configured(verification_id, wallet_address, document_data, document_source)
     append_audit_event(
         "verification_requested",
         wallet_address,
         target_id=verification_id,
         target_type="aadhaar_verification",
         details="Aadhaar verification request accepted for agent orchestration.",
+    )
+    append_audit_event(
+        "consent_recorded" if consent_provided else "consent_missing",
+        wallet_address,
+        target_id=verification_id,
+        target_type="consent_record",
+        details=(
+            "Aadhaar identity-verification consent was explicitly granted."
+            if consent_provided
+            else "Aadhaar verification was requested without required consent."
+        ),
     )
     background_tasks.add_task(
         agent_manager.orchestrate_verification,
@@ -119,6 +139,7 @@ async def create_pan_verification(
     document_hash: Optional[str] = Form(default=None),
 ):
     """Create PAN card verification request and start agent workflow."""
+    _enforce_verification_rate_limit(wallet_address)
     data = PanVerificationData(
         name=name,
         pan_number=pan_number,
@@ -132,6 +153,7 @@ async def create_pan_verification(
         "pan",
         data
     )
+    _store_evidence_if_configured(verification_id, wallet_address, document_data, document_source)
     append_audit_event(
         "verification_requested",
         wallet_address,
@@ -393,6 +415,162 @@ async def seed_trust_fixture(
     )
 
 
+@router.get("/reviews/queue", response_model=ApiResponse, tags=["identity"])
+async def list_review_queue():
+    """List downstream-safe manual review queue items for operators."""
+    queue_items = []
+    for status in agent_manager.verification_records.values():
+        if status.status != "manual_review":
+            continue
+        summary = _to_trust_verification_summary(status)
+        queue_items.append(
+            {
+                "verification_id": status.verification_id,
+                "wallet_address": status.wallet_address,
+                "workflow_status": status.status,
+                "reason": summary.reason,
+                "evidence_status": summary.evidence_status,
+                "consent": summary.consent.model_dump(),
+                "review": summary.review.model_dump(),
+                "created_at": status.created_at,
+                "updated_at": status.updated_at,
+            }
+        )
+
+    return ApiResponse(
+        success=True,
+        message="Manual review queue loaded",
+        data={"items": queue_items},
+    )
+
+
+@router.post("/reviews/{verification_id}/evidence-access", response_model=ApiResponse, tags=["identity"])
+async def record_evidence_access(
+    verification_id: str,
+    data: EvidenceAccessRequest,
+):
+    """Record private-evidence access and return only a redacted descriptor."""
+    status = _get_verification_or_404(verification_id)
+    metadata = status.metadata
+    if metadata is None:
+        raise HTTPException(status_code=409, detail="Verification has no evidence metadata")
+
+    audit_event = append_audit_event(
+        "evidence_accessed",
+        status.wallet_address,
+        target_id=verification_id,
+        target_type="evidence_reference",
+        details=f"Reviewer {data.reviewer_id} accessed redacted evidence for purpose={data.purpose}.",
+    )
+    return ApiResponse(
+        success=True,
+        message="Evidence access recorded",
+        data={
+            "audit_receipt": audit_event["id"],
+            "verification_id": verification_id,
+            "wallet_address": status.wallet_address,
+            "document_type": metadata.document.document_type,
+            "evidence_reference": f"evidence:{verification_id}",
+            "source": metadata.document.source.model_dump() if metadata.document.source else None,
+            "raw_evidence_returned": False,
+        },
+    )
+
+
+@router.post("/reviews/{verification_id}/decision", response_model=ApiResponse, tags=["identity"])
+async def decide_review(
+    verification_id: str,
+    data: ReviewDecisionRequest,
+):
+    """Apply an operator review decision without exposing raw evidence downstream."""
+    status = _get_verification_or_404(verification_id)
+    if status.status != "manual_review":
+        raise HTTPException(status_code=409, detail="Verification is not awaiting manual review")
+    if status.metadata is None:
+        raise HTTPException(status_code=409, detail="Verification has no decision metadata")
+
+    status.updated_at = _get_timestamp()
+    status.metadata.reason = data.reason
+    if data.decision == "approve":
+        status.status = "verified"
+        status.error = None
+        status.metadata.decision = "approve"
+        identity = identities.get(status.wallet_address)
+        if identity:
+            identity.verification_bitmap = max(identity.verification_bitmap, 1)
+            identity.updated_at = status.updated_at
+    elif data.decision == "reject":
+        status.status = "failed"
+        status.error = data.reason
+        status.metadata.decision = "reject"
+    else:
+        status.status = "manual_review"
+        status.error = data.reason
+        status.metadata.decision = "manual_review"
+
+    audit_event = append_audit_event(
+        "review_decision_recorded",
+        status.wallet_address,
+        target_id=verification_id,
+        target_type="review_record",
+        details=(
+            f"Reviewer {data.reviewer_id} recorded review decision={data.decision}; "
+            f"appeal_reference={data.appeal_reference or 'none'}."
+        ),
+    )
+    persist_runtime_state()
+    return ApiResponse(
+        success=True,
+        message="Review decision recorded",
+        data={
+            "audit_receipt": audit_event["id"],
+            "trust": _build_trust_surface(identities[status.wallet_address]).model_dump()
+            if status.wallet_address in identities
+            else None,
+        },
+    )
+
+
+@router.post("/{wallet_address}/trust/{verification_id}/revoke", response_model=ApiResponse, tags=["identity"])
+async def revoke_trust(
+    wallet_address: str,
+    verification_id: str,
+    data: RevokeTrustRequest,
+):
+    """Revoke a downstream trust artifact and record the operator audit trail."""
+    status = _get_verification_or_404(verification_id)
+    if status.wallet_address != wallet_address:
+        raise HTTPException(status_code=404, detail="Verification not found for wallet")
+    if status.status not in {"verified", "manual_review"}:
+        raise HTTPException(status_code=409, detail="Only active or reviewable trust can be revoked")
+
+    status.status = "failed"
+    status.error = f"Revoked: {data.reason}"
+    status.updated_at = _get_timestamp()
+    if status.metadata:
+        status.metadata.decision = "reject"
+        status.metadata.reason = status.error
+
+    audit_event = append_audit_event(
+        "trust_revoked",
+        wallet_address,
+        target_id=verification_id,
+        target_type="revocation_record",
+        details=f"Operator {data.operator_id} revoked downstream trust: {data.reason}",
+    )
+    persist_runtime_state()
+    return ApiResponse(
+        success=True,
+        message="Trust revoked",
+        data={
+            "audit_receipt": audit_event["id"],
+            "trust": _build_trust_surface(identities[wallet_address]).model_dump()
+            if wallet_address in identities
+            else None,
+        },
+    )
+
+
 # --- Helper Functions ---
 
 
@@ -400,6 +578,57 @@ def _ensure_local_fixture_access(request: Request) -> None:
     client_host = request.client.host if request.client else None
     if client_host not in {"127.0.0.1", "::1", "localhost", "testclient", None}:
         raise HTTPException(status_code=403, detail="Trust fixtures are limited to local development access")
+
+
+def _get_verification_or_404(verification_id: str) -> VerificationStatus:
+    status = agent_manager.verification_records.get(verification_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Verification not found")
+    return status
+
+
+def _store_evidence_if_configured(
+    verification_id: str,
+    wallet_address: str,
+    document_data: bytes,
+    document_source: DocumentEvidenceSource,
+) -> None:
+    if not settings.evidence_encryption_key:
+        return
+    evidence_reference = store_encrypted_evidence(
+        verification_id=verification_id,
+        wallet_address=wallet_address,
+        document_data=document_data,
+        source=document_source,
+    )
+    append_audit_event(
+        "evidence_stored",
+        wallet_address,
+        target_id=verification_id,
+        target_type="evidence_reference",
+        details=(
+            "Uploaded evidence encrypted at rest "
+            f"with key_id={evidence_reference['key_id']}."
+        ),
+    )
+
+
+def _enforce_verification_rate_limit(wallet_address: str) -> None:
+    limit = max(settings.verification_rate_limit_per_minute, 1)
+    now = monotonic()
+    window_start = now - 60
+    bucket = [
+        timestamp
+        for timestamp in verification_rate_buckets.get(wallet_address, [])
+        if timestamp >= window_start
+    ]
+    if len(bucket) >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail="Verification rate limit exceeded for this wallet.",
+        )
+    bucket.append(now)
+    verification_rate_buckets[wallet_address] = bucket
 
 
 def _seed_trust_fixture(
@@ -581,6 +810,7 @@ def _to_trust_verification_summary(status: VerificationStatus) -> TrustVerificat
     metadata = status.metadata
     consent = _build_consent_artifact(status, document_type)
     review = _build_review_artifact(status)
+    revocation = _build_revocation_artifact(status, metadata)
     audit_receipts = [
         AuditReceiptReference(
             kind="verification_record",
@@ -604,6 +834,22 @@ def _to_trust_verification_summary(status: VerificationStatus) -> TrustVerificat
                     created_at=status.created_at,
                 )
             )
+        if review.reference:
+            audit_receipts.append(
+                AuditReceiptReference(
+                    kind="review_record",
+                    reference=review.reference,
+                    created_at=status.updated_at,
+                )
+            )
+    if revocation.reference:
+        audit_receipts.append(
+            AuditReceiptReference(
+                kind="revocation_record",
+                reference=revocation.reference,
+                created_at=status.updated_at,
+            )
+        )
 
     return TrustVerificationSummary(
         document_type=document_type,  # type: ignore[arg-type]
@@ -618,10 +864,7 @@ def _to_trust_verification_summary(status: VerificationStatus) -> TrustVerificat
             credential_type=document_type,
             reference=None,
         ),
-        revocation=RevocationArtifact(
-            status="not_applicable" if metadata else "pending",
-            reference=None,
-        ),
+        revocation=revocation,
         review=review,
         audit_receipts=audit_receipts,
     )
@@ -672,6 +915,20 @@ def _build_review_artifact(status: VerificationStatus) -> ReviewArtifact:
             reason=status.error,
         )
     return ReviewArtifact(status="pending")
+
+
+def _build_revocation_artifact(
+    status: VerificationStatus,
+    metadata: Optional[VerificationMetadata],
+) -> RevocationArtifact:
+    if status.status == "failed":
+        return RevocationArtifact(
+            status="active",
+            reference=f"revocation:{status.verification_id}",
+        )
+    if metadata is None:
+        return RevocationArtifact(status="pending")
+    return RevocationArtifact(status="not_applicable")
 
 
 def _derive_portfolio_trust_state(

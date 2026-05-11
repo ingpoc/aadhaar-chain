@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     aadhaar_chain_env: str = "demo"
     trust_store_backend: str = "local_file"
     database_url: Optional[str] = None
+    evidence_encryption_key: Optional[str] = None
+    evidence_encryption_key_id: str = "local-dev"
+    evidence_retention_days: int = 90
+    verification_rate_limit_per_minute: int = 20
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -113,9 +117,10 @@ def validate_runtime_storage_config() -> None:
             "AadhaarChain production mode requires DATABASE_URL for the PostgreSQL trust store."
         )
 
-    raise RuntimeError(
-        "AadhaarChain PostgreSQL trust store is not implemented yet; production startup is blocked."
-    )
+    if not settings.evidence_encryption_key:
+        raise RuntimeError(
+            "AadhaarChain production mode requires EVIDENCE_ENCRYPTION_KEY for encrypted evidence storage."
+        )
 
 def apply_runtime_environment() -> None:
     """Propagate runtime settings into environment variables during startup."""

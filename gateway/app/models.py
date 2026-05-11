@@ -166,7 +166,14 @@ class ReviewArtifact(BaseModel):
 
 class AuditReceiptReference(BaseModel):
     """Reference to a durable backend trust or audit record."""
-    kind: Literal["verification_record", "decision_record", "consent_record"]
+    kind: Literal[
+        "verification_record",
+        "decision_record",
+        "consent_record",
+        "review_record",
+        "revocation_record",
+        "evidence_access_record",
+    ]
     reference: str
     created_at: str
 
@@ -267,6 +274,26 @@ class TrustFixtureRequest(BaseModel):
         "revoked_or_blocked",
     ]
     document_type: Literal["aadhaar", "pan"] = "aadhaar"
+
+
+class ReviewDecisionRequest(BaseModel):
+    """Operator decision for a manual review queue item."""
+    reviewer_id: str = Field(min_length=1)
+    decision: Literal["approve", "reject", "request_correction"]
+    reason: str = Field(min_length=1)
+    appeal_reference: Optional[str] = None
+
+
+class EvidenceAccessRequest(BaseModel):
+    """Audited request to inspect private evidence outside downstream trust reads."""
+    reviewer_id: str = Field(min_length=1)
+    purpose: str = Field(min_length=1)
+
+
+class RevokeTrustRequest(BaseModel):
+    """Operator revocation decision for a previously issued trust artifact."""
+    operator_id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
 
 
 # --- Verification Request Models ---

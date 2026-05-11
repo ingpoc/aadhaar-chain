@@ -61,6 +61,10 @@ This surface is versioned as `v1` and intentionally excludes raw extracted field
 - consented workflows should expose a consent record reference when consent exists
 - audit references are safe for downstream consumption; the underlying raw evidence is not
 
+The Aadhaar/PAN evidence threat model, including retention, deletion, encryption,
+key rotation, access logging, and breach-monitoring controls, is maintained in
+[aadhaar-pan-threat-model.md](aadhaar-pan-threat-model.md).
+
 ## Rejected Patterns
 
 - storing raw Aadhaar, PAN, OCR output, or extracted PII on a public chain

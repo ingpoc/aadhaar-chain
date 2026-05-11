@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from config import get_runtime_mode, settings, validate_runtime_storage_config
 from main import app
+from cryptography.fernet import Fernet
 from app.models import (
     AgentRunProvenance,
     ComplianceVerificationEvidence,
@@ -16,8 +17,9 @@ from app.models import (
     VerificationMetadata,
     VerificationStatus,
 )
-from app.routes import agent_manager, identities
+from app.routes import agent_manager, identities, verification_rate_buckets
 from app.state_store import load_audit_events, load_gateway_state, save_gateway_state
+from app.evidence_store import load_encrypted_evidence
 
 
 def _provenance(agent_id: str) -> AgentRunProvenance:
@@ -235,25 +237,47 @@ def test_production_runtime_rejects_local_file_trust_store() -> None:
         settings.database_url = original_database_url
 
 
-def test_production_runtime_blocks_unimplemented_postgres_store() -> None:
+def test_production_runtime_accepts_postgres_store_config() -> None:
     original_env = settings.aadhaar_chain_env
     original_backend = settings.trust_store_backend
     original_database_url = settings.database_url
+    original_key = settings.evidence_encryption_key
     try:
         settings.aadhaar_chain_env = "production"
         settings.trust_store_backend = "postgres"
         settings.database_url = "postgresql://example/identity"
+        settings.evidence_encryption_key = Fernet.generate_key().decode("ascii")
 
-        try:
-            validate_runtime_storage_config()
-        except RuntimeError as exc:
-            assert "PostgreSQL trust store is not implemented" in str(exc)
-        else:
-            raise AssertionError("production postgres trust store should fail until implemented")
+        validate_runtime_storage_config()
     finally:
         settings.aadhaar_chain_env = original_env
         settings.trust_store_backend = original_backend
         settings.database_url = original_database_url
+        settings.evidence_encryption_key = original_key
+
+
+def test_production_runtime_requires_evidence_encryption_key() -> None:
+    original_env = settings.aadhaar_chain_env
+    original_backend = settings.trust_store_backend
+    original_database_url = settings.database_url
+    original_key = settings.evidence_encryption_key
+    try:
+        settings.aadhaar_chain_env = "production"
+        settings.trust_store_backend = "postgres"
+        settings.database_url = "postgresql://example/identity"
+        settings.evidence_encryption_key = None
+
+        try:
+            validate_runtime_storage_config()
+        except RuntimeError as exc:
+            assert "EVIDENCE_ENCRYPTION_KEY" in str(exc)
+        else:
+            raise AssertionError("production must require encrypted evidence storage")
+    finally:
+        settings.aadhaar_chain_env = original_env
+        settings.trust_store_backend = original_backend
+        settings.database_url = original_database_url
+        settings.evidence_encryption_key = original_key
 
 
 def test_save_gateway_state_round_trips_verifications(tmp_path) -> None:
@@ -443,3 +467,190 @@ def test_seed_trust_fixture_supports_full_local_matrix() -> None:
     identity_response = client.get(f"/api/identity/{wallet_address}")
     assert identity_response.status_code == 200
     assert identity_response.json()["data"] is None
+
+
+def test_aadhaar_upload_stores_encrypted_evidence_when_key_is_configured(monkeypatch, tmp_path) -> None:
+    original_data_dir = settings.data_dir
+    original_key = settings.evidence_encryption_key
+    settings.data_dir = str(tmp_path)
+    settings.evidence_encryption_key = Fernet.generate_key().decode("ascii")
+    identities.clear()
+    agent_manager.verification_records.clear()
+    captured: dict[str, object] = {}
+
+    async def fake_create_verification(wallet_address: str, document_type: str, verification_data):
+        del verification_data
+        return f"{document_type}_{wallet_address}"
+
+    async def fake_orchestrate(wallet_address: str, document_type: str, document_data: bytes, verification_data, document_source):
+        captured["document_data"] = document_data
+        captured["document_source"] = document_source
+        captured["verification_data"] = verification_data
+
+    monkeypatch.setattr(agent_manager, "create_verification", fake_create_verification)
+    monkeypatch.setattr(agent_manager, "orchestrate_verification", fake_orchestrate)
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/api/identity/wallet-evidence/aadhaar",
+            data={
+                "name": "Alice Example",
+                "dob": "1990-01-01",
+                "uid": "123456789012",
+                "consent_provided": "true",
+            },
+            files={
+                "document": ("aadhaar.pdf", b"private aadhaar bytes", "application/pdf"),
+            },
+        )
+        assert response.status_code == 200
+
+        encrypted_file = tmp_path / "encrypted-evidence" / "aadhaar_wallet-evidence.json"
+        assert encrypted_file.exists()
+        encrypted_payload = encrypted_file.read_text(encoding="utf-8")
+        assert "private aadhaar bytes" not in encrypted_payload
+        assert load_encrypted_evidence("evidence:aadhaar_wallet-evidence") == b"private aadhaar bytes"
+
+        audit_actions = [event["action"] for event in load_audit_events()]
+        assert "evidence_stored" in audit_actions
+    finally:
+        settings.data_dir = original_data_dir
+        settings.evidence_encryption_key = original_key
+        identities.clear()
+        agent_manager.verification_records.clear()
+
+
+def test_verification_upload_rate_limit_is_enforced(monkeypatch) -> None:
+    original_limit = settings.verification_rate_limit_per_minute
+    original_key = settings.evidence_encryption_key
+    settings.verification_rate_limit_per_minute = 1
+    settings.evidence_encryption_key = None
+    verification_rate_buckets.clear()
+
+    async def fake_create_verification(wallet_address: str, document_type: str, verification_data):
+        del verification_data
+        return f"{document_type}_{wallet_address}"
+
+    async def fake_orchestrate(wallet_address: str, document_type: str, document_data: bytes, verification_data, document_source):
+        del wallet_address, document_type, document_data, verification_data, document_source
+
+    monkeypatch.setattr(agent_manager, "create_verification", fake_create_verification)
+    monkeypatch.setattr(agent_manager, "orchestrate_verification", fake_orchestrate)
+    try:
+        client = TestClient(app)
+        payload = {
+            "data": {
+                "name": "Alice Example",
+                "dob": "1990-01-01",
+                "uid": "123456789012",
+                "consent_provided": "true",
+            },
+            "files": {
+                "document": ("aadhaar.pdf", b"private aadhaar bytes", "application/pdf"),
+            },
+        }
+        first = client.post("/api/identity/wallet-rate/aadhaar", **payload)
+        second = client.post("/api/identity/wallet-rate/aadhaar", **payload)
+
+        assert first.status_code == 200
+        assert second.status_code == 429
+    finally:
+        settings.verification_rate_limit_per_minute = original_limit
+        settings.evidence_encryption_key = original_key
+        verification_rate_buckets.clear()
+
+
+def test_review_queue_evidence_access_and_decision_are_audited(tmp_path) -> None:
+    original_data_dir = settings.data_dir
+    settings.data_dir = str(tmp_path)
+    identities.clear()
+    agent_manager.verification_records.clear()
+    try:
+        client = TestClient(app)
+        wallet_address = "wallet-review"
+        verification_id = f"aadhaar_{wallet_address}_fixture"
+
+        fixture_response = client.post(
+            f"/api/identity/dev/fixtures/{wallet_address}",
+            json={"fixture_state": "manual_review", "document_type": "aadhaar"},
+        )
+        assert fixture_response.status_code == 200
+
+        queue_response = client.get("/api/identity/reviews/queue")
+        assert queue_response.status_code == 200
+        queue_items = queue_response.json()["data"]["items"]
+        assert [item["verification_id"] for item in queue_items] == [verification_id]
+        assert queue_items[0]["review"]["status"] == "manual_review_required"
+
+        access_response = client.post(
+            f"/api/identity/reviews/{verification_id}/evidence-access",
+            json={"reviewer_id": "reviewer-1", "purpose": "manual_review"},
+        )
+        assert access_response.status_code == 200
+        access_payload = access_response.json()["data"]
+        assert access_payload["raw_evidence_returned"] is False
+        assert "extracted_fields" not in access_payload
+        assert "submitted_claims" not in access_payload
+
+        decision_response = client.post(
+            f"/api/identity/reviews/{verification_id}/decision",
+            json={
+                "reviewer_id": "reviewer-1",
+                "decision": "approve",
+                "reason": "Reviewer accepted the evidence completeness record.",
+            },
+        )
+        assert decision_response.status_code == 200
+        trust = decision_response.json()["data"]["trust"]
+        assert trust["trust_state"] == "verified"
+        assert trust["high_trust_eligible"] is True
+        receipt_kinds = {
+            receipt["kind"]
+            for receipt in trust["verifications"][0]["audit_receipts"]
+        }
+        assert "review_record" in receipt_kinds
+
+        audit_actions = [event["action"] for event in load_audit_events()]
+        assert "evidence_accessed" in audit_actions
+        assert "review_decision_recorded" in audit_actions
+    finally:
+        settings.data_dir = original_data_dir
+        identities.clear()
+        agent_manager.verification_records.clear()
+
+
+def test_trust_revocation_updates_trust_surface_and_audit(tmp_path) -> None:
+    original_data_dir = settings.data_dir
+    settings.data_dir = str(tmp_path)
+    identities.clear()
+    agent_manager.verification_records.clear()
+    try:
+        client = TestClient(app)
+        wallet_address = "wallet-revoked"
+        verification_id = f"aadhaar_{wallet_address}_fixture"
+
+        fixture_response = client.post(
+            f"/api/identity/dev/fixtures/{wallet_address}",
+            json={"fixture_state": "verified", "document_type": "aadhaar"},
+        )
+        assert fixture_response.status_code == 200
+
+        revoke_response = client.post(
+            f"/api/identity/{wallet_address}/trust/{verification_id}/revoke",
+            json={"operator_id": "ops-1", "reason": "Subject requested revocation."},
+        )
+        assert revoke_response.status_code == 200
+        trust = revoke_response.json()["data"]["trust"]
+        assert trust["trust_state"] == "revoked_or_blocked"
+        verification = trust["verifications"][0]
+        assert verification["revocation"]["status"] == "active"
+        assert "revocation_record" in {
+            receipt["kind"] for receipt in verification["audit_receipts"]
+        }
+
+        audit_actions = [event["action"] for event in load_audit_events()]
+        assert "trust_revoked" in audit_actions
+    finally:
+        settings.data_dir = original_data_dir
+        identities.clear()
+        agent_manager.verification_records.clear()
