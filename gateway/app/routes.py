@@ -18,6 +18,7 @@ from app.models import (
     RevocationArtifact,
     StepStatus,
     TrustReadSurface,
+    TrustReadSurfaceResponse,
     TrustFixtureRequest,
     TrustVerificationSummary,
     UpdateIdentityRequest,
@@ -159,22 +160,22 @@ async def get_verification_status(
     )
 
 
-@router.get("/{wallet_address}/trust", response_model=ApiResponse, tags=["identity"])
+@router.get("/{wallet_address}/trust", response_model=TrustReadSurfaceResponse, tags=["identity"])
 async def get_trust_surface(
     wallet_address: str,
 ):
     """Expose a downstream-safe trust view without leaking raw verification evidence."""
     if wallet_address not in identities:
-        return ApiResponse(
+        return TrustReadSurfaceResponse(
             success=True,
-            data=_build_no_identity_trust_surface(wallet_address).model_dump(),
+            data=_build_no_identity_trust_surface(wallet_address),
         )
 
     identity = identities[wallet_address]
     trust_surface = _build_trust_surface(identity)
-    return ApiResponse(
+    return TrustReadSurfaceResponse(
         success=True,
-        data=trust_surface.model_dump(),
+        data=trust_surface,
     )
 
 

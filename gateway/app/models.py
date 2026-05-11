@@ -205,6 +205,14 @@ class TrustReadSurface(BaseModel):
     verifications: List[TrustVerificationSummary] = Field(default_factory=list)
 
 
+class TrustReadSurfaceResponse(BaseModel):
+    """Typed API response for the stable downstream trust contract."""
+    success: bool = True
+    message: str = ""
+    data: TrustReadSurface
+    error: Optional[Dict[str, Any]] = None
+
+
 class VerificationStatus(BaseModel):
     """Status of verification process."""
     verification_id: str

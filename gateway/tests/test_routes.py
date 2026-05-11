@@ -117,6 +117,41 @@ def test_get_trust_surface_returns_no_identity_contract_when_missing() -> None:
     assert trust["verifications"] == []
 
 
+def test_get_trust_surface_openapi_schema_locks_downstream_contract() -> None:
+    schema = app.openapi()
+    route_schema = schema["paths"]["/api/identity/{wallet_address}/trust"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    assert route_schema == {"$ref": "#/components/schemas/TrustReadSurfaceResponse"}
+
+    components = schema["components"]["schemas"]
+    trust_response = components["TrustReadSurfaceResponse"]
+    assert trust_response["properties"]["data"] == {"$ref": "#/components/schemas/TrustReadSurface"}
+    assert "data" in trust_response["required"]
+
+    trust_surface = components["TrustReadSurface"]
+    expected_properties = {
+        "trust_version",
+        "wallet_address",
+        "did",
+        "verification_bitmap",
+        "updated_at",
+        "trust_state",
+        "high_trust_eligible",
+        "state_reason",
+        "verifications",
+    }
+    assert set(trust_surface["properties"]) == expected_properties
+    assert trust_surface["properties"]["trust_state"]["enum"] == [
+        "no_identity",
+        "identity_present_unverified",
+        "verified",
+        "manual_review",
+        "revoked_or_blocked",
+    ]
+    assert trust_surface["properties"]["trust_version"]["const"] == "v1"
+
+
 def test_create_identity_persists_runtime_state(tmp_path) -> None:
     identities.clear()
     agent_manager.verification_records.clear()
