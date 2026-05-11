@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from config import settings
+from config import get_runtime_mode, settings, validate_runtime_storage_config
 from main import app
 from app.models import (
     AgentRunProvenance,
@@ -177,6 +177,61 @@ def test_create_identity_persists_runtime_state(tmp_path) -> None:
         assert persisted_verifications == {}
     finally:
         settings.data_dir = original_data_dir
+
+
+def test_runtime_mode_normalizes_production_alias() -> None:
+    original_env = settings.aadhaar_chain_env
+    try:
+        settings.aadhaar_chain_env = "prod"
+        assert get_runtime_mode() == "production"
+        settings.aadhaar_chain_env = "staging"
+        assert get_runtime_mode() == "staging"
+        settings.aadhaar_chain_env = "local"
+        assert get_runtime_mode() == "demo"
+    finally:
+        settings.aadhaar_chain_env = original_env
+
+
+def test_production_runtime_rejects_local_file_trust_store() -> None:
+    original_env = settings.aadhaar_chain_env
+    original_backend = settings.trust_store_backend
+    original_database_url = settings.database_url
+    try:
+        settings.aadhaar_chain_env = "production"
+        settings.trust_store_backend = "local_file"
+        settings.database_url = None
+
+        try:
+            validate_runtime_storage_config()
+        except RuntimeError as exc:
+            assert "TRUST_STORE_BACKEND=postgres" in str(exc)
+        else:
+            raise AssertionError("production local_file trust store should be rejected")
+    finally:
+        settings.aadhaar_chain_env = original_env
+        settings.trust_store_backend = original_backend
+        settings.database_url = original_database_url
+
+
+def test_production_runtime_blocks_unimplemented_postgres_store() -> None:
+    original_env = settings.aadhaar_chain_env
+    original_backend = settings.trust_store_backend
+    original_database_url = settings.database_url
+    try:
+        settings.aadhaar_chain_env = "production"
+        settings.trust_store_backend = "postgres"
+        settings.database_url = "postgresql://example/identity"
+
+        try:
+            validate_runtime_storage_config()
+        except RuntimeError as exc:
+            assert "PostgreSQL trust store is not implemented" in str(exc)
+        else:
+            raise AssertionError("production postgres trust store should fail until implemented")
+    finally:
+        settings.aadhaar_chain_env = original_env
+        settings.trust_store_backend = original_backend
+        settings.database_url = original_database_url
 
 
 def test_save_gateway_state_round_trips_verifications(tmp_path) -> None:

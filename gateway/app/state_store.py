@@ -19,6 +19,11 @@ def _state_file_path() -> Path:
 
 def load_gateway_state() -> Tuple[Dict[str, IdentityData], Dict[str, VerificationStatus]]:
     """Load persisted gateway state from disk."""
+    if settings.trust_store_backend != "local_file":
+        raise NotImplementedError(
+            f"Unsupported AadhaarChain trust store backend: {settings.trust_store_backend}"
+        )
+
     path = _state_file_path()
     if not path.exists():
         return {}, {}
@@ -51,6 +56,11 @@ def save_gateway_state(
     verification_records: Dict[str, VerificationStatus],
 ) -> None:
     """Persist gateway runtime state to disk atomically."""
+    if settings.trust_store_backend != "local_file":
+        raise NotImplementedError(
+            f"Unsupported AadhaarChain trust store backend: {settings.trust_store_backend}"
+        )
+
     path = _state_file_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 

@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 
-from config import apply_runtime_environment, settings
+from config import apply_runtime_environment, settings, validate_runtime_storage_config
 from app.models import (
     AadhaarVerificationData,
     PanVerificationData,
@@ -48,6 +48,7 @@ app.include_router(identity_router)
 async def startup_event():
     """Initialize Claude Agent SDK and agents on startup."""
     apply_runtime_environment()
+    validate_runtime_storage_config()
     persisted_identities, persisted_verifications = load_gateway_state()
     identities.clear()
     identities.update(persisted_identities)

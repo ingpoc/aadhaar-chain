@@ -57,6 +57,9 @@ class Settings(BaseSettings):
 
     # Storage
     data_dir: str = "./data"
+    aadhaar_chain_env: str = "demo"
+    trust_store_backend: str = "local_file"
+    database_url: Optional[str] = None
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -74,6 +77,45 @@ class Settings(BaseSettings):
 
 # Global settings instance
 settings = Settings()
+
+
+def get_runtime_mode() -> str:
+    """Return normalized AadhaarChain runtime mode."""
+    raw_mode = (
+        settings.aadhaar_chain_env
+        or os.getenv("AADHAAR_CHAIN_ENV")
+        or os.getenv("APP_ENV")
+        or os.getenv("ENVIRONMENT")
+        or "demo"
+    )
+    normalized = raw_mode.strip().lower()
+    if normalized in {"prod", "production"}:
+        return "production"
+    if normalized in {"stage", "staging"}:
+        return "staging"
+    return "demo"
+
+
+def validate_runtime_storage_config() -> None:
+    """Fail loud when production would use non-production trust storage."""
+    backend = (settings.trust_store_backend or "local_file").strip().lower()
+    if get_runtime_mode() != "production":
+        return
+
+    if backend != "postgres":
+        raise RuntimeError(
+            "AadhaarChain production mode requires TRUST_STORE_BACKEND=postgres; "
+            "the local JSON trust store is for demo and fixture use only."
+        )
+
+    if not settings.database_url:
+        raise RuntimeError(
+            "AadhaarChain production mode requires DATABASE_URL for the PostgreSQL trust store."
+        )
+
+    raise RuntimeError(
+        "AadhaarChain PostgreSQL trust store is not implemented yet; production startup is blocked."
+    )
 
 def apply_runtime_environment() -> None:
     """Propagate runtime settings into environment variables during startup."""
