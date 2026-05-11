@@ -61,6 +61,7 @@ from app.models import (
     VerificationStep,
     VerificationStepDetail,
 )
+from config import get_runtime_mode
 
 repo_root_for_imports = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if repo_root_for_imports not in sys.path:
@@ -1080,6 +1081,10 @@ Return only JSON with this exact shape:
         fraud: FraudVerificationEvidence,
         compliance: ComplianceVerificationEvidence,
     ) -> VerificationMetadata:
+        uses_deterministic_fallback = (
+            fraud.provenance.model == "deterministic-fallback"
+            or compliance.provenance.model == "deterministic-fallback"
+        )
         blocking_gaps = [
             *[gap for gap in document.gaps if gap.blocking],
             *[gap for gap in fraud.gaps if gap.blocking],
@@ -1089,6 +1094,8 @@ Return only JSON with this exact shape:
         evidence_status = "complete"
         if blocking_gaps:
             evidence_status = "missing"
+        elif uses_deterministic_fallback:
+            evidence_status = "partial"
         elif document.gaps or fraud.gaps or compliance.gaps:
             evidence_status = "partial"
 
@@ -1111,6 +1118,9 @@ Return only JSON with this exact shape:
         elif compliance.aadhaar_act_compliant is False or compliance.dpdp_compliant is False:
             decision = "reject"
             reason = "Compliance contract marked the verification as non-compliant."
+        elif get_runtime_mode() == "production" and uses_deterministic_fallback:
+            decision = "manual_review"
+            reason = "Production mode requires primary fraud and compliance evidence before approval."
         else:
             decision = "approve"
             reason = "Explicit document, fraud, and compliance contracts passed all approval rules."
@@ -1118,6 +1128,7 @@ Return only JSON with this exact shape:
         assumptions = [
             "Approval is allowed only when every stage returns an explicit structured contract.",
             "Missing contracts or provenance never auto-approve a verification.",
+            "Production mode never approves deterministic fallback fraud or compliance evidence.",
             "Fraud risk > 0.7 rejects the verification.",
             "Document confidence < 0.6 downgrades the verification to manual review.",
             f"Document type: {document_type}",

@@ -7,6 +7,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.agent_manager import AgentManager, AgentType
+from config import settings
 from app.models import (
     AadhaarVerificationData,
     AgentRunProvenance,
@@ -16,12 +17,17 @@ from app.models import (
 )
 
 
-def _provenance(agent_id: str, status: str = "completed") -> AgentRunProvenance:
+def _provenance(
+    agent_id: str,
+    status: str = "completed",
+    model: str | None = None,
+) -> AgentRunProvenance:
     return AgentRunProvenance(
         agent_id=agent_id,
         status=status,  # type: ignore[arg-type]
         started_at="2026-03-17T00:00:00Z",
         completed_at="2026-03-17T00:00:01Z",
+        model=model,
         tools=[],
     )
 
@@ -364,3 +370,50 @@ def test_build_metadata_only_approves_complete_evidence_contract() -> None:
     assert metadata.decision == "approve"
     assert metadata.evidence_status == "complete"
     assert metadata.blocking_gaps == []
+
+
+def test_build_metadata_blocks_deterministic_fallback_approval_in_production() -> None:
+    manager = AgentManager()
+    original_env = settings.aadhaar_chain_env
+    settings.aadhaar_chain_env = "production"
+    try:
+        document = DocumentVerificationEvidence(
+            document_type="pan",
+            input_kind="raw_document",
+            extracted_fields={
+                "name": "Alice Example",
+                "dob": "1990-01-01",
+                "pan_number": "ABCDE1234F",
+            },
+            submitted_claims={},
+            confidence=0.96,
+            warnings=[],
+            required_fields=["name", "dob", "pan_number"],
+            missing_fields=[],
+            provenance=_provenance("document-validator"),
+            gaps=[],
+        )
+        fraud = FraudVerificationEvidence(
+            risk_score=0.08,
+            risk_level="safe",
+            indicators=[],
+            recommendation="approve",
+            provenance=_provenance("fraud-detection", model="deterministic-fallback"),
+            gaps=[],
+        )
+        compliance = ComplianceVerificationEvidence(
+            aadhaar_act_compliant=True,
+            dpdp_compliant=True,
+            violations=[],
+            recommendation="approve",
+            provenance=_provenance("compliance-monitor"),
+            gaps=[],
+        )
+
+        metadata = manager._build_metadata("pan", document, fraud, compliance)
+
+        assert metadata.decision == "manual_review"
+        assert metadata.evidence_status == "partial"
+        assert "Production mode requires primary fraud and compliance evidence" in metadata.reason
+    finally:
+        settings.aadhaar_chain_env = original_env
