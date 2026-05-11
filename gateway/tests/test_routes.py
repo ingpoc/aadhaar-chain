@@ -17,7 +17,7 @@ from app.models import (
     VerificationStatus,
 )
 from app.routes import agent_manager, identities
-from app.state_store import load_gateway_state, save_gateway_state
+from app.state_store import load_audit_events, load_gateway_state, save_gateway_state
 
 
 def _provenance(agent_id: str) -> AgentRunProvenance:
@@ -175,6 +175,28 @@ def test_create_identity_persists_runtime_state(tmp_path) -> None:
         assert "wallet-persisted" in persisted_identities
         assert persisted_identities["wallet-persisted"].commitment == "sha256:persisted"
         assert persisted_verifications == {}
+        audit_events = load_audit_events()
+        assert audit_events[-1]["action"] == "identity_created"
+        assert audit_events[-1]["wallet_address"] == "wallet-persisted"
+    finally:
+        settings.data_dir = original_data_dir
+
+
+def test_trust_surface_reads_append_audit_receipts(tmp_path) -> None:
+    identities.clear()
+    agent_manager.verification_records.clear()
+
+    original_data_dir = settings.data_dir
+    settings.data_dir = str(tmp_path)
+    try:
+        client = TestClient(app)
+        response = client.get("/api/identity/missing-wallet/trust")
+
+        assert response.status_code == 200
+        audit_events = load_audit_events()
+        assert audit_events[-1]["action"] == "trust_read"
+        assert audit_events[-1]["wallet_address"] == "missing-wallet"
+        assert audit_events[-1]["details"] == "Downstream trust read returned no identity."
     finally:
         settings.data_dir = original_data_dir
 

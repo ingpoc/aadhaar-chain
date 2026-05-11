@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Dict, Tuple
 
 from config import settings
@@ -10,11 +11,16 @@ from app.models import IdentityData, VerificationStatus
 
 
 STATE_FILE_NAME = "gateway-state.json"
+AUDIT_FILE_NAME = "gateway-audit-log.jsonl"
 STATE_FILE_VERSION = 1
 
 
 def _state_file_path() -> Path:
     return Path(settings.data_dir).expanduser() / STATE_FILE_NAME
+
+
+def _audit_file_path() -> Path:
+    return Path(settings.data_dir).expanduser() / AUDIT_FILE_NAME
 
 
 def load_gateway_state() -> Tuple[Dict[str, IdentityData], Dict[str, VerificationStatus]]:
@@ -82,3 +88,53 @@ def save_gateway_state(
         encoding="utf-8",
     )
     temp_path.replace(path)
+
+
+def append_audit_event(
+    action: str,
+    wallet_address: str,
+    *,
+    target_id: str,
+    target_type: str,
+    details: str,
+) -> dict:
+    """Append an immutable local audit event for demo/fixture trust operations."""
+    if settings.trust_store_backend != "local_file":
+        raise NotImplementedError(
+            f"Unsupported AadhaarChain trust store backend: {settings.trust_store_backend}"
+        )
+
+    path = _audit_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    event = {
+        "id": f"audit-{datetime.now(timezone.utc).timestamp():.6f}",
+        "action": action,
+        "wallet_address": wallet_address,
+        "target_id": target_id,
+        "target_type": target_type,
+        "details": details,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True))
+        handle.write("\n")
+    return event
+
+
+def load_audit_events() -> list[dict]:
+    """Load immutable local audit events."""
+    if settings.trust_store_backend != "local_file":
+        raise NotImplementedError(
+            f"Unsupported AadhaarChain trust store backend: {settings.trust_store_backend}"
+        )
+
+    path = _audit_file_path()
+    if not path.exists():
+        return []
+
+    events: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        events.append(json.loads(line))
+    return events

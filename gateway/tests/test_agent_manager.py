@@ -15,6 +15,7 @@ from app.models import (
     DocumentVerificationEvidence,
     FraudVerificationEvidence,
 )
+from app.state_store import load_audit_events
 
 
 def _provenance(
@@ -417,3 +418,55 @@ def test_build_metadata_blocks_deterministic_fallback_approval_in_production() -
         assert "Production mode requires primary fraud and compliance evidence" in metadata.reason
     finally:
         settings.aadhaar_chain_env = original_env
+
+
+def test_complete_verification_appends_decision_audit_event(tmp_path) -> None:
+    manager = AgentManager()
+    original_data_dir = settings.data_dir
+    settings.data_dir = str(tmp_path)
+    try:
+        verification_id = asyncio.run(
+            manager.create_verification("wallet-audit", "pan", None),
+        )
+        document = DocumentVerificationEvidence(
+            document_type="pan",
+            input_kind="raw_document",
+            extracted_fields={
+                "name": "Alice Example",
+                "dob": "1990-01-01",
+                "pan_number": "ABCDE1234F",
+            },
+            submitted_claims={},
+            confidence=0.96,
+            warnings=[],
+            required_fields=["name", "dob", "pan_number"],
+            missing_fields=[],
+            provenance=_provenance("document-validator"),
+            gaps=[],
+        )
+        fraud = FraudVerificationEvidence(
+            risk_score=0.08,
+            risk_level="safe",
+            indicators=[],
+            recommendation="approve",
+            provenance=_provenance("fraud-detection"),
+            gaps=[],
+        )
+        compliance = ComplianceVerificationEvidence(
+            aadhaar_act_compliant=True,
+            dpdp_compliant=True,
+            violations=[],
+            recommendation="approve",
+            provenance=_provenance("compliance-monitor"),
+            gaps=[],
+        )
+        metadata = manager._build_metadata("pan", document, fraud, compliance)
+
+        asyncio.run(manager.complete_verification(verification_id, metadata.decision, metadata))
+
+        audit_events = load_audit_events()
+        assert audit_events[-1]["action"] == "verification_decision"
+        assert audit_events[-1]["wallet_address"] == "wallet-audit"
+        assert audit_events[-1]["target_id"] == verification_id
+    finally:
+        settings.data_dir = original_data_dir

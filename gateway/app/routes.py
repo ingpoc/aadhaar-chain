@@ -32,7 +32,7 @@ from app.models import (
 )
 
 from app.agent_manager import agent_manager
-from app.state_store import save_gateway_state
+from app.state_store import append_audit_event, save_gateway_state
 
 
 # Runtime stores hydrated on startup.
@@ -82,6 +82,13 @@ async def create_aadhaar_verification(
         "aadhaar",
         data
     )
+    append_audit_event(
+        "verification_requested",
+        wallet_address,
+        target_id=verification_id,
+        target_type="aadhaar_verification",
+        details="Aadhaar verification request accepted for agent orchestration.",
+    )
     background_tasks.add_task(
         agent_manager.orchestrate_verification,
         wallet_address,
@@ -125,6 +132,13 @@ async def create_pan_verification(
         "pan",
         data
     )
+    append_audit_event(
+        "verification_requested",
+        wallet_address,
+        target_id=verification_id,
+        target_type="pan_verification",
+        details="PAN verification request accepted for agent orchestration.",
+    )
     background_tasks.add_task(
         agent_manager.orchestrate_verification,
         wallet_address,
@@ -166,6 +180,13 @@ async def get_trust_surface(
 ):
     """Expose a downstream-safe trust view without leaking raw verification evidence."""
     if wallet_address not in identities:
+        append_audit_event(
+            "trust_read",
+            wallet_address,
+            target_id=wallet_address,
+            target_type="wallet_trust_surface",
+            details="Downstream trust read returned no identity.",
+        )
         return TrustReadSurfaceResponse(
             success=True,
             data=_build_no_identity_trust_surface(wallet_address),
@@ -173,6 +194,13 @@ async def get_trust_surface(
 
     identity = identities[wallet_address]
     trust_surface = _build_trust_surface(identity)
+    append_audit_event(
+        "trust_read",
+        wallet_address,
+        target_id=identity.did,
+        target_type="wallet_trust_surface",
+        details=f"Downstream trust read returned {trust_surface.trust_state}.",
+    )
     return TrustReadSurfaceResponse(
         success=True,
         data=trust_surface,
@@ -195,6 +223,13 @@ async def verify_aadhaar_document(
         wallet_address,
         "aadhaar",
         verification_data
+    )
+    append_audit_event(
+        "verification_requested",
+        wallet_address,
+        target_id=verification_id,
+        target_type="aadhaar_verification",
+        details="Legacy Aadhaar verification request accepted for agent orchestration.",
     )
     
     # Orchestrate verification workflow through agents
@@ -230,6 +265,13 @@ async def verify_pan_document(
         wallet_address,
         "pan",
         verification_data
+    )
+    append_audit_event(
+        "verification_requested",
+        wallet_address,
+        target_id=verification_id,
+        target_type="pan_verification",
+        details="Legacy PAN verification request accepted for agent orchestration.",
     )
     
     # Orchestrate verification workflow through agents
@@ -292,6 +334,13 @@ async def create_identity(
     )
     identities[wallet_address] = identity
     persist_runtime_state()
+    append_audit_event(
+        "identity_created",
+        wallet_address,
+        target_id=identity.did,
+        target_type="identity_anchor",
+        details="Wallet-bound identity anchor created.",
+    )
 
     return ApiResponse(
         success=True,

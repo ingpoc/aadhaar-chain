@@ -45,6 +45,7 @@ except ModuleNotFoundError:
 from app.mcp_config import DEFAULT_MCP_SERVERS
 from app.runtime_config import resolve_runtime_policy
 from app.document_processing import extract_document_contract
+from app.state_store import append_audit_event
 from app.models import (
     AadhaarVerificationData,
     AgentRunProvenance,
@@ -1257,6 +1258,13 @@ Return only JSON with this exact shape:
             status.error = metadata.reason
 
         status.metadata = metadata
+        append_audit_event(
+            "verification_decision",
+            status.wallet_address,
+            target_id=verification_id,
+            target_type="verification_record",
+            details=f"Verification completed with decision={metadata.decision}.",
+        )
         self._notify_state_changed()
 
     async def cleanup_expired_verifications(self, days: int = 7) -> int:
