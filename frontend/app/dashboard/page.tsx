@@ -1,8 +1,10 @@
 'use client';
 
+import { useState } from 'react';
 import Link from 'next/link';
-import { useWallet } from '@solana/wallet-adapter-react';
+import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { ArrowUpRight, BadgeCheck, CreditCard, ShieldCheck } from 'lucide-react';
+import { SystemProgram, Transaction } from '@solana/web3.js';
 
 import { IdentityCard } from '@/components/identity/IdentityCard';
 import { PageHeader } from '@/components/layout/page-header';
@@ -14,6 +16,7 @@ import {
 } from '@/components/ui/card';
 import { EmptyState } from '@/components/ui/empty-state';
 import { Button } from '@/components/ui/button';
+import { Notice } from '@/components/ui/notice';
 import { WalletInfo } from '@/components/wallet/WalletInfo';
 
 const quickActions = [
@@ -38,7 +41,64 @@ const quickActions = [
 ];
 
 export default function DashboardPage() {
-  const { connected } = useWallet();
+  const { connection } = useConnection();
+  const { connected, publicKey, signTransaction } = useWallet();
+  const [signing, setSigning] = useState(false);
+  const [signingResult, setSigningResult] = useState<{
+    tone: 'success' | 'destructive';
+    title: string;
+    message: string;
+  } | null>(null);
+
+  async function handleSignOwnershipTransaction() {
+    if (!connected || !publicKey || !signTransaction) {
+      setSigningResult({
+        tone: 'destructive',
+        title: 'Wallet signing unavailable',
+        message: 'Connect a wallet that supports Solana transaction signing before running this checkpoint.',
+      });
+      return;
+    }
+
+    setSigning(true);
+    setSigningResult(null);
+
+    try {
+      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+      const transaction = new Transaction({
+        blockhash,
+        feePayer: publicKey,
+        lastValidBlockHeight,
+      }).add(
+        SystemProgram.transfer({
+          fromPubkey: publicKey,
+          toPubkey: publicKey,
+          lamports: 0,
+        }),
+      );
+
+      const signedTransaction = await signTransaction(transaction);
+      const signature = signedTransaction.signatures.find((entry) =>
+        entry.publicKey.equals(publicKey),
+      )?.signature;
+
+      setSigningResult({
+        tone: 'success',
+        title: 'Transaction signed',
+        message: signature
+          ? `Wallet approval produced a local transaction signature for ${truncateSignature(signature)}. The transaction was not submitted.`
+          : 'Wallet approval completed. The transaction was not submitted.',
+      });
+    } catch (error) {
+      setSigningResult({
+        tone: 'destructive',
+        title: 'Transaction signing failed',
+        message: error instanceof Error ? error.message : 'The wallet did not sign the transaction.',
+      });
+    } finally {
+      setSigning(false);
+    }
+  }
 
   return (
     <div className="page-stack">
@@ -76,6 +136,26 @@ export default function DashboardPage() {
             <WalletInfo />
             <IdentityCard />
           </div>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Transaction signing checkpoint</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <p className="text-sm text-muted-foreground">
+                Request a wallet signature for a local devnet ownership transaction before relying on
+                signed trust flows. This checkpoint does not submit the transaction.
+              </p>
+              {signingResult ? (
+                <Notice tone={signingResult.tone} title={signingResult.title}>
+                  {signingResult.message}
+                </Notice>
+              ) : null}
+              <Button type="button" onClick={handleSignOwnershipTransaction} disabled={signing}>
+                {signing ? 'Waiting for wallet approval...' : 'Sign ownership transaction'}
+              </Button>
+            </CardContent>
+          </Card>
 
           <Card>
             <CardHeader>
@@ -117,4 +197,13 @@ export default function DashboardPage() {
       )}
     </div>
   );
+}
+
+function truncateSignature(signature: Uint8Array): string {
+  const hex = Array.from(signature)
+    .slice(0, 8)
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+
+  return `${hex}...`;
 }
