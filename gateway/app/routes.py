@@ -1,7 +1,12 @@
 """Routes for identity operations with agent integration."""
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
+import json
+import secrets
 from time import monotonic
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+from solders.pubkey import Pubkey
+from solders.signature import Signature
 
 from app.models import (
     AgentRunProvenance,
@@ -12,6 +17,8 @@ from app.models import (
     DocumentVerificationEvidence,
     EvidenceAccessRequest,
     IdentityData,
+    IdentityProofToken,
+    IdentityProofTokenRequest,
     CreateIdentityRequest,
     CreateIdentityResponse,
     DocumentEvidenceSource,
@@ -20,6 +27,8 @@ from app.models import (
     ReviewDecisionRequest,
     RevocationArtifact,
     RevokeTrustRequest,
+    SignedIdentityProofRequest,
+    SignedIdentityProofResult,
     StepStatus,
     TrustReadSurface,
     TrustReadSurfaceResponse,
@@ -45,6 +54,7 @@ from config import settings
 verifications: dict[str, VerificationStatus] = {}
 identities: dict[str, IdentityData] = {}
 verification_rate_buckets: dict[str, list[float]] = {}
+identity_proof_tokens: dict[str, IdentityProofToken] = {}
 
 
 def persist_runtime_state() -> None:
@@ -226,6 +236,58 @@ async def get_trust_surface(
     return TrustReadSurfaceResponse(
         success=True,
         data=trust_surface,
+    )
+
+
+@router.post("/{wallet_address}/proof-token", response_model=ApiResponse, tags=["identity"])
+async def issue_identity_proof_token(
+    wallet_address: str,
+    data: IdentityProofTokenRequest,
+):
+    """Issue a signed-message challenge for downstream buyer/seller proof."""
+    if wallet_address not in identities:
+        raise HTTPException(status_code=404, detail="Identity anchor not found")
+
+    trust_surface = _build_trust_surface(identities[wallet_address])
+    if trust_surface.trust_state != "verified":
+        raise HTTPException(
+            status_code=403,
+            detail="Verified AadhaarChain trust is required before issuing an identity proof token.",
+        )
+
+    token = _build_identity_proof_token(wallet_address, data, trust_surface)
+    identity_proof_tokens[token.token_id] = token
+    append_audit_event(
+        "identity_proof_token_issued",
+        wallet_address,
+        target_id=token.token_id,
+        target_type="identity_proof_token",
+        details=f"Issued {data.audience} identity proof token.",
+    )
+    return ApiResponse(
+        success=True,
+        message="Identity proof token issued",
+        data=token.model_dump(),
+    )
+
+
+@router.post("/proof-token/verify", response_model=ApiResponse, tags=["identity"])
+async def verify_identity_proof_token(
+    data: SignedIdentityProofRequest,
+):
+    """Verify a wallet signature over an AadhaarChain proof token."""
+    result = _verify_signed_identity_proof(data)
+    append_audit_event(
+        "identity_proof_token_verified" if result.valid else "identity_proof_token_rejected",
+        data.wallet_address,
+        target_id=data.token_id,
+        target_type="identity_proof_token",
+        details=result.reason,
+    )
+    return ApiResponse(
+        success=result.valid,
+        message=result.reason,
+        data=result.model_dump(),
     )
 
 
@@ -673,6 +735,118 @@ def _seed_trust_fixture(
         metadata=_build_fixture_metadata(fixture_state, document_type),
     )
     return _build_trust_surface(identities[wallet_address])
+
+
+def _build_identity_proof_token(
+    wallet_address: str,
+    request: IdentityProofTokenRequest,
+    trust_surface: TrustReadSurface,
+) -> IdentityProofToken:
+    issued_at = datetime.now(timezone.utc)
+    expires_at = issued_at + timedelta(minutes=5)
+    token_id = f"idproof_{secrets.token_urlsafe(18)}"
+    message_payload = {
+        "audience": request.audience,
+        "did": trust_surface.did,
+        "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
+        "high_trust_eligible": trust_surface.high_trust_eligible,
+        "issued_at": issued_at.isoformat().replace("+00:00", "Z"),
+        "purpose": request.purpose,
+        "token_id": token_id,
+        "trust_state": trust_surface.trust_state,
+        "trust_version": trust_surface.trust_version,
+        "wallet_address": wallet_address,
+    }
+
+    return IdentityProofToken(
+        token_id=token_id,
+        wallet_address=wallet_address,
+        audience=request.audience,
+        purpose=request.purpose,
+        trust_state=trust_surface.trust_state,
+        high_trust_eligible=trust_surface.high_trust_eligible,
+        issued_at=message_payload["issued_at"],
+        expires_at=message_payload["expires_at"],
+        message=json.dumps(message_payload, separators=(",", ":"), sort_keys=True),
+    )
+
+
+def _verify_signed_identity_proof(data: SignedIdentityProofRequest) -> SignedIdentityProofResult:
+    verified_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    token = identity_proof_tokens.get(data.token_id)
+    if token is None:
+        return SignedIdentityProofResult(
+            valid=False,
+            wallet_address=data.wallet_address,
+            audience=data.audience,
+            reason="Identity proof token was not issued by this AadhaarChain gateway.",
+            verified_at=verified_at,
+        )
+
+    if token.wallet_address != data.wallet_address or token.audience != data.audience:
+        return SignedIdentityProofResult(
+            valid=False,
+            wallet_address=data.wallet_address,
+            audience=data.audience,
+            reason="Identity proof token subject or audience does not match the signed request.",
+            verified_at=verified_at,
+        )
+
+    if token.message != data.message:
+        return SignedIdentityProofResult(
+            valid=False,
+            wallet_address=data.wallet_address,
+            audience=data.audience,
+            reason="Signed message does not match the issued identity proof token.",
+            verified_at=verified_at,
+        )
+
+    expires_at = datetime.fromisoformat(token.expires_at.replace("Z", "+00:00"))
+    if expires_at < datetime.now(timezone.utc):
+        return SignedIdentityProofResult(
+            valid=False,
+            wallet_address=data.wallet_address,
+            audience=data.audience,
+            trust_state=token.trust_state,
+            high_trust_eligible=token.high_trust_eligible,
+            reason="Identity proof token has expired.",
+            verified_at=verified_at,
+        )
+
+    try:
+        public_key = Pubkey.from_string(data.wallet_address)
+        signature = Signature.from_string(data.signature)
+    except Exception:
+        return SignedIdentityProofResult(
+            valid=False,
+            wallet_address=data.wallet_address,
+            audience=data.audience,
+            trust_state=token.trust_state,
+            high_trust_eligible=token.high_trust_eligible,
+            reason="Identity proof token contains an invalid wallet address or signature.",
+            verified_at=verified_at,
+        )
+
+    if not signature.verify(public_key, data.message.encode("utf-8")):
+        return SignedIdentityProofResult(
+            valid=False,
+            wallet_address=data.wallet_address,
+            audience=data.audience,
+            trust_state=token.trust_state,
+            high_trust_eligible=token.high_trust_eligible,
+            reason="Wallet signature does not verify against the identity proof token.",
+            verified_at=verified_at,
+        )
+
+    return SignedIdentityProofResult(
+        valid=True,
+        wallet_address=data.wallet_address,
+        audience=data.audience,
+        trust_state=token.trust_state,
+        high_trust_eligible=token.high_trust_eligible,
+        reason="Wallet signature proves control of a verified AadhaarChain identity token.",
+        verified_at=verified_at,
+    )
 
 
 def _clear_wallet_fixture(wallet_address: str) -> None:

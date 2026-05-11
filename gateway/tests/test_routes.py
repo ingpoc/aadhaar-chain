@@ -2,6 +2,7 @@ import os
 import sys
 
 from fastapi.testclient import TestClient
+from solders.keypair import Keypair
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -17,7 +18,7 @@ from app.models import (
     VerificationMetadata,
     VerificationStatus,
 )
-from app.routes import agent_manager, identities, verification_rate_buckets
+from app.routes import agent_manager, identities, identity_proof_tokens, verification_rate_buckets
 from app.state_store import load_audit_events, load_gateway_state, save_gateway_state
 from app.evidence_store import load_encrypted_evidence
 
@@ -467,6 +468,133 @@ def test_seed_trust_fixture_supports_full_local_matrix() -> None:
     identity_response = client.get(f"/api/identity/{wallet_address}")
     assert identity_response.status_code == 200
     assert identity_response.json()["data"] is None
+
+
+def test_verified_wallet_can_issue_and_sign_identity_proof_token() -> None:
+    identities.clear()
+    identity_proof_tokens.clear()
+    agent_manager.verification_records.clear()
+
+    keypair = Keypair()
+    wallet_address = str(keypair.pubkey())
+    client = TestClient(app)
+
+    try:
+        fixture_response = client.post(
+            f"/api/identity/dev/fixtures/{wallet_address}",
+            json={"fixture_state": "verified", "document_type": "aadhaar"},
+        )
+        assert fixture_response.status_code == 200
+
+        issue_response = client.post(
+            f"/api/identity/{wallet_address}/proof-token",
+            json={"audience": "buyer", "purpose": "buyer_checkout_identity_proof"},
+        )
+        assert issue_response.status_code == 200
+        issued = issue_response.json()["data"]
+
+        signature = keypair.sign_message(issued["message"].encode("utf-8"))
+        verify_response = client.post(
+            "/api/identity/proof-token/verify",
+            json={
+                "token_id": issued["token_id"],
+                "wallet_address": wallet_address,
+                "audience": "buyer",
+                "message": issued["message"],
+                "signature": str(signature),
+            },
+        )
+
+        assert verify_response.status_code == 200
+        payload = verify_response.json()
+        assert payload["success"] is True
+        assert payload["data"]["valid"] is True
+        assert payload["data"]["wallet_address"] == wallet_address
+        assert payload["data"]["audience"] == "buyer"
+        assert payload["data"]["trust_state"] == "verified"
+        assert payload["data"]["high_trust_eligible"] is True
+    finally:
+        identities.clear()
+        identity_proof_tokens.clear()
+        agent_manager.verification_records.clear()
+
+
+def test_identity_proof_token_requires_verified_trust() -> None:
+    identities.clear()
+    identity_proof_tokens.clear()
+    agent_manager.verification_records.clear()
+
+    wallet_address = str(Keypair().pubkey())
+    client = TestClient(app)
+
+    try:
+        fixture_response = client.post(
+            f"/api/identity/dev/fixtures/{wallet_address}",
+            json={"fixture_state": "identity_present_unverified", "document_type": "aadhaar"},
+        )
+        assert fixture_response.status_code == 200
+
+        issue_response = client.post(
+            f"/api/identity/{wallet_address}/proof-token",
+            json={"audience": "seller", "purpose": "seller_catalog_identity_proof"},
+        )
+
+        assert issue_response.status_code == 403
+        assert identity_proof_tokens == {}
+    finally:
+        identities.clear()
+        identity_proof_tokens.clear()
+        agent_manager.verification_records.clear()
+
+
+def test_identity_proof_token_rejects_tampered_message() -> None:
+    identities.clear()
+    identity_proof_tokens.clear()
+    agent_manager.verification_records.clear()
+
+    keypair = Keypair()
+    wallet_address = str(keypair.pubkey())
+    client = TestClient(app)
+
+    try:
+        fixture_response = client.post(
+            f"/api/identity/dev/fixtures/{wallet_address}",
+            json={"fixture_state": "verified", "document_type": "aadhaar"},
+        )
+        assert fixture_response.status_code == 200
+
+        issue_response = client.post(
+            f"/api/identity/{wallet_address}/proof-token",
+            json={"audience": "seller", "purpose": "seller_catalog_identity_proof"},
+        )
+        assert issue_response.status_code == 200
+        issued = issue_response.json()["data"]
+        tampered_message = issued["message"].replace(
+            "seller_catalog_identity_proof",
+            "buyer_checkout_identity_proof",
+        )
+        signature = keypair.sign_message(tampered_message.encode("utf-8"))
+
+        verify_response = client.post(
+            "/api/identity/proof-token/verify",
+            json={
+                "token_id": issued["token_id"],
+                "wallet_address": wallet_address,
+                "audience": "seller",
+                "message": tampered_message,
+                "signature": str(signature),
+            },
+        )
+
+        assert verify_response.status_code == 200
+        payload = verify_response.json()
+        assert payload["success"] is False
+        assert payload["data"]["valid"] is False
+        assert payload["data"]["reason"] == "Signed message does not match the issued identity proof token."
+    finally:
+        identities.clear()
+        identity_proof_tokens.clear()
+        agent_manager.verification_records.clear()
 
 
 def test_aadhaar_upload_stores_encrypted_evidence_when_key_is_configured(monkeypatch, tmp_path) -> None:

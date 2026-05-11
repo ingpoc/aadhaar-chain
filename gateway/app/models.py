@@ -220,6 +220,59 @@ class TrustReadSurfaceResponse(BaseModel):
     error: Optional[Dict[str, Any]] = None
 
 
+class IdentityProofTokenRequest(BaseModel):
+    """Request to issue a wallet-bound local proof token."""
+    audience: Literal["buyer", "seller", "flatwatch"]
+    purpose: str = Field(default="portfolio_identity_proof", min_length=1)
+
+
+class IdentityProofToken(BaseModel):
+    """Challenge token that a wallet signs to prove identity ownership."""
+    token_id: str
+    wallet_address: str
+    audience: Literal["buyer", "seller", "flatwatch"]
+    purpose: str
+    trust_state: Literal[
+        "no_identity",
+        "identity_present_unverified",
+        "verified",
+        "manual_review",
+        "revoked_or_blocked",
+    ]
+    high_trust_eligible: bool
+    issued_at: str
+    expires_at: str
+    message: str
+
+
+class SignedIdentityProofRequest(BaseModel):
+    """Signed proof token submitted by a downstream app."""
+    token_id: str
+    wallet_address: str
+    audience: Literal["buyer", "seller", "flatwatch"]
+    message: str
+    signature: str
+
+
+class SignedIdentityProofResult(BaseModel):
+    """Verification result for a signed wallet proof token."""
+    valid: bool
+    wallet_address: str
+    audience: Literal["buyer", "seller", "flatwatch"]
+    trust_state: Optional[
+        Literal[
+            "no_identity",
+            "identity_present_unverified",
+            "verified",
+            "manual_review",
+            "revoked_or_blocked",
+        ]
+    ] = None
+    high_trust_eligible: bool = False
+    reason: str
+    verified_at: str
+
+
 class VerificationStatus(BaseModel):
     """Status of verification process."""
     verification_id: str
