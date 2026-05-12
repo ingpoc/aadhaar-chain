@@ -32,12 +32,19 @@ const WalletConnectionButton = dynamic(
   }
 );
 
-const links = [
+type NavLink = {
+  href: string;
+  label: string;
+  external?: boolean;
+};
+
+const links: NavLink[] = [
   { href: '/dashboard', label: 'Dashboard' },
   { href: '/identity/create', label: 'Create Identity' },
   { href: '/verify/aadhaar', label: 'Verify Aadhaar' },
   { href: '/verify/pan', label: 'Verify PAN' },
   { href: '/credentials', label: 'Credentials' },
+  { href: '/usecase.html#agents', label: 'Use Case', external: true },
   { href: '/settings', label: 'Settings' },
 ];
 
@@ -56,6 +63,17 @@ export function Navbar() {
             <div className="hidden items-center gap-2 rounded-full border border-border/70 bg-card/80 p-1 md:flex">
               {links.map((link) => {
                 const isActive = pathname === link.href;
+                if (link.external) {
+                  return (
+                    <a
+                      key={link.href}
+                      href={link.href}
+                      className="rounded-full px-4 py-2 text-sm font-medium tracking-tight text-muted-foreground transition-colors hover:text-foreground"
+                    >
+                      {link.label}
+                    </a>
+                  );
+                }
 
                 return (
                   <Link
@@ -99,6 +117,18 @@ export function Navbar() {
                 <div className="mt-8 flex flex-col gap-2 px-6 pb-6">
                   {links.map((link) => {
                     const isActive = pathname === link.href;
+                    if (link.external) {
+                      return (
+                        <a
+                          key={link.href}
+                          href={link.href}
+                          onClick={() => setOpen(false)}
+                          className="rounded-2xl border border-border px-4 py-3 text-sm font-medium tracking-tight text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+                        >
+                          {link.label}
+                        </a>
+                      );
+                    }
 
                     return (
                       <Link
