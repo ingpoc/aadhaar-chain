@@ -994,6 +994,10 @@
 
   buttons.forEach(b => b.addEventListener('click', () => showPanel(Number(b.dataset.i))));
 
+  const hashPanels = { agents: 8 };
+  const initialPanel = hashPanels[window.location.hash.slice(1)];
+  if (typeof initialPanel === 'number') showPanel(initialPanel);
+
   document.addEventListener('keydown', (e) => {
     if (e.key === 'ArrowRight') showPanel(Math.min(panels.length - 1, current + 1));
     if (e.key === 'ArrowLeft')  showPanel(Math.max(0, current - 1));
