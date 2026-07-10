@@ -5,8 +5,10 @@
   "type": "module",
   "scripts": {
     "grade:deterministic": "node graders/run-deterministic.mjs",
-    "grade:browser": "playwright test -c browser/playwright.config.ts",
-    "start:all": "bash scripts/start-all.sh"
+    "grade:browser": "playwright test -c browser/playwright.config.ts browser/portfolio.spec.ts",
+    "start:all": "bash scripts/start-all.sh",
+    "grade:wallet": "playwright test -c browser/playwright.config.ts browser/wallet-journey.spec.ts",
+    "grade:all": "npm run grade:deterministic && npm run grade:browser && npm run grade:wallet"
   },
   "dependencies": {
     "@playwright/test": "^1.61.1",
