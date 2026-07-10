@@ -1,0 +1,15 @@
+{
+  "name": "portfolio-qa",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "grade:deterministic": "node graders/run-deterministic.mjs",
+    "grade:browser": "playwright test -c browser/playwright.config.ts",
+    "start:all": "bash scripts/start-all.sh"
+  },
+  "dependencies": {
+    "@playwright/test": "^1.61.1",
+    "playwright": "^1.61.1"
+  }
+}

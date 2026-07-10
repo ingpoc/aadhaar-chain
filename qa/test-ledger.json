@@ -1,0 +1,434 @@
+{
+  "version": "1.0.0",
+  "generated_at": "2026-07-10T03:59:00Z",
+  "portfolio_purpose": "Same-wallet trust producer (AadhaarChain) feeds buyer commerce, seller commerce, and FlatWatch transparency. Every action must map to a concrete user outcome.",
+  "services": {
+    "aadhaar_chain_frontend": { "url": "http://127.0.0.1:43100", "repo": "aadhaar-chain", "role": "trust_producer_ui" },
+    "aadhaar_chain_gateway": { "url": "http://127.0.0.1:43101", "repo": "aadhaar-chain", "role": "trust_producer_api", "health": "/health" },
+    "ondc_buyer": { "url": "http://127.0.0.1:43102", "repo": "ondc-buyer", "role": "trust_consumer_commerce_buyer" },
+    "ondc_seller": { "url": "http://127.0.0.1:43103", "repo": "ondc-seller", "role": "trust_consumer_commerce_seller" },
+    "flatwatch_backend": { "url": "http://127.0.0.1:43104", "repo": "flatwatch", "role": "trust_consumer_transparency_api", "health": "/api/health" },
+    "flatwatch_frontend": { "url": "http://127.0.0.1:43105", "repo": "flatwatch", "role": "trust_consumer_transparency_ui" }
+  },
+  "test_wallet": {
+    "note": "Deterministic Solana keypair generated at runtime by graders; fixtures seeded via gateway POST /api/identity/dev/fixtures/{wallet}",
+    "fixture_states": [
+      "no_identity",
+      "identity_present_unverified",
+      "verified",
+      "manual_review",
+      "revoked_or_blocked"
+    ]
+  },
+  "apps": [
+    {
+      "id": "aadhaar-chain",
+      "usecase": "Produce wallet-bound trust state without leaking raw Aadhaar/PAN evidence to downstream apps.",
+      "success_definition": "A wallet can create an identity anchor, complete verification (or fixture), reach trust_state=verified, and issue/verify audience-bound proof tokens.",
+      "flows": [
+        {
+          "id": "ac.health",
+          "name": "Gateway health",
+          "type": ["deterministic"],
+          "actions": [{ "method": "GET", "path": "/health", "service": "aadhaar_chain_gateway" }],
+          "success": { "status": 200, "body_contains_any": ["ok", "healthy", "status"] }
+        },
+        {
+          "id": "ac.landing_loads",
+          "name": "Landing page loads with brand CTA",
+          "type": ["browser"],
+          "route": "/",
+          "actions": [
+            { "assert_visible": "AadhaarChain" },
+            { "assert_visible_any": ["Join the revolution", "Select Wallet", "Create identity"] }
+          ],
+          "success": "First viewport shows brand and a meaningful next action (wallet connect or create identity)."
+        },
+        {
+          "id": "ac.identity_create_api",
+          "name": "Create identity anchor via API",
+          "type": ["deterministic"],
+          "actions": [
+            { "method": "POST", "path": "/api/identity/{wallet}", "json": { "commitment": "sha256:qa-test-commitment" } },
+            { "method": "GET", "path": "/api/identity/{wallet}" },
+            { "method": "GET", "path": "/api/identity/{wallet}/trust" }
+          ],
+          "success": {
+            "identity_present": true,
+            "trust_state": "identity_present_unverified"
+          }
+        },
+        {
+          "id": "ac.fixture_matrix",
+          "name": "Dev fixture matrix covers all trust states",
+          "type": ["deterministic"],
+          "actions": [
+            {
+              "for_each_fixture": true,
+              "method": "POST",
+              "path": "/api/identity/dev/fixtures/{wallet}",
+              "json": { "fixture_state": "{fixture}", "document_type": "aadhaar" },
+              "then_get": "/api/identity/{wallet}/trust",
+              "expect_trust_state": "{fixture}"
+            }
+          ],
+          "success": "Each fixture_state returns matching trust_state on trust read surface."
+        },
+        {
+          "id": "ac.proof_token_requires_verified",
+          "name": "Proof token rejected unless verified",
+          "type": ["deterministic"],
+          "actions": [
+            { "seed_fixture": "identity_present_unverified" },
+            {
+              "method": "POST",
+              "path": "/api/identity/{wallet}/proof-token",
+              "json": { "audience": "buyer", "purpose": "buyer_checkout_identity_proof" },
+              "expect_status": [403, 400, 409]
+            },
+            { "seed_fixture": "verified" },
+            {
+              "method": "POST",
+              "path": "/api/identity/{wallet}/proof-token",
+              "json": { "audience": "buyer", "purpose": "buyer_checkout_identity_proof" },
+              "expect_status": 200
+            }
+          ],
+          "success": "Unverified wallets cannot obtain proof challenges; verified wallets can."
+        },
+        {
+          "id": "ac.proof_token_sign_verify",
+          "name": "Wallet signs proof challenge and gateway verifies",
+          "type": ["deterministic"],
+          "actions": [
+            { "seed_fixture": "verified" },
+            { "issue_proof": { "audience": "buyer", "purpose": "buyer_checkout_identity_proof" } },
+            { "sign_with_test_keypair": true },
+            { "verify_proof": true }
+          ],
+          "success": { "valid": true, "trust_state": "verified" }
+        },
+        {
+          "id": "ac.routes_browser",
+          "name": "Critical routes render without crash",
+          "type": ["browser"],
+          "routes": ["/", "/dashboard", "/identity/create", "/verify/aadhaar", "/verify/pan", "/credentials", "/settings"],
+          "success": "Each route returns HTTP 200 and shows a page-specific heading or primary CTA (not a blank/error shell)."
+        },
+        {
+          "id": "ac.no_raw_pii_on_trust_surface",
+          "name": "Trust surface never returns raw document fields",
+          "type": ["deterministic"],
+          "actions": [
+            { "seed_fixture": "verified" },
+            { "method": "GET", "path": "/api/identity/{wallet}/trust" }
+          ],
+          "success": {
+            "forbidden_keys_absent": ["aadhaar_number", "pan_number", "uid", "document_bytes", "ocr_raw", "full_name"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "ondc-buyer",
+      "usecase": "Let a shopper discover products, manage cart, and complete trust-gated checkout using AadhaarChain trust — never raw identity evidence.",
+      "success_definition": "Search→product→cart works without trust; checkout/cancel/support/agent-write require verified trust and show concrete labels (not vague disabled states).",
+      "flows": [
+        {
+          "id": "buyer.landing_search",
+          "name": "Search page loads with categories and trust notice",
+          "type": ["browser"],
+          "route": "/search",
+          "actions": [
+            { "assert_visible_any": ["Grocery", "Restaurant", "Fashion", "Electronics"] },
+            { "assert_visible_any": ["Search network", "Search", "Search the network"] }
+          ],
+          "success": "Buyer can start discovery immediately; trust chip/notice is meaningful."
+        },
+        {
+          "id": "buyer.search_results_demo",
+          "name": "Demo search returns grocery items",
+          "type": ["browser", "deterministic"],
+          "route": "/results?category=grocery&q=rice",
+          "actions": [
+            { "assert_visible_any": ["Basmati Rice", "Mustard Oil", "rice", "Grocery"] },
+            { "click_any": ["Add", "View details"] }
+          ],
+          "success": "At least one product card is actionable."
+        },
+        {
+          "id": "buyer.add_to_cart_checkout_gate",
+          "name": "Cart works; checkout gated without verified trust",
+          "type": ["browser"],
+          "actions": [
+            { "goto": "/product/basmati-rice-5kg" },
+            { "click": "Add to cart" },
+            { "goto": "/cart" },
+            { "assert_visible_any": ["Basmati Rice", "Proceed to checkout"] },
+            { "click": "Proceed to checkout" },
+            { "assert_visible_any": ["Trust verification required", "Resolve trust", "AadhaarChain", "Get quote", "Place order"] }
+          ],
+          "success": "Checkout CTA either requires trust with an explicit reason or proceeds only when verified."
+        },
+        {
+          "id": "buyer.policy_matrix",
+          "name": "Buyer action policy: elevated actions need verified",
+          "type": ["deterministic"],
+          "module": "src/lib/buyerActionPolicy.ts",
+          "success": "Unit/policy grader asserts checkout/cancel/support/agent_write require verified; search/cart do not."
+        },
+        {
+          "id": "buyer.orders_tabs",
+          "name": "Orders page tabs are concrete statuses",
+          "type": ["browser"],
+          "route": "/orders",
+          "actions": [
+            { "assert_visible_any": ["all", "pending", "active", "complete"] }
+          ],
+          "success": "Order filters map to real order lifecycle states."
+        },
+        {
+          "id": "buyer.agent_page",
+          "name": "Agent page explains runtime/trust mode",
+          "type": ["browser"],
+          "route": "/agent",
+          "actions": [
+            { "assert_visible_any": ["Runtime", "Authentication required", "Read-only", "High-trust", "Claude", "agent"] }
+          ],
+          "success": "Agent surface never looks empty/vague — shows runtime or auth/trust reason."
+        },
+        {
+          "id": "buyer.unit_suite",
+          "name": "Vitest suite passes",
+          "type": ["deterministic"],
+          "command": "npm test",
+          "cwd": "/agent/repos/ondc-buyer",
+          "success": "exit_code=0"
+        }
+      ]
+    },
+    {
+      "id": "ondc-seller",
+      "usecase": "Let a merchant manage catalog and fulfill orders, with verified trust required for writes.",
+      "success_definition": "Reads work with wallet/session; catalog create/edit/delete and order accept/reject/dispatch require verified trust and clear CTAs.",
+      "flows": [
+        {
+          "id": "seller.dashboard_loads",
+          "name": "Dashboard shows catalog pulse and proof CTA",
+          "type": ["browser"],
+          "route": "/dashboard",
+          "actions": [
+            { "assert_visible_any": ["Dashboard", "Catalog", "Add product", "Sign seller proof", "Open catalog"] }
+          ],
+          "success": "Seller lands on an actionable control surface."
+        },
+        {
+          "id": "seller.catalog_list",
+          "name": "Catalog lists demo items with Edit/Delete meaning",
+          "type": ["browser"],
+          "route": "/catalog",
+          "actions": [
+            { "assert_visible_any": ["Basmati Rice", "Mustard Oil", "Add product", "Refresh catalog"] },
+            { "assert_visible_any": ["Edit", "Delete"] }
+          ],
+          "success": "Each listed product has concrete management actions."
+        },
+        {
+          "id": "seller.orders_fulfillment",
+          "name": "Orders queue exposes Accept/Reject/Dispatch",
+          "type": ["browser"],
+          "route": "/orders",
+          "actions": [
+            { "assert_visible_any": ["pending", "accepted", "dispatched", "Accept", "Reject", "View Details"] }
+          ],
+          "success": "Fulfillment actions are explicit lifecycle verbs."
+        },
+        {
+          "id": "seller.policy_matrix",
+          "name": "Seller action policy: writes need verified",
+          "type": ["deterministic"],
+          "module": "src/lib/sellerActionPolicy.ts",
+          "success": "catalog_save/delete and order_accept/reject/dispatch require verified."
+        },
+        {
+          "id": "seller.config_page",
+          "name": "Config page has Save and Test connection",
+          "type": ["browser"],
+          "route": "/config",
+          "actions": [
+            { "assert_visible_any": ["Save configuration", "Test connection", "Generate key"] }
+          ],
+          "success": "Operator config actions are concrete."
+        },
+        {
+          "id": "seller.agent_page",
+          "name": "Seller agent shows approval gate language",
+          "type": ["browser"],
+          "route": "/agent",
+          "actions": [
+            { "assert_visible_any": ["Runtime", "Read-only", "Verified seller writes", "Approve and apply", "agent"] }
+          ],
+          "success": "Agent write path is explicit about approval/trust."
+        },
+        {
+          "id": "seller.unit_suite",
+          "name": "Vitest suite passes",
+          "type": ["deterministic"],
+          "command": "npm test",
+          "cwd": "/agent/repos/ondc-seller",
+          "success": "exit_code=0"
+        },
+        {
+          "id": "seller.cross_app_demo_gap",
+          "name": "Document/fix demo catalog SKU alignment with buyer",
+          "type": ["deterministic", "fix"],
+          "problem": "Buyer and seller demo catalogs must share SKUs; buyer checkout must bridge into seller demo order queue via ondc-portfolio-demo-orders.",
+          "success": "Shared demo SKUs OR documented intentional isolation with a bridge for portfolio E2E."
+        }
+      ]
+    },
+    {
+      "id": "flatwatch",
+      "usecase": "Give housing-society residents transparent finance visibility: sync money feed, upload receipts, challenge suspicious txns, ask Chat Guard — elevated writes require AadhaarChain verified trust.",
+      "success_definition": "Resident can sign in, sync transactions, view dashboard; receipt upload/challenge submit disabled with explicit Trust required until verified; chat explains runtime.",
+      "flows": [
+        {
+          "id": "fw.health",
+          "name": "Backend health",
+          "type": ["deterministic"],
+          "actions": [{ "method": "GET", "path": "/api/health", "service": "flatwatch_backend" }],
+          "success": { "status": 200 }
+        },
+        {
+          "id": "fw.auth_login",
+          "name": "Demo resident login issues JWT",
+          "type": ["deterministic"],
+          "actions": [
+            {
+              "method": "POST",
+              "path": "/api/auth/login",
+              "service": "flatwatch_backend",
+              "json": { "email": "resident@flatwatch.test", "password": "dev-local" }
+            }
+          ],
+          "success": { "has_token": true, "role": "resident" }
+        },
+        {
+          "id": "fw.sync_and_summary",
+          "name": "Sync transactions then read summary",
+          "type": ["deterministic"],
+          "actions": [
+            { "auth": "resident" },
+            { "method": "POST", "path": "/api/transactions/sync", "service": "flatwatch_backend" },
+            { "method": "GET", "path": "/api/transactions/summary", "service": "flatwatch_backend" }
+          ],
+          "success": "Summary includes balance/inflow/outflow numeric fields."
+        },
+        {
+          "id": "fw.landing_signin",
+          "name": "Landing → dashboard sign-in",
+          "type": ["browser"],
+          "route": "/",
+          "actions": [
+            { "click_any": ["Get Started"] },
+            { "click_any": ["Sign in"] },
+            { "assert_visible_any": ["Sync now", "Dashboard", "balance", "Inflow", "Outflow", "Transactions"] }
+          ],
+          "success": "Authenticated dashboard shows financial summary and Sync now."
+        },
+        {
+          "id": "fw.receipts_trust_gate",
+          "name": "Receipt upload gated without verified trust",
+          "type": ["browser"],
+          "route": "/receipts",
+          "actions": [
+            { "assert_visible_any": ["Upload receipt", "Trust required", "Review trust"] }
+          ],
+          "success": "Upload CTA is either enabled (verified) or explicitly Trust required."
+        },
+        {
+          "id": "fw.challenges_trust_gate",
+          "name": "Challenge submit gated without verified trust",
+          "type": ["browser"],
+          "route": "/challenges",
+          "actions": [
+            { "click_any": ["New challenge"] },
+            { "assert_visible_any": ["Submit challenge", "Trust required", "Select a transaction"] }
+          ],
+          "success": "Challenge form uses concrete transaction selection and trust-aware submit."
+        },
+        {
+          "id": "fw.chat_guard",
+          "name": "Chat Guard page shows suggested queries",
+          "type": ["browser"],
+          "route": "/chat",
+          "actions": [
+            {
+              "assert_visible_any": [
+                "Summarize this month",
+                "receipts still need review",
+                "resident challenges",
+                "by-law",
+                "Ask about transactions",
+                "Runtime"
+              ]
+            }
+          ],
+          "success": "Chat surface offers meaningful suggested actions, not an empty box."
+        },
+        {
+          "id": "fw.backend_suite",
+          "name": "Backend pytest suite",
+          "type": ["deterministic"],
+          "command": "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q -p pytest_asyncio.plugin --asyncio-mode=auto",
+          "cwd": "/agent/repos/flatwatch/backend",
+          "success": "exit_code=0"
+        },
+        {
+          "id": "fw.frontend_suite",
+          "name": "Frontend Jest suite",
+          "type": ["deterministic"],
+          "command": "npm test -- --runInBand",
+          "cwd": "/agent/repos/flatwatch/frontend",
+          "success": "exit_code=0"
+        },
+        {
+          "id": "fw.trust_api_bypass_root_cause",
+          "name": "Receipt/challenge APIs must enforce trust server-side",
+          "type": ["deterministic", "fix"],
+          "problem": "UI gates trust but backend receipt/challenge routes accept resident JWT without wallet trust check.",
+          "success": "Backend rejects elevated writes when X-Wallet-Address trust is not verified (or documents intentional demo exception with flag)."
+        }
+      ]
+    }
+  ],
+  "portfolio_journeys": [
+    {
+      "id": "portfolio.same_wallet_trust_then_commerce",
+      "order": [
+        "ac.health",
+        "ac.fixture_matrix",
+        "ac.proof_token_sign_verify",
+        "buyer.landing_search",
+        "buyer.add_to_cart_checkout_gate",
+        "seller.dashboard_loads",
+        "seller.catalog_list",
+        "fw.auth_login",
+        "fw.sync_and_summary",
+        "fw.receipts_trust_gate"
+      ],
+      "success": "Trust producer healthy → consumers show coherent trust-gated UX."
+    }
+  ],
+  "graders": {
+    "deterministic": {
+      "runner": "node graders/run-deterministic.mjs",
+      "outputs": "artifacts/deterministic-report.json"
+    },
+    "browser": {
+      "runner": "npx playwright test",
+      "config": "browser/playwright.config.ts",
+      "outputs": "artifacts/browser-report"
+    }
+  }
+}
