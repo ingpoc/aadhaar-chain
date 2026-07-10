@@ -1,30 +1,33 @@
 # AGENTS.md
 
-## Instruction Inheritance
+## Scope
 
-- Read `../AGENTS.md` first for portfolio-wide governance.
-- This file adds only `aadhaar-chain`-specific execution guidance.
-- If this file conflicts with the root workspace `AGENTS.md`, the root file wins unless it explicitly allows a repo-local exception.
+Repo-local guidance for `aadhaar-chain` only.
 
-## Browser Testing
+**Portfolio QA / browser / same-wallet control owner:** `qa/docs/workflow/`  
+Entry: `qa/docs/workflow/README.md` → then control plane → acceptance loop.
 
-- BEFORE browser testing AadhaarChain -> read `qa/docs/workflow/browser-testing-control-plane.md`
-- BEFORE running the same-user portfolio journey -> read `qa/docs/workflow/portfolio-browser-acceptance-loop.md`
-- Session friction / standing traps -> `qa/docs/workflow/session-friction-log.md`
-- Treat AadhaarChain as the first browser checkpoint in the portfolio flow because downstream trust consumers depend on its identity and trust state.
-- Critical browser routes for this repo: `/`, `/dashboard`, `/identity/create`, `/verify/aadhaar`, `/verify/pan`, `/credentials`, `/settings`
-- Local browser validation should confirm both the frontend and gateway are running before drawing product conclusions.
-- Runners live under `qa/` (`grade:deterministic`, `grade:browser`, `grade:wallet`).
+There is no parent `../AGENTS.md` in this multi-repo checkout. Do not invent one. Do not create parallel portfolio workflow docs elsewhere.
 
-# Agent SDK Integration
+## Portfolio testing (pointer only)
 
-## Purpose
+- BEFORE browser testing → `qa/docs/workflow/browser-testing-control-plane.md`
+- BEFORE same-wallet journey → `qa/docs/workflow/portfolio-browser-acceptance-loop.md`
+- Session friction → `qa/docs/workflow/session-friction-log.md`
+- Runners: `qa/` only (`grade:deterministic`, `grade:browser`, `grade:wallet`)
+- AadhaarChain is the first browser checkpoint; downstream trust consumers depend on its identity/trust state
+- Critical routes: `/`, `/dashboard`, `/identity/create`, `/verify/aadhaar`, `/verify/pan`, `/credentials`, `/settings`
+- Confirm frontend (43100) + gateway (43101) healthy before product conclusions
+
+## Agent SDK Integration
+
+### Purpose
 Manage Codex Agent SDK integration for aadhaar-chain verification workflows.
 
-## Components
+### Components
 
-### Agent Manager (`gateway/app/agent_manager.py`)
-**Service:** AgentManager
+#### Agent Manager (`gateway/app/agent_manager.py`)
+**Service:** AgentManager  
 **Purpose:** Orchestrates agent invocations and manages verification workflows
 
 **Methods:**
@@ -56,7 +59,7 @@ Manage Codex Agent SDK integration for aadhaar-chain verification workflows.
 - OCR confidence < 0.6 → MANUAL REVIEW
 - Otherwise → APPROVE
 
-### Verification Routes (`gateway/app/routes.py`)
+#### Verification Routes (`gateway/app/routes.py`)
 **Base Path:** `/api/identity`
 
 **Endpoints:**
@@ -74,7 +77,7 @@ Manage Codex Agent SDK integration for aadhaar-chain verification workflows.
 - Decision storage in verification metadata
 - In-memory verification records store
 
-### Gateway (`gateway/main.py`)
+#### Gateway (`gateway/main.py`)
 **Startup:**
 - Initialize Codex Agent SDK
 - Connect to MCP servers (document-processor, pattern-analyzer, compliance-rules)
@@ -86,70 +89,12 @@ Manage Codex Agent SDK integration for aadhaar-chain verification workflows.
 ## Testing
 
 ### Test Suite (`gateway/tests/test_agent_manager.py`)
-**Tests:**
-- `test_create_verification` - Create new verification request
-- `test_get_verification_status` - Get status by ID
-- `test_validate_document_mock` - Document validation (mock)
-- `test_detect_fraud_mock` - Fraud detection (mock)
-- `test_check_compliance_mock` - Compliance check (mock)
-- `test_orchestrate_verification_mock` - Full workflow (mock)
-- `test_update_verification_progress` - Progress tracking
-- `test_cleanup_expired_verifications` - Record cleanup
-- `test_agent_initialization` - Agent setup verification
-
-**Run Tests:**
+**Run:**
 ```bash
 cd gateway
 pytest tests/test_agent_manager.py -v
 ```
 
-## Next Steps
-
-### feat-011: Orchestrator Agent Workflow
-**Goal:** Implement actual agent-to-agent coordination using Task tool
-
-**Tasks:**
-1. Setup Codex Agent SDK (API keys, MCP server connections)
-2. Create agent instances from `mcp/agents.py`
-3. Implement Task tool invocations
-4. Add error handling for agent failures
-5. Store decision traces in Context Graph
-6. Replace mock implementations with real agent calls
-
-**Success Criteria:**
-- Can invoke Document Validator agent
-- Can invoke Fraud Detection agent
-- Can invoke Compliance Monitor agent
-- Can use Task tool for subagent coordination
-- Can handle agent errors gracefully
-- Can store decisions in Context Graph
-
-## Current Status
-
-**Completed:**
-- ✅ Agent manager service (mock implementations)
-- ✅ Verification routes with agent integration
-- ✅ Test suite
-- ✅ Decision logic (approve/reject/manual review)
-- ✅ Progress tracking
-
-**Pending (feat-011):**
-- Real Codex Agent SDK integration
-- MCP server connections
-- Actual agent invocations
-- Context Graph integration
-
 ## Notes
 
-### Mock vs Real Implementation
-Current implementation uses mock data for agent results (OCR, fraud, compliance). Next feature (feat-011) will integrate real Codex Agent SDK and MCP server calls.
-
-### Performance Considerations
-- In-memory verification records (for development)
-- Production: Use Redis or PostgreSQL
-- Agent initialization: Cache instances (avoid re-initializing)
-- MCP connections: Reuse connections across invocations
-
----
-
-**Last Updated:** 2026-02-03 17:10 UTC
+Current agent results are mock (OCR, fraud, compliance). feat-011 targets real Codex Agent SDK + MCP. Prefer Redis/PostgreSQL over in-memory verification records for production.

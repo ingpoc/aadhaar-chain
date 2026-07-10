@@ -1,20 +1,22 @@
 # Portfolio Browser Testing Control Plane
 
-Owner: `aadhaar-chain/qa` (trust producer is the first checkpoint).  
-Use this before any portfolio browser or wallet-signed debugging.
+**Sole owner:** `aadhaar-chain/qa` (see `README.md` in this folder).  
+Trust producer is the first checkpoint. Use this before any portfolio browser or wallet-signed debugging.
+
+Do not maintain a second ledger, grader tree, or workflow doc in FlatWatch / Buyer / Seller.
 
 ## First command
 
 ```bash
 cd /agent/repos/aadhaar-chain/qa
-# writable harness copy may also live at /home/ubuntu/portfolio-qa
+# optional writable mirror: /home/ubuntu/portfolio-qa (same tree, not a second owner)
 bash scripts/start-all.sh
 npm run grade:deterministic
 npm run grade:browser
 npm run grade:wallet
 ```
 
-Ledger of record: `qa/test-ledger.json`.
+Ledger of record: `aadhaar-chain/qa/test-ledger.json` only.
 
 ## Loop (do not skip)
 
@@ -110,5 +112,7 @@ Before claiming a fix:
 
 ## Related
 
+- Ownership / entry map: `README.md`
 - Same-user acceptance order: `portfolio-browser-acceptance-loop.md`
-- Ledger: `../test-ledger.json`
+- Friction log: `session-friction-log.md`
+- Ledger: `../../test-ledger.json`

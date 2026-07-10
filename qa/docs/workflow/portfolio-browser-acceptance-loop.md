@@ -1,7 +1,7 @@
 # Portfolio Browser Acceptance Loop
 
 Same-user, same-wallet journey across the portfolio.  
-Prerequisite: read `browser-testing-control-plane.md`.
+Prerequisite: ownership entry `README.md`, then `browser-testing-control-plane.md`.
 
 ## Journey order (fixed)
 
