@@ -2,6 +2,12 @@
 
 Use-case-backed test ledger + deterministic graders + Playwright browser control.
 
+## Workflow (read first)
+
+1. `docs/workflow/browser-testing-control-plane.md` — setup, taxonomy, wallet contract, standing traps
+2. `docs/workflow/portfolio-browser-acceptance-loop.md` — same-wallet journey order + exit criteria
+3. `docs/workflow/session-friction-log.md` — friction → standing rules from prior sessions
+
 ## Services
 
 | App | URL |
@@ -16,10 +22,11 @@ Use-case-backed test ledger + deterministic graders + Playwright browser control
 ## Run
 
 ```bash
-# from portfolio-qa harness (or this qa/ folder after npm install)
-npm run start:all
+# from this qa/ folder after npm install (or /home/ubuntu/portfolio-qa mirror)
+bash scripts/start-all.sh
 npm run grade:deterministic
 npm run grade:browser
+npm run grade:wallet
 ```
 
 Ledger: `test-ledger.json` — every flow maps to a product use case and concrete success criteria.

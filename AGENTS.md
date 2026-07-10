@@ -8,11 +8,13 @@
 
 ## Browser Testing
 
-- BEFORE browser testing AadhaarChain -> read `../docs/workflow/browser-testing-control-plane.md`
-- BEFORE running the same-user portfolio journey -> read `../docs/workflow/portfolio-browser-acceptance-loop.md`
+- BEFORE browser testing AadhaarChain -> read `qa/docs/workflow/browser-testing-control-plane.md`
+- BEFORE running the same-user portfolio journey -> read `qa/docs/workflow/portfolio-browser-acceptance-loop.md`
+- Session friction / standing traps -> `qa/docs/workflow/session-friction-log.md`
 - Treat AadhaarChain as the first browser checkpoint in the portfolio flow because downstream trust consumers depend on its identity and trust state.
 - Critical browser routes for this repo: `/`, `/dashboard`, `/identity/create`, `/verify/aadhaar`, `/verify/pan`, `/credentials`, `/settings`
 - Local browser validation should confirm both the frontend and gateway are running before drawing product conclusions.
+- Runners live under `qa/` (`grade:deterministic`, `grade:browser`, `grade:wallet`).
 
 # Agent SDK Integration
 
