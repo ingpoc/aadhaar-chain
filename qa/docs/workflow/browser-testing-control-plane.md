@@ -9,12 +9,13 @@ Do not maintain a second ledger, grader tree, or workflow doc in FlatWatch / Buy
 
 ```bash
 cd /agent/repos/aadhaar-chain/qa
-# optional writable mirror: /home/ubuntu/portfolio-qa (same tree, not a second owner)
 bash scripts/start-all.sh
 npm run grade:deterministic
 npm run grade:browser
 npm run grade:wallet
 ```
+
+If `/agent/repos` is not writable, copy or symlink **this entire `qa/` tree** elsewhere — do not fork workflow docs or the ledger.
 
 Ledger of record: `aadhaar-chain/qa/test-ledger.json` only.
 

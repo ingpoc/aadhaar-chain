@@ -44,4 +44,4 @@ npm run grade:browser
 npm run grade:wallet
 ```
 
-Writable harness mirror (optional): `/home/ubuntu/portfolio-qa` — same tree, not a second owner.
+If `/agent/repos` is not writable, copy or symlink **this entire `qa/` tree** elsewhere — do not fork workflow docs or the ledger.
