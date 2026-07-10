@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT=/home/ubuntu/portfolio-qa
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOGS="$ROOT/artifacts/logs"
 mkdir -p "$LOGS"
 

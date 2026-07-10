@@ -11,6 +11,7 @@ Not a second control owner.
 | No browser MCP in cloud agent | Playwright in `aadhaar-chain/qa/browser` is the browser control plane |
 | AGENTS pointed at missing `../AGENTS.md` or `../docs/workflow/*` | Sole owner is `aadhaar-chain/qa/docs/workflow/`; repo AGENTS are scope + pointer only |
 | Duplicate `qa/test-ledger.json` in consumer repos | Delete forks; ledger of record lives only in `aadhaar-chain/qa` |
+| `start-all.sh` hardcoded `/home/ubuntu/portfolio-qa` | Resolve `ROOT` from script path under `aadhaar-chain/qa` |
 | Seller docs/scripts still said port 3002 | Seller is **43103** everywhere |
 | Phantom connect flaky | Real pubkey `toBytes()` + click Phantom text; wait for truncated pubkey button |
 | FlatWatch Sign in flake | Wait for Sign in **or** authenticated content after verifying-session |
