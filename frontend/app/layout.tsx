@@ -24,8 +24,8 @@ const ibmPlexMono = IBM_Plex_Mono({
 })
 
 export const metadata: Metadata = {
-  title: "Identity Agent Platform - Self-Sovereign Identity on Solana",
-  description: "Decentralized identity platform powered by Solana and Claude Agent SDK",
+  title: "AadhaarChain",
+  description: "Verify once. Wallet-bound trust for portfolio apps.",
 }
 
 export default function RootLayout({

@@ -134,6 +134,7 @@ class VerificationMetadata(BaseModel):
     compliance: ComplianceVerificationEvidence
     blocking_gaps: List[VerificationGap] = Field(default_factory=list)
     assumptions: List[str] = Field(default_factory=list)
+    chain_transaction_signature: Optional[str] = None
 
 
 class ConsentArtifact(BaseModel):

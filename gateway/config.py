@@ -36,24 +36,38 @@ class Settings(BaseSettings):
     cors_allow_methods: list[str] = ["*"]
     cors_allow_headers: list[str] = ["*"]
 
-    # Solana
+    # Solana (on-chain identity-registry bridge)
     solana_rpc_url: str = "http://127.0.0.1:8899"
+    solana_on_chain_enabled: bool = False
+    solana_commitment: str = "confirmed"
+    solana_idl_path: Optional[str] = None
+    identity_registry_program_id: str = "DPW1Ji3XhNb4zAnL9SLq5ZBjmG7ePPegWuocY5VeJLdm"
+    verification_oracle_program_id: str = "35h6f6txjVcf8UshEaAm8fki2v1nhRLvRHFGNRwnTMrn"
+    credential_manager_program_id: str = "Fib1drk4v1pTPFxVZbvkuFxEUiZ8vXZNJuRq97YUdaG4"
+    reputation_engine_program_id: str = "FF1mjZ7WBhrUVq8SG7D3vNfGoTtE7L8mBLsi4efRNN2k"
+    staking_manager_program_id: str = "7s3ftYP22nGWxqvc6mDA1U4tRVdtaBJpACfg7GnSdJXH"
+    oracle_private_key: Optional[str] = None
+    oracle_public_key: Optional[str] = None
 
     # IPFS
     ipfs_gateway_url: str = "https://ipfs.io/ipfs"
 
-    # API Setu
+    # Setu.co Aadhaar eKYC (preferred production KYC rail)
+    setu_ekyc_enabled: bool = False
+    setu_ekyc_base_url: str = "https://dg-sandbox.setu.co"
+    setu_ekyc_client_id: Optional[str] = None
+    setu_ekyc_client_secret: Optional[str] = None
+    setu_ekyc_product_instance_id: Optional[str] = None
+    public_gateway_url: str = "http://127.0.0.1:43101"
+    public_web_url: str = "http://127.0.0.1:43100"
+
+    # Legacy / MeitY API Setu placeholders (not the active eKYC rail)
     apisetu_client_id: Optional[str] = None
     apisetu_client_secret: Optional[str] = None
 
-    # Anthropic (Claude Agent SDK)
-    anthropic_api_key: Optional[str] = None
-    anthropic_base_url: Optional[str] = None
-    claude_agent_auth_mode: str = "auto"
-    claude_agent_allow_local_cli_auth: bool = True
-    claude_agent_allow_deployed_cli_auth: bool = False
-    claude_agent_model: str = "claude-haiku-4-5-20251001"
-    claude_code_executable: Optional[str] = None
+    # Cursor SDK agent runtime
+    cursor_api_key: Optional[str] = None
+    cursor_agent_model: str = "composer-2.5"
 
     # Storage
     data_dir: str = "./data"
@@ -64,6 +78,10 @@ class Settings(BaseSettings):
     evidence_encryption_key_id: str = "local-dev"
     evidence_retention_days: int = 90
     verification_rate_limit_per_minute: int = 20
+
+    # Portfolio SSO session cookies (stateless signed tokens)
+    session_secret: str = "aadhaarchain-local-dev-session-secret"
+    session_ttl_hours: int = 24
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -124,11 +142,8 @@ def validate_runtime_storage_config() -> None:
 
 def apply_runtime_environment() -> None:
     """Propagate runtime settings into environment variables during startup."""
-    if settings.anthropic_api_key and not os.getenv("ANTHROPIC_API_KEY"):
-        os.environ["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
+    if settings.cursor_api_key and not os.getenv("CURSOR_API_KEY"):
+        os.environ["CURSOR_API_KEY"] = settings.cursor_api_key
 
-    if settings.anthropic_base_url and not os.getenv("ANTHROPIC_BASE_URL"):
-        os.environ["ANTHROPIC_BASE_URL"] = settings.anthropic_base_url
-
-    if settings.claude_code_executable and not os.getenv("CLAUDE_CODE_EXECUTABLE"):
-        os.environ["CLAUDE_CODE_EXECUTABLE"] = settings.claude_code_executable
+    if settings.cursor_agent_model and not os.getenv("CURSOR_AGENT_MODEL"):
+        os.environ["CURSOR_AGENT_MODEL"] = settings.cursor_agent_model

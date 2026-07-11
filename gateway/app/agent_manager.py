@@ -1,4 +1,4 @@
-"""Agent Manager Service for Claude Agent SDK integration.
+"""Agent Manager Service for Cursor SDK integration.
 
 This service orchestrates verification workflows and records exactly what evidence
 was observed at each stage. It never fabricates OCR, fraud, or compliance outputs.
@@ -12,38 +12,14 @@ from typing import Any, Callable, Dict, Optional
 import base64
 import hashlib
 import importlib.util
-import inspect
 import json
 import os
 import re
 import sys
 
-try:
-    from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
-    from claude_agent_sdk.types import (
-        AssistantMessage,
-        ResultMessage,
-        TextBlock,
-        ToolResultBlock,
-        ToolUseBlock,
-        McpStdioServerConfig,
-    )
-    CLAUDE_AGENT_SDK_AVAILABLE = True
-except ModuleNotFoundError:
-    class ClaudeAgentOptions:  # type: ignore[no-redef]
-        """Minimal options shim for tests when the SDK package is unavailable."""
-
-        def __init__(self, **kwargs: Any) -> None:
-            for key, value in kwargs.items():
-                setattr(self, key, value)
-
-    ClaudeSDKClient = None  # type: ignore[assignment]
-    AssistantMessage = ResultMessage = TextBlock = ToolResultBlock = ToolUseBlock = object  # type: ignore[assignment]
-    McpStdioServerConfig = Dict[str, Any]  # type: ignore[assignment]
-    CLAUDE_AGENT_SDK_AVAILABLE = False
-
 from app.mcp_config import DEFAULT_MCP_SERVERS
 from app.runtime_config import resolve_runtime_policy
+from config import get_runtime_mode
 from app.document_processing import extract_document_contract
 from app.state_store import append_audit_event
 from app.models import (
@@ -62,7 +38,10 @@ from app.models import (
     VerificationStep,
     VerificationStepDetail,
 )
-from config import get_runtime_mode
+
+_SHARED_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "shared"))
+if _SHARED_ROOT not in sys.path:
+    sys.path.insert(0, _SHARED_ROOT)
 
 repo_root_for_imports = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if repo_root_for_imports not in sys.path:
@@ -335,55 +314,22 @@ class AgentManager:
     def _build_mcp_servers(
         self,
         server_names: list[str],
-    ) -> Dict[str, McpStdioServerConfig]:
-        mcp_servers: Dict[str, McpStdioServerConfig] = {}
+    ) -> Dict[str, Any]:
+        from cursor_sdk import StdioMcpServerConfig
+
+        mcp_servers: Dict[str, StdioMcpServerConfig] = {}
         for server_name in server_names:
             normalized_name = self._normalize_mcp_server_name(server_name)
             config = DEFAULT_MCP_SERVERS.get(normalized_name)
             if config is None or not config.enabled:
                 continue
 
-            mcp_servers[normalized_name] = {
-                "type": "stdio",
-                "command": config.command,
-                "args": config.args,
-                "env": config.env,
-            }
-        return mcp_servers
-
-    def _create_sdk_client(self, agent_type: AgentType) -> ClaudeSDKClient:
-        """Create a fresh SDK client for each invocation.
-
-        ClaudeSDKClient instances cannot safely service concurrent background tasks.
-        Reusing them causes overlapping reads against the same subprocess transport.
-        """
-        if ClaudeSDKClient is None:
-            raise RuntimeError(
-                "Claude Agent SDK is not installed in this environment. "
-                "Run the gateway with deterministic fallback mode or install the SDK from the internal source."
+            mcp_servers[normalized_name] = StdioMcpServerConfig(
+                command=config.command,
+                args=config.args,
+                env=config.env or None,
             )
-        agent_def = self.agents.get(agent_type)
-        if agent_def is None:
-            raise ValueError(f"Agent not found: {agent_type}")
-        runtime_policy = resolve_runtime_policy()
-        if not runtime_policy.runtime_available:
-            raise RuntimeError(runtime_policy.blocked_reason or "Claude Agent runtime is unavailable for AadhaarChain.")
-
-        options_kwargs: Dict[str, Any] = {
-            "system_prompt": agent_def.system_prompt,
-            "mcp_servers": self._build_mcp_servers(agent_def.mcp_servers or []),
-            "cwd": self.repo_root,
-            "model": runtime_policy.model,
-            "allowed_tools": agent_def.tools or [],
-            "permission_mode": "default",
-        }
-        # Older pinned SDK builds do not expose cli_path; fall back to PATH resolution there.
-        if "cli_path" in inspect.signature(ClaudeAgentOptions).parameters:
-            options_kwargs["cli_path"] = runtime_policy.claude_code_executable_path
-
-        return ClaudeSDKClient(
-            options=ClaudeAgentOptions(**options_kwargs)
-        )
+        return mcp_servers
 
     def _build_deterministic_fallback_provenance(
         self,
@@ -519,38 +465,6 @@ class AgentManager:
             "recommendation": recommendation,
         }
 
-    def _append_tool_result(
-        self,
-        tools: list[AgentToolTrace],
-        tool_use_id_to_name: Dict[str, str],
-        tool_use_id: str,
-        content: str | list[dict[str, Any]] | None,
-        is_error: Optional[bool],
-    ) -> None:
-        tool_name = tool_use_id_to_name.get(tool_use_id, tool_use_id)
-        preview = self._preview_tool_content(content)
-        tool_status = "failed" if is_error else "completed"
-        tools.append(
-            AgentToolTrace(
-                tool_name=tool_name,
-                status=tool_status,
-                output_preview=preview,
-            )
-        )
-
-    def _preview_tool_content(
-        self,
-        content: str | list[dict[str, Any]] | None,
-    ) -> Optional[str]:
-        if content is None:
-            return None
-        if isinstance(content, str):
-            return content[:240]
-        try:
-            return json.dumps(content)[:240]
-        except TypeError:
-            return str(content)[:240]
-
     def _extract_json_payload(self, response_text: Optional[str]) -> Optional[Dict[str, Any]]:
         if not response_text:
             return None
@@ -570,75 +484,63 @@ class AgentManager:
                 return parsed
         return None
 
+    async def _invoke_via_cursor(
+        self,
+        agent_type: AgentType,
+        prompt: str,
+        started_at: str,
+        agent_id: str,
+    ) -> tuple[Optional[Dict[str, Any]], AgentRunProvenance]:
+        agent_def = self.agents.get(agent_type)
+        if agent_def is None:
+            raise ValueError(f"Agent not found: {agent_type}")
+
+        from cursor_agent_runtime.prompt import run_cursor_prompt
+
+        runtime_policy = resolve_runtime_policy()
+        response_text, _ = await asyncio.to_thread(
+            run_cursor_prompt,
+            prompt,
+            cwd=self.repo_root,
+            system_prompt=agent_def.system_prompt,
+            mcp_servers=self._build_mcp_servers(agent_def.mcp_servers or []),
+            model=runtime_policy.model,
+        )
+        payload = self._extract_json_payload(response_text)
+        status = "completed" if payload is not None else "missing_contract"
+        provenance = AgentRunProvenance(
+            agent_id=agent_id,
+            status=status,
+            started_at=started_at,
+            completed_at=self._timestamp(),
+            model=runtime_policy.model,
+            session_id=None,
+            tools=[],
+            response_preview=response_text[:400] if response_text else None,
+            structured_output=payload,
+            error=None if payload is not None else "Agent response did not contain a parseable JSON contract.",
+        )
+        return payload, provenance
+
     async def invoke_agent(
         self,
         agent_type: AgentType,
         prompt: str,
     ) -> tuple[Optional[Dict[str, Any]], AgentRunProvenance]:
-        """Invoke an agent via SDK and return parsed JSON plus provenance."""
+        """Invoke an agent via the Cursor SDK and return parsed JSON plus provenance."""
         started_at = self._timestamp()
-        tools: list[AgentToolTrace] = []
-        tool_use_id_to_name: Dict[str, str] = {}
-        response_fragments: list[str] = []
-        model: Optional[str] = None
-        session_id: Optional[str] = None
-        structured_output: Optional[Dict[str, Any]] = None
         agent_id = agent_type.value
 
+        runtime_policy = resolve_runtime_policy()
+        if not runtime_policy.runtime_available:
+            return None, self._failed_provenance(
+                agent_id,
+                started_at,
+                runtime_policy.blocked_reason or "Cursor agent runtime is unavailable for AadhaarChain.",
+            )
+
         try:
-            client = self._create_sdk_client(agent_type)
-            await client.connect()
-            try:
-                await client.query(prompt)
-
-                async for message in client.receive_response():
-                    if isinstance(message, AssistantMessage):
-                        model = message.model or model
-                        for block in message.content:
-                            if isinstance(block, TextBlock):
-                                response_fragments.append(block.text)
-                            elif isinstance(block, ToolUseBlock):
-                                tool_use_id_to_name[block.id] = block.name
-                                tools.append(
-                                    AgentToolTrace(
-                                        tool_name=block.name,
-                                        status="requested",
-                                    )
-                                )
-                            elif isinstance(block, ToolResultBlock):
-                                self._append_tool_result(
-                                    tools,
-                                    tool_use_id_to_name,
-                                    block.tool_use_id,
-                                    block.content,
-                                    block.is_error,
-                                )
-                    elif isinstance(message, ResultMessage):
-                        session_id = message.session_id
-                        if isinstance(message.structured_output, dict):
-                            structured_output = message.structured_output
-                        if message.result:
-                            response_fragments.append(message.result)
-
-                response_text = "\n".join(fragment.strip() for fragment in response_fragments if fragment.strip()) or None
-                payload = structured_output or self._extract_json_payload(response_text)
-                status = "completed" if payload is not None else "missing_contract"
-
-                provenance = AgentRunProvenance(
-                    agent_id=agent_id,
-                    status=status,
-                    started_at=started_at,
-                    completed_at=self._timestamp(),
-                    model=model,
-                    session_id=session_id,
-                    tools=tools,
-                    response_preview=response_text[:400] if response_text else None,
-                    structured_output=payload,
-                    error=None if payload is not None else "Agent response did not contain a parseable JSON contract.",
-                )
-                return payload, provenance
-            finally:
-                await client.disconnect()
+            return await self._invoke_via_cursor(agent_type, prompt, started_at, agent_id)
         except Exception as exc:
             return None, self._failed_provenance(agent_id, started_at, str(exc))
 
@@ -1179,6 +1081,13 @@ Return only JSON with this exact shape:
         self._record_step(status, VerificationStep.blockchain_upload, 0.8)
         metadata = self._build_metadata(document_type, document, fraud, compliance)
 
+        if metadata.decision == "approve":
+            metadata = await self._submit_on_chain_verification(
+                wallet_address=wallet_address,
+                document_type=document_type,
+                metadata=metadata,
+            )
+
         await self.complete_verification(
             verification_id,
             metadata.decision,
@@ -1266,6 +1175,32 @@ Return only JSON with this exact shape:
             details=f"Verification completed with decision={metadata.decision}.",
         )
         self._notify_state_changed()
+
+    async def _submit_on_chain_verification(
+        self,
+        wallet_address: str,
+        document_type: str,
+        metadata: VerificationMetadata,
+    ) -> VerificationMetadata:
+        """Submit an approved verification to the identity-registry program."""
+        from app.solana_bridge import get_solana_bridge
+
+        bridge = get_solana_bridge()
+        if not bridge.is_enabled:
+            return metadata
+
+        try:
+            signature = await bridge.submit_approved_verification(wallet_address, document_type)
+            metadata.chain_transaction_signature = signature
+            return metadata
+        except Exception as exc:  # noqa: BLE001
+            return metadata.model_copy(
+                update={
+                    "decision": "manual_review",
+                    "reason": f"On-chain verification upload failed: {exc}",
+                    "chain_transaction_signature": None,
+                }
+            )
 
     async def cleanup_expired_verifications(self, days: int = 7) -> int:
         """Clean up old verification records."""

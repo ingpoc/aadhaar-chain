@@ -4,10 +4,9 @@
 
 Repo-local guidance for `aadhaar-chain` only.
 
-**Portfolio QA / browser / same-wallet control owner:** `qa/docs/workflow/`  
-Entry: `qa/docs/workflow/README.md` → then control plane → acceptance loop.
+**Product goal:** [`GOAL.md`](GOAL.md) — privacy-preserving trust platform; AgentGuard is the flagship (bounded AI-agent authorization). Portfolio thesis: workspace root [`PRODUCTIDEA.md`](../PRODUCTIDEA.md).
 
-There is no parent `../AGENTS.md` in this multi-repo checkout. Do not invent one. Do not create parallel portfolio workflow docs elsewhere.
+**Portfolio QA / browser / same-wallet control owner:** workspace root `AGENTS.md` + `.cursor/skills/portfolio-browser/`.
 
 ## Portfolio testing (pointer only)
 
@@ -16,7 +15,7 @@ There is no parent `../AGENTS.md` in this multi-repo checkout. Do not invent one
 - Session friction → `qa/docs/workflow/session-friction-log.md`
 - Runners: `qa/` only (`grade:deterministic`, `grade:browser`, `grade:wallet`)
 - AadhaarChain is the first browser checkpoint; downstream trust consumers depend on its identity/trust state
-- Critical routes: `/`, `/dashboard`, `/identity/create`, `/verify/aadhaar`, `/verify/pan`, `/credentials`, `/settings`
+- Critical routes: `/`, `/home`, `/verify`, `/login`, `/activity`, `/settings`
 - Confirm frontend (43100) + gateway (43101) healthy before product conclusions
 
 ## Agent SDK Integration

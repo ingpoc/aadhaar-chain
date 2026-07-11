@@ -17,6 +17,7 @@ import { Input } from '@/components/ui/input';
 import { KeyValueList } from '@/components/ui/key-value-list';
 import { Label } from '@/components/ui/label';
 import { Notice } from '@/components/ui/notice';
+import { SOLANA_RPC_URL, resolveSolanaNetworkLabel } from '@/lib/wallet';
 
 export default function SettingsPage() {
   const { connected, publicKey } = useWallet();
@@ -109,7 +110,7 @@ export default function SettingsPage() {
                     },
                     {
                       label: 'Network',
-                      value: 'Solana Devnet',
+                      value: resolveSolanaNetworkLabel(),
                     },
                   ]}
                 />
@@ -202,14 +203,12 @@ export default function SettingsPage() {
                 items={[
                   {
                     label: 'RPC endpoint',
-                    value:
-                      process.env.NEXT_PUBLIC_SOLANA_RPC_URL ??
-                      'https://api.devnet.solana.com',
+                    value: SOLANA_RPC_URL,
                     valueClassName: 'font-mono text-xs md:text-sm',
                   },
                   {
                     label: 'Network',
-                    value: 'Devnet',
+                    value: resolveSolanaNetworkLabel(),
                   },
                 ]}
               />

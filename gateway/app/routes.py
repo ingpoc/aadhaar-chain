@@ -1,10 +1,11 @@
 """Routes for identity operations with agent integration."""
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, Response, UploadFile
+from pydantic import BaseModel, Field
 import json
 import secrets
 from time import monotonic
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 from solders.pubkey import Pubkey
 from solders.signature import Signature
 
@@ -46,8 +47,24 @@ from app.models import (
 
 from app.agent_manager import agent_manager
 from app.evidence_store import store_encrypted_evidence
+from app.session_auth import create_session_token, set_session_cookie
+from app.setu_ekyc import (
+    create_ekyc_request,
+    get_ekyc_request,
+    load_ekyc_link,
+    save_ekyc_link,
+    setu_ekyc_configured,
+)
 from app.state_store import append_audit_event, save_gateway_state
 from config import settings
+
+
+class SetuEkycStartRequest(BaseModel):
+    consent_provided: bool = False
+
+
+class SetuEkycSyncRequest(BaseModel):
+    setu_id: str = Field(min_length=8)
 
 
 # Runtime stores hydrated on startup.
@@ -65,7 +82,338 @@ def persist_runtime_state() -> None:
 agent_manager.set_state_change_callback(persist_runtime_state)
 
 
+async def _apply_on_chain_verification_bitmap(
+    wallet_address: str,
+    document_type: str,
+    chain_signature: Optional[str],
+) -> None:
+    """Sync local trust bitmap after a confirmed on-chain verification update."""
+    from app.solana_bridge import verification_bit
+
+    identity = identities.get(wallet_address)
+    if identity is None:
+        return
+
+    identity.verification_bitmap |= verification_bit(document_type)
+    identity.updated_at = _get_timestamp()
+    persist_runtime_state()
+    if chain_signature:
+        append_audit_event(
+            "blockchain_upload",
+            wallet_address,
+            target_id=identity.did,
+            target_type="identity_anchor",
+            details=f"On-chain verification bitmap updated ({document_type}): {chain_signature}",
+        )
+
+
+def _register_solana_bridge_hooks() -> None:
+    from app.solana_bridge import get_solana_bridge
+
+    get_solana_bridge().set_on_chain_approved_handler(_apply_on_chain_verification_bitmap)
+
+
+_register_solana_bridge_hooks()
+
+
 router = APIRouter(prefix="/api/identity", tags=["identity"])
+
+
+# --- Setu.co Aadhaar eKYC (env-gated) ---
+
+
+@router.get("/ekyc/config", response_model=ApiResponse, tags=["identity"])
+async def get_ekyc_config():
+    """Frontend feature flag: live Setu eKYC vs demo upload path."""
+    return ApiResponse(
+        success=True,
+        data={
+            "provider": "setu_ekyc",
+            "enabled": setu_ekyc_configured(),
+            "base_url": settings.setu_ekyc_base_url if setu_ekyc_configured() else None,
+        },
+    )
+
+
+@router.post("/{wallet_address}/aadhaar/ekyc/start", response_model=ApiResponse, tags=["identity"])
+async def start_setu_aadhaar_ekyc(
+    wallet_address: str,
+    body: SetuEkycStartRequest,
+):
+    """Create Setu eKYC request and return hosted kycURL for OTP flow."""
+    if not setu_ekyc_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Setu eKYC is not configured. Set SETU_EKYC_* in gateway .env.",
+        )
+    if wallet_address not in identities:
+        raise HTTPException(status_code=404, detail="Identity anchor not found")
+    if not body.consent_provided:
+        raise HTTPException(status_code=400, detail="Consent is required for Aadhaar eKYC.")
+
+    _enforce_verification_rate_limit(wallet_address)
+
+    verification_id = await agent_manager.create_verification(wallet_address, "aadhaar", None)
+    await agent_manager.update_verification_progress(
+        verification_id,
+        VerificationStep.document_received,
+        0.15,
+    )
+
+    webhook_url = f"{settings.public_gateway_url.rstrip('/')}/api/identity/webhooks/setu/ekyc"
+    redirection_url = (
+        f"{settings.public_web_url.rstrip('/')}/verify"
+        f"?ekyc=setu&wallet={wallet_address}"
+    )
+
+    try:
+        setu_payload = create_ekyc_request(
+            webhook_url=webhook_url,
+            redirection_url=redirection_url,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    setu_id = str(setu_payload.get("id") or "")
+    kyc_url = str(setu_payload.get("kycURL") or setu_payload.get("kycUrl") or "")
+    if not setu_id or not kyc_url:
+        raise HTTPException(status_code=502, detail="Setu eKYC response missing id/kycURL")
+
+    save_ekyc_link(
+        setu_id=setu_id,
+        wallet_address=wallet_address,
+        verification_id=verification_id,
+    )
+    append_audit_event(
+        "verification_requested",
+        wallet_address,
+        target_id=verification_id,
+        target_type="aadhaar_ekyc",
+        details=f"Setu eKYC started setu_id={setu_id}.",
+    )
+    append_audit_event(
+        "consent_recorded",
+        wallet_address,
+        target_id=verification_id,
+        target_type="consent_record",
+        details="Aadhaar eKYC consent granted before Setu redirect.",
+    )
+
+    return ApiResponse(
+        success=True,
+        message="Setu eKYC request created",
+        data={
+            "verification_id": verification_id,
+            "setu_id": setu_id,
+            "kyc_url": kyc_url,
+            "status": setu_payload.get("status") or "CREATED",
+        },
+    )
+
+
+@router.post("/webhooks/setu/ekyc", response_model=ApiResponse, tags=["identity"])
+async def setu_ekyc_webhook(request: Request):
+    """Receive Setu EKYC_DATA webhook and complete local verification."""
+    try:
+        payload = await request.json()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        data = payload if isinstance(payload, dict) else {}
+    setu_id = str(data.get("id") or "")
+    if not setu_id:
+        raise HTTPException(status_code=400, detail="Missing Setu request id")
+
+    result = await _finalize_setu_ekyc(setu_id, data)
+    return ApiResponse(success=True, message="Webhook processed", data=result)
+
+
+@router.post("/ekyc/sync", response_model=ApiResponse, tags=["identity"])
+async def sync_setu_ekyc(body: SetuEkycSyncRequest):
+    """Poll Setu and finalize after browser redirect (webhook may lag)."""
+    if not setu_ekyc_configured():
+        raise HTTPException(status_code=503, detail="Setu eKYC is not configured.")
+    try:
+        remote = get_ekyc_request(body.setu_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    result = await _finalize_setu_ekyc(body.setu_id, remote)
+    return ApiResponse(success=True, message="Sync processed", data=result)
+
+
+async def _finalize_setu_ekyc(setu_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    link = load_ekyc_link(setu_id)
+    if link is None:
+        raise HTTPException(status_code=404, detail="Unknown Setu eKYC request id")
+
+    verification_id = link["verification_id"]
+    wallet_address = link["wallet_address"]
+    status = str(payload.get("status") or "").upper()
+
+    existing = await agent_manager.get_verification_status(verification_id)
+    if existing and existing.status in {"verified", "failed", "manual_review"}:
+        return {
+            "verification_id": verification_id,
+            "wallet_address": wallet_address,
+            "setu_id": setu_id,
+            "status": existing.status,
+            "setu_status": status,
+        }
+
+    if status in {"CREATED", "KYC_REQUESTED", "PENDING", ""}:
+        await agent_manager.update_verification_progress(
+            verification_id,
+            VerificationStep.parsing,
+            0.4,
+        )
+        return {
+            "verification_id": verification_id,
+            "wallet_address": wallet_address,
+            "setu_id": setu_id,
+            "status": "processing",
+            "setu_status": status or "PENDING",
+        }
+
+    if status == "SUCCESS":
+        metadata = _build_setu_success_metadata(setu_id, payload)
+        await agent_manager.complete_verification(verification_id, "approve", metadata)
+        append_audit_event(
+            "verification_decision",
+            wallet_address,
+            target_id=verification_id,
+            target_type="aadhaar_ekyc",
+            details=f"Setu eKYC SUCCESS setu_id={setu_id}.",
+        )
+        return {
+            "verification_id": verification_id,
+            "wallet_address": wallet_address,
+            "setu_id": setu_id,
+            "status": "verified",
+            "setu_status": status,
+        }
+
+    metadata = _build_setu_failure_metadata(setu_id, payload, status)
+    await agent_manager.complete_verification(verification_id, "reject", metadata)
+    return {
+        "verification_id": verification_id,
+        "wallet_address": wallet_address,
+        "setu_id": setu_id,
+        "status": "failed",
+        "setu_status": status,
+    }
+
+
+def _format_setu_address(address: Any) -> Optional[str]:
+    if not isinstance(address, dict):
+        return None
+    parts = [
+        address.get("house"),
+        address.get("street"),
+        address.get("locality"),
+        address.get("landmark"),
+        address.get("vtc"),
+        address.get("district"),
+        address.get("state"),
+        address.get("pin"),
+        address.get("country"),
+    ]
+    joined = ", ".join(str(part).strip() for part in parts if part)
+    return joined or None
+
+
+def _build_setu_success_metadata(setu_id: str, payload: dict[str, Any]) -> VerificationMetadata:
+    aadhaar = payload.get("aadhaar") if isinstance(payload.get("aadhaar"), dict) else {}
+    extracted = {
+        "name": aadhaar.get("name"),
+        "dob": aadhaar.get("dateOfBirth"),
+        "gender": aadhaar.get("gender"),
+        "uid_masked": aadhaar.get("aadhaarNumber") or aadhaar.get("maskedAadhaarNumber"),
+        "address": _format_setu_address(aadhaar.get("address")),
+        "setu_id": setu_id,
+        "provider": "setu_ekyc",
+    }
+    return VerificationMetadata(
+        decision="approve",
+        reason="Setu Aadhaar eKYC completed successfully.",
+        evidence_status="complete",
+        document=DocumentVerificationEvidence(
+            document_type="aadhaar",
+            input_kind="request_payload",
+            source=DocumentEvidenceSource(transport="request_payload"),
+            extracted_fields={k: v for k, v in extracted.items() if v is not None},
+            submitted_claims={"consent_provided": True, "provider": "setu_ekyc"},
+            confidence=0.99,
+            warnings=[],
+            required_fields=["name"],
+            missing_fields=[],
+            provenance=_fixture_provenance("setu-ekyc"),
+            gaps=[],
+        ),
+        fraud=FraudVerificationEvidence(
+            risk_score=0.05,
+            risk_level="low",
+            indicators=[],
+            recommendation="approve",
+            provenance=_fixture_provenance("setu-ekyc"),
+            gaps=[],
+        ),
+        compliance=ComplianceVerificationEvidence(
+            aadhaar_act_compliant=True,
+            dpdp_compliant=True,
+            violations=[],
+            recommendation="approve",
+            provenance=_fixture_provenance("setu-ekyc"),
+            gaps=[],
+        ),
+        blocking_gaps=[],
+        assumptions=["Aadhaar OTP verification performed by Setu.co; gateway stores masked fields only."],
+    )
+
+
+def _build_setu_failure_metadata(
+    setu_id: str,
+    payload: dict[str, Any],
+    status: str,
+) -> VerificationMetadata:
+    reason = str(payload.get("error") or payload.get("message") or f"Setu eKYC ended with status={status}")
+    return VerificationMetadata(
+        decision="reject",
+        reason=reason,
+        evidence_status="partial",
+        document=DocumentVerificationEvidence(
+            document_type="aadhaar",
+            input_kind="request_payload",
+            source=DocumentEvidenceSource(transport="request_payload"),
+            extracted_fields={"setu_id": setu_id, "provider": "setu_ekyc", "setu_status": status},
+            submitted_claims={"consent_provided": True, "provider": "setu_ekyc"},
+            confidence=None,
+            warnings=[reason],
+            required_fields=["name"],
+            missing_fields=["name"],
+            provenance=_fixture_provenance("setu-ekyc"),
+            gaps=[],
+        ),
+        fraud=FraudVerificationEvidence(
+            risk_score=None,
+            risk_level=None,
+            indicators=[],
+            recommendation="block",
+            provenance=_fixture_provenance("setu-ekyc"),
+            gaps=[],
+        ),
+        compliance=ComplianceVerificationEvidence(
+            aadhaar_act_compliant=None,
+            dpdp_compliant=None,
+            violations=[],
+            recommendation="block",
+            provenance=_fixture_provenance("setu-ekyc"),
+            gaps=[],
+        ),
+        blocking_gaps=[],
+        assumptions=[],
+    )
 
 
 # --- Verification Routes with Agent Integration ---
@@ -244,16 +592,24 @@ async def issue_identity_proof_token(
     wallet_address: str,
     data: IdentityProofTokenRequest,
 ):
-    """Issue a signed-message challenge for downstream buyer/seller proof."""
-    if wallet_address not in identities:
-        raise HTTPException(status_code=404, detail="Identity anchor not found")
+    """Issue a signed-message challenge for downstream buyer/seller proof or SSO login."""
+    is_sso_login = data.purpose == "sso_login"
 
-    trust_surface = _build_trust_surface(identities[wallet_address])
-    if trust_surface.trust_state != "verified":
-        raise HTTPException(
-            status_code=403,
-            detail="Verified AadhaarChain trust is required before issuing an identity proof token.",
-        )
+    if is_sso_login:
+        if wallet_address in identities:
+            trust_surface = _build_trust_surface(identities[wallet_address])
+        else:
+            trust_surface = _build_no_identity_trust_surface(wallet_address)
+    else:
+        if wallet_address not in identities:
+            raise HTTPException(status_code=404, detail="Identity anchor not found")
+
+        trust_surface = _build_trust_surface(identities[wallet_address])
+        if trust_surface.trust_state != "verified":
+            raise HTTPException(
+                status_code=403,
+                detail="Verified AadhaarChain trust is required before issuing an identity proof token.",
+            )
 
     token = _build_identity_proof_token(wallet_address, data, trust_surface)
     identity_proof_tokens[token.token_id] = token
@@ -262,7 +618,7 @@ async def issue_identity_proof_token(
         wallet_address,
         target_id=token.token_id,
         target_type="identity_proof_token",
-        details=f"Issued {data.audience} identity proof token.",
+        details=f"Issued {data.audience} identity proof token ({data.purpose}).",
     )
     return ApiResponse(
         success=True,
@@ -274,9 +630,11 @@ async def issue_identity_proof_token(
 @router.post("/proof-token/verify", response_model=ApiResponse, tags=["identity"])
 async def verify_identity_proof_token(
     data: SignedIdentityProofRequest,
+    response: Response,
 ):
     """Verify a wallet signature over an AadhaarChain proof token."""
     result = _verify_signed_identity_proof(data)
+    token = identity_proof_tokens.get(data.token_id)
     append_audit_event(
         "identity_proof_token_verified" if result.valid else "identity_proof_token_rejected",
         data.wallet_address,
@@ -284,6 +642,29 @@ async def verify_identity_proof_token(
         target_type="identity_proof_token",
         details=result.reason,
     )
+
+    if result.valid and token is not None and token.purpose == "sso_login":
+        did = _build_did(data.wallet_address)
+        if data.wallet_address in identities:
+            did = identities[data.wallet_address].did
+        else:
+            if settings.aadhaar_chain_env == "demo":
+                _seed_trust_fixture(data.wallet_address, "verified", "aadhaar")
+                did = identities[data.wallet_address].did
+        session_token = create_session_token(
+            wallet_address=data.wallet_address,
+            did=did,
+            audience=token.audience,
+        )
+        set_session_cookie(response, session_token)
+        append_audit_event(
+            "identity_session_created",
+            data.wallet_address,
+            target_id=data.token_id,
+            target_type="identity_session",
+            details=f"Portfolio SSO session issued for audience={token.audience}.",
+        )
+
     return ApiResponse(
         success=result.valid,
         message=result.reason,
@@ -426,10 +807,33 @@ async def create_identity(
         details="Wallet-bound identity anchor created.",
     )
 
+    unsigned_transaction: Optional[str] = None
+    if settings.solana_on_chain_enabled:
+        from app.solana_bridge import get_solana_bridge
+
+        bridge = get_solana_bridge()
+        metadata_uri = f"aadhaarchain://commitment/{data.commitment}"
+        try:
+            unsigned_transaction = await bridge.build_create_identity_transaction(
+                wallet_address,
+                identity.did,
+                metadata_uri,
+            )
+        except Exception as exc:  # noqa: BLE001
+            identities.pop(wallet_address, None)
+            persist_runtime_state()
+            raise HTTPException(
+                status_code=503,
+                detail=f"Failed to prepare on-chain identity transaction: {exc}",
+            ) from exc
+
     return ApiResponse(
         success=True,
         message="Identity created",
-        data=CreateIdentityResponse(identity=identity).model_dump()
+        data=CreateIdentityResponse(
+            identity=identity,
+            signature=unsigned_transaction,
+        ).model_dump(),
     )
 
 
@@ -554,13 +958,25 @@ async def decide_review(
     status.updated_at = _get_timestamp()
     status.metadata.reason = data.reason
     if data.decision == "approve":
-        status.status = "verified"
-        status.error = None
-        status.metadata.decision = "approve"
-        identity = identities.get(status.wallet_address)
-        if identity:
-            identity.verification_bitmap = max(identity.verification_bitmap, 1)
-            identity.updated_at = status.updated_at
+        document_type = "aadhaar" if verification_id.startswith("aadhaar_") else "pan"
+        if status.metadata is not None:
+            approving_metadata = status.metadata.model_copy(
+                update={"decision": "approve", "reason": data.reason},
+            )
+            status.metadata = await agent_manager._submit_on_chain_verification(
+                status.wallet_address,
+                document_type,
+                approving_metadata,
+            )
+        if status.metadata and status.metadata.decision == "approve":
+            status.status = "verified"
+            status.error = None
+            status.metadata.decision = "approve"
+        else:
+            status.status = "manual_review"
+            status.error = status.metadata.reason if status.metadata else data.reason
+            if status.metadata:
+                status.metadata.decision = "manual_review"
     elif data.decision == "reject":
         status.status = "failed"
         status.error = data.reason
@@ -931,8 +1347,7 @@ def _build_fixture_metadata(fixture_state: str, document_type: str) -> Verificat
 
 def _get_timestamp() -> str:
     """Get current timestamp in ISO format."""
-    from datetime import datetime
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _build_did(wallet_address: str) -> str:

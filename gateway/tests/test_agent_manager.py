@@ -220,34 +220,32 @@ def test_validate_document_reports_processor_runtime_failure() -> None:
     assert any(gap.code == "document_processor_failed" for gap in evidence.gaps)
 
 
-def test_create_sdk_client_returns_distinct_instances_per_call() -> None:
+def test_invoke_agent_routes_through_cursor_runtime() -> None:
     manager = AgentManager()
     asyncio.run(manager.initialize_agents())
-    created_clients = []
-
-    class FakeClient:
-        def __init__(self, options):
-            self.options = options
-            created_clients.append(self)
 
     runtime_policy = SimpleNamespace(
         runtime_available=True,
-        auth_mode="local_cli",
-        model="claude-haiku-4-5-20251001",
+        provider="cursor",
+        model="composer-2.5",
         blocked_reason=None,
-        claude_code_executable_path="/tmp/fake-claude",
     )
+    expected_provenance = _provenance("document-validator", model="composer-2.5")
 
-    with patch("app.agent_manager.ClaudeSDKClient", FakeClient), patch(
+    async def fake_invoke_via_cursor(agent_type, prompt, started_at, agent_id):
+        del agent_type, prompt, started_at, agent_id
+        return {"risk_score": 0.1}, expected_provenance
+
+    with patch.object(manager, "_invoke_via_cursor", side_effect=fake_invoke_via_cursor), patch(
         "app.agent_manager.resolve_runtime_policy",
         return_value=runtime_policy,
     ):
-        first = manager._create_sdk_client(AgentType.DOCUMENT_VALIDATOR)
-        second = manager._create_sdk_client(AgentType.DOCUMENT_VALIDATOR)
+        payload, provenance = asyncio.run(
+            manager.invoke_agent(AgentType.DOCUMENT_VALIDATOR, "Return JSON contract")
+        )
 
-    assert first is not second
-    assert len(created_clients) == 2
-    assert created_clients[0].options.model == "claude-haiku-4-5-20251001"
+    assert payload == {"risk_score": 0.1}
+    assert provenance.model == "composer-2.5"
 
 
 def test_detect_fraud_falls_back_to_deterministic_contract_when_agent_returns_none() -> None:

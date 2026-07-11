@@ -39,12 +39,8 @@ type NavLink = {
 };
 
 const links: NavLink[] = [
-  { href: '/dashboard', label: 'Dashboard' },
-  { href: '/identity/create', label: 'Create Identity' },
-  { href: '/verify/aadhaar', label: 'Verify Aadhaar' },
-  { href: '/verify/pan', label: 'Verify PAN' },
-  { href: '/credentials', label: 'Credentials' },
-  { href: '/usecase.html#agents', label: 'Use Case', external: true },
+  { href: '/home', label: 'Home' },
+  { href: '/activity', label: 'Activity' },
   { href: '/settings', label: 'Settings' },
 ];
 
@@ -62,7 +58,9 @@ export function Navbar() {
             </Link>
             <div className="hidden items-center gap-2 rounded-full border border-border/70 bg-card/80 p-1 md:flex">
               {links.map((link) => {
-                const isActive = pathname === link.href;
+                const isActive =
+                  pathname === link.href ||
+                  (link.href === '/home' && pathname === '/dashboard');
                 if (link.external) {
                   return (
                     <a
@@ -116,7 +114,9 @@ export function Navbar() {
                 </SheetHeader>
                 <div className="mt-8 flex flex-col gap-2 px-6 pb-6">
                   {links.map((link) => {
-                    const isActive = pathname === link.href;
+                    const isActive =
+                  pathname === link.href ||
+                  (link.href === '/home' && pathname === '/dashboard');
                     if (link.external) {
                       return (
                         <a

@@ -1,8 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 cd "$(dirname "$0")/../gateway"
-source venv/bin/activate
-if [ -d "tests" ]; then
-    pytest tests/ -v
-else
-    echo "No tests directory found"
-fi
+.venv/bin/python -m pytest tests/ -q "$@"

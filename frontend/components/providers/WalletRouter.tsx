@@ -4,7 +4,7 @@ import { useEffect } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { useRouter, usePathname } from 'next/navigation';
 
-// Public routes where wallet connection should redirect to dashboard
+// Public routes where a connected wallet should leave for /home
 const PUBLIC_ROUTES = [
   '/',
 ];
@@ -20,8 +20,8 @@ export function WalletRouter() {
     if (connected && isPublicRoute) {
       // Auto-connected wallets briefly report disconnected during hydration.
       // Redirecting protected routes during that window traps the user in
-      // a "/" -> "/dashboard" loop, so only redirect the landing page.
-      router.replace('/dashboard');
+      // a "/" -> "/home" loop, so only redirect the landing page.
+      router.replace('/home');
     }
   }, [connected, pathname, router]);
 

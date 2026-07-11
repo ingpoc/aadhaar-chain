@@ -3,7 +3,7 @@ from typing import Optional, Dict, Any, List
 
 
 class AgentDefinition:
-    """Claude Agent SDK agent definition."""
+    """Cursor SDK agent definition."""
     
     def __init__(
         self,
@@ -396,7 +396,7 @@ Your role is to coordinate verification workflows by orchestrating specialist ag
 - compliance-monitor: For Aadhaar Act and DPDP compliance validation
 
 ## Available Tools
-- Task: Create and manage subagent invocations (Claude Agent SDK)
+- Task: Create and manage subagent invocations (Cursor SDK)
 - Context Graph: Query past decisions and store new ones
 - All MCP tools from document-validator, fraud-detection, compliance-monitor
 

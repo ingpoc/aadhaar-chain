@@ -1,5 +1,7 @@
 """FastAPI gateway for aadhaar-chain identity platform."""
-from fastapi import FastAPI
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -13,40 +15,21 @@ from app.models import (
     VerificationStep,
     ApiResponse,
 )
-from app.routes import router as identity_router, identities
+from app.routes import router as identity_router, identities, _build_did
+from app.agentguard_routes import router as agentguard_router
 from app.agent_manager import agent_manager
 from app.runtime_config import resolve_runtime_policy
+from app.session_auth import (
+    SESSION_COOKIE_NAME,
+    clear_session_cookie,
+    parse_session_token,
+)
 from app.state_store import load_gateway_state
 
 
-# Create FastAPI app
-app = FastAPI(
-    title=settings.app_name,
-    description="Gateway for identity & asset tokenization platform",
-    version="1.0.0",
-    docs_url="/api/docs",
-    redoc_url="/api/redoc",
-)
-
-
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=settings.cors_allow_credentials,
-    allow_methods=settings.cors_allow_methods,
-    allow_headers=settings.cors_allow_headers,
-)
-
-
-# Include identity router (no prefix, router already has prefix)
-app.include_router(identity_router)
-
-
-# Startup event: Initialize agents
-@app.on_event("startup")
-async def startup_event():
-    """Initialize Claude Agent SDK and agents on startup."""
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Initialize agents and load persisted state on startup."""
     apply_runtime_environment()
     validate_runtime_storage_config()
     persisted_identities, persisted_verifications = load_gateway_state()
@@ -63,15 +46,43 @@ async def startup_event():
             f"verifications={len(persisted_verifications)})"
         )
     if runtime_policy.runtime_available:
+        provider = getattr(runtime_policy, "provider", "cursor")
         print(
-            "✓ AadhaarChain Claude Agent runtime ready "
-            f"(auth={runtime_policy.auth_mode}, model={runtime_policy.model})"
+            f"✓ AadhaarChain agent runtime ready "
+            f"(provider={provider}, auth={runtime_policy.auth_mode}, model={runtime_policy.model})"
         )
     else:
         print(
-            "⚠ AadhaarChain Claude Agent runtime unavailable: "
+            "⚠ AadhaarChain agent runtime unavailable: "
             f"{runtime_policy.blocked_reason}"
         )
+    yield
+
+
+# Create FastAPI app
+app = FastAPI(
+    title=settings.app_name,
+    description="Gateway for AadhaarChain identity trust and AgentGuard authorization",
+    version="1.0.0",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    lifespan=lifespan,
+)
+
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=settings.cors_allow_credentials,
+    allow_methods=settings.cors_allow_methods,
+    allow_headers=settings.cors_allow_headers,
+)
+
+
+# Include identity router (no prefix, router already has prefix)
+app.include_router(identity_router)
+app.include_router(agentguard_router)
 
 
 # Health check endpoint
@@ -92,26 +103,55 @@ async def api_health_check() -> JSONResponse:
 
 
 @app.get("/api/auth/me", tags=["auth"])
-async def auth_me() -> JSONResponse:
-    """Legacy auth compatibility endpoint for buyer/seller public deployments."""
+async def auth_me(request: Request) -> JSONResponse:
+    """Return the authenticated portfolio user from the session cookie."""
+    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    if session is None:
+        return JSONResponse(
+            {
+                "success": True,
+                "message": "No authenticated identity session.",
+                "data": None,
+            }
+        )
+
     return JSONResponse(
         {
             "success": True,
-            "message": "Public deployment has no authenticated identity session.",
-            "data": None,
+            "message": "Authenticated identity session active.",
+            "data": {
+                "wallet_address": session["wallet_address"],
+                "did": session.get("did") or _build_did(session["wallet_address"]),
+            },
         }
     )
 
 
 @app.get("/api/auth/validate", tags=["auth"])
-async def auth_validate() -> JSONResponse:
-    """Legacy auth validation endpoint for buyer/seller public deployments."""
+async def auth_validate(request: Request) -> JSONResponse:
+    """Validate the current session cookie without throwing on missing auth."""
+    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    if session is None:
+        return JSONResponse(
+            {
+                "success": True,
+                "data": {
+                    "valid": False,
+                    "user": None,
+                },
+            }
+        )
+
+    user = {
+        "wallet_address": session["wallet_address"],
+        "did": session.get("did") or _build_did(session["wallet_address"]),
+    }
     return JSONResponse(
         {
             "success": True,
             "data": {
-                "valid": False,
-                "user": None,
+                "valid": True,
+                "user": user,
             },
         }
     )
@@ -119,14 +159,16 @@ async def auth_validate() -> JSONResponse:
 
 @app.post("/api/auth/logout", tags=["auth"])
 async def auth_logout() -> JSONResponse:
-    """Legacy logout compatibility endpoint."""
-    return JSONResponse(
+    """Clear the portfolio SSO session cookie."""
+    response = JSONResponse(
         {
             "success": True,
-            "message": "No active deployed session to revoke.",
+            "message": "Identity session revoked.",
             "data": None,
         }
     )
+    clear_session_cookie(response)
+    return response
 
 
 # Root endpoint

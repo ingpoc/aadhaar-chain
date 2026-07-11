@@ -5,11 +5,13 @@ pydantic==2.10.3
 pydantic-settings==2.6.1
 python-dotenv==1.0.1
 
-# Claude Agent SDK
-# Optional for local browser validation; the gateway degrades gracefully when absent.
+# Cursor SDK (agent runtime)
+cursor-sdk>=0.1.9
 
-# Solana SDK
+# Solana SDK (solders for primitives; solana-py for JSON-RPC per project docs)
 solders==0.23.0
+solana==0.36.6
+base58==2.1.1
 
 # HTTP client
 httpx==0.27.0
@@ -26,3 +28,4 @@ google-cloud-vision==3.7.1
 
 # Test runtime
 pytest==8.4.2
+pytest-asyncio==0.25.3

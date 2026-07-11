@@ -1,13 +1,14 @@
 # aadhaar-chain - Memory & Decision Log
 
-## 🎯 Project Vision
-Identity verification platform using Solana blockchain + Claude Agent SDK + MCP servers
-- Verified credentials on-chain (DID, verification bitmap)
-- OCR-based document parsing (Aadhaar, PAN)
-- Fraud detection with compliance rules (Aadhaar Act 2019, DPDP Act 2019)
-- Context Graph for decision traces and precedents
+## Product goal
 
-## 📊 Current Progress
+Owner: [`GOAL.md`](GOAL.md). Workspace thesis: [`../PRODUCTIDEA.md`](../PRODUCTIDEA.md).
+
+AadhaarChain is the privacy-preserving trust substrate (verify once, minimal claims, revoke anytime). **AgentGuard** is the flagship product on top. Do not treat SSI wallets, on-chain identity tokens, universal reputation, or land title tokenization as the product.
+
+Historical decisions below remain useful for verification/trust hardening; ignore outdated “credentials on-chain / DID platform” framing if it appears in older notes.
+
+## Current Progress
 
 ### ✅ Completed Features (13/22 - 59%)
 - Frontend (Phase 1-4): 11 features (50%)

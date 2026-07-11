@@ -45,7 +45,7 @@ class MCPRegistry(BaseModel):
 
 
 class AgentRegistry(BaseModel):
-    """Registry of all Claude agents and their configurations."""
+    """Registry of portfolio verification agents and their configurations."""
     agents: Dict[str, "AgentDefinition"] = {}
     
     def register_agent(self, agent_def: "AgentDefinition"):

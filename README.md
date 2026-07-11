@@ -1,8 +1,8 @@
 # AadhaarChain
 
-`aadhaar-chain` is the active trust producer for the portfolio. It owns wallet-bound identity anchors, verification state, consent references, review/revocation status, audit receipts, and downstream-safe trust reads.
+`aadhaar-chain` is the active trust producer for the portfolio and the platform behind **AgentGuard**. Product goal: [`GOAL.md`](GOAL.md). Workspace thesis: [`../PRODUCTIDEA.md`](../PRODUCTIDEA.md).
 
-It is explicitly not a system for putting raw Aadhaar, PAN, OCR output, or verifier internals on-chain or into downstream apps.
+It owns identity anchors, verification state, consent references, review/revocation status, audit receipts, and downstream-safe trust reads — not raw Aadhaar/PAN/OCR on-chain or in consumer apps.
 
 ## Portfolio Role
 

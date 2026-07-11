@@ -1,0 +1,623 @@
+{
+  "address": "DPW1Ji3XhNb4zAnL9SLq5ZBjmG7ePPegWuocY5VeJLdm",
+  "metadata": {
+    "name": "identity_registry",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Core identity management program for AadhaarChain"
+  },
+  "instructions": [
+    {
+      "name": "add_recovery_key",
+      "discriminator": [
+        15,
+        0,
+        205,
+        162,
+        112,
+        187,
+        101,
+        73
+      ],
+      "accounts": [
+        {
+          "name": "identity_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  100,
+                  101,
+                  110,
+                  116,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "authority"
+              }
+            ]
+          }
+        },
+        {
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "identity_account"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "recovery_key",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "create_identity",
+      "discriminator": [
+        12,
+        253,
+        209,
+        41,
+        176,
+        51,
+        195,
+        179
+      ],
+      "accounts": [
+        {
+          "name": "identity_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  100,
+                  101,
+                  110,
+                  116,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "authority"
+              }
+            ]
+          }
+        },
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "did",
+          "type": "string"
+        },
+        {
+          "name": "metadata_uri",
+          "type": "string"
+        },
+        {
+          "name": "recovery_keys",
+          "type": {
+            "vec": "pubkey"
+          }
+        }
+      ]
+    },
+    {
+      "name": "initialize_config",
+      "discriminator": [
+        208,
+        127,
+        21,
+        1,
+        194,
+        190,
+        196,
+        70
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "admin",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "verification_oracle",
+          "type": "pubkey"
+        },
+        {
+          "name": "credential_manager",
+          "type": "pubkey"
+        },
+        {
+          "name": "reputation_engine",
+          "type": "pubkey"
+        },
+        {
+          "name": "staking_manager",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "recover_identity",
+      "discriminator": [
+        236,
+        190,
+        126,
+        192,
+        28,
+        163,
+        102,
+        116
+      ],
+      "accounts": [
+        {
+          "name": "identity_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  100,
+                  101,
+                  110,
+                  116,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "identity_account.authority",
+                "account": "IdentityAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "recovery_signer",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "new_authority",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "update_reputation",
+      "discriminator": [
+        194,
+        220,
+        43,
+        201,
+        54,
+        209,
+        49,
+        178
+      ],
+      "accounts": [
+        {
+          "name": "identity_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  100,
+                  101,
+                  110,
+                  116,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "identity_account.authority",
+                "account": "IdentityAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "reputation_engine",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "new_score",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "update_staked_amount",
+      "docs": [
+        "Update staked amount (called by staking manager via CPI)"
+      ],
+      "discriminator": [
+        66,
+        175,
+        202,
+        180,
+        93,
+        40,
+        156,
+        34
+      ],
+      "accounts": [
+        {
+          "name": "identity_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  100,
+                  101,
+                  110,
+                  116,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "identity_account.authority",
+                "account": "IdentityAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "staking_manager",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "new_amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "update_verification_status",
+      "discriminator": [
+        98,
+        145,
+        244,
+        162,
+        212,
+        244,
+        201,
+        233
+      ],
+      "accounts": [
+        {
+          "name": "identity_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  100,
+                  101,
+                  110,
+                  116,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "identity_account.authority",
+                "account": "IdentityAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "oracle",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "verification_type",
+          "type": "u8"
+        },
+        {
+          "name": "verified",
+          "type": "bool"
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "GlobalConfig",
+      "discriminator": [
+        149,
+        8,
+        156,
+        202,
+        160,
+        252,
+        176,
+        217
+      ]
+    },
+    {
+      "name": "IdentityAccount",
+      "discriminator": [
+        194,
+        90,
+        181,
+        160,
+        182,
+        206,
+        116,
+        158
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "DIDTooLong",
+      "msg": "DID exceeds maximum length of 128 characters"
+    },
+    {
+      "code": 6001,
+      "name": "URITooLong",
+      "msg": "Metadata URI exceeds maximum length of 256 characters"
+    },
+    {
+      "code": 6002,
+      "name": "TooManyRecoveryKeys",
+      "msg": "Too many recovery keys (maximum 5)"
+    },
+    {
+      "code": 6003,
+      "name": "InvalidVerificationType",
+      "msg": "Invalid verification type"
+    },
+    {
+      "code": 6004,
+      "name": "UnauthorizedRecovery",
+      "msg": "Unauthorized recovery attempt"
+    },
+    {
+      "code": 6005,
+      "name": "InsufficientStake",
+      "msg": "Insufficient stake amount"
+    },
+    {
+      "code": 6006,
+      "name": "AccountNotFound",
+      "msg": "Account not found"
+    },
+    {
+      "code": 6007,
+      "name": "UnauthorizedOracle",
+      "msg": "Unauthorized: Only verification oracle can update verification status"
+    },
+    {
+      "code": 6008,
+      "name": "UnauthorizedReputationEngine",
+      "msg": "Unauthorized: Only reputation engine can update reputation"
+    },
+    {
+      "code": 6009,
+      "name": "UnauthorizedStakingManager",
+      "msg": "Unauthorized: Only staking manager can update staked amount"
+    }
+  ],
+  "types": [
+    {
+      "name": "GlobalConfig",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "verification_oracle",
+            "type": "pubkey"
+          },
+          {
+            "name": "credential_manager",
+            "type": "pubkey"
+          },
+          {
+            "name": "reputation_engine",
+            "type": "pubkey"
+          },
+          {
+            "name": "staking_manager",
+            "type": "pubkey"
+          },
+          {
+            "name": "min_stake_amount",
+            "type": "u64"
+          },
+          {
+            "name": "verification_fee",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "IdentityAccount",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "did",
+            "type": "string"
+          },
+          {
+            "name": "verification_bitmap",
+            "type": "u64"
+          },
+          {
+            "name": "reputation_score",
+            "type": "u64"
+          },
+          {
+            "name": "staked_amount",
+            "type": "u64"
+          },
+          {
+            "name": "created_at",
+            "type": "i64"
+          },
+          {
+            "name": "last_updated",
+            "type": "i64"
+          },
+          {
+            "name": "metadata_uri",
+            "type": "string"
+          },
+          {
+            "name": "recovery_keys",
+            "type": {
+              "vec": "pubkey"
+            }
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    }
+  ]
+}

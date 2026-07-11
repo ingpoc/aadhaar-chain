@@ -1,5 +1,5 @@
-import { AnimatedLanding } from '@/components/landing/AnimatedLanding';
+import { SimpleLanding } from '@/components/landing/SimpleLanding';
 
-export default function HomePage() {
-  return <AnimatedLanding />;
+export default function LandingPage() {
+  return <SimpleLanding />;
 }

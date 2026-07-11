@@ -8,7 +8,7 @@ import { Navbar } from './Navbar';
 export const ConditionalNavbar = () => {
   const pathname = usePathname();
 
-  if (pathname === '/') {
+  if (pathname === '/' || pathname === '/login') {
     return null;
   }
 
@@ -22,7 +22,7 @@ export const ConditionalMainWrapper = ({
 }) => {
   const pathname = usePathname();
 
-  if (pathname === '/') {
+  if (pathname === '/' || pathname === '/login') {
     return <>{children}</>;
   }
 

@@ -55,20 +55,8 @@ export function WalletInfo() {
               value: `${balance.toFixed(4)} SOL`,
               valueClassName: 'font-mono tabular-nums text-base',
             },
-            {
-              label: 'Network',
-              value: 'Solana Devnet',
-            },
           ]}
         />
-
-        <div className="list-panel">
-          <p className="page-eyebrow">Operational note</p>
-          <p className="mt-2 text-sm text-muted-foreground">
-            AadhaarChain binds identity proofs to wallet ownership. Keep the
-            current wallet connected while creating or reviewing trust state.
-          </p>
-        </div>
       </CardContent>
     </Card>
   );

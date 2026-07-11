@@ -494,6 +494,14 @@ export const identityApi = {
     if (!data.data) throw new Error(data.error?.message || 'Failed to fetch trust surface');
     return toTrustReadSurface(data.data);
   },
+
+  async getEkycConfig(): Promise<{ provider: string; enabled: boolean; base_url: string | null }> {
+    const { data } = await apiClient.get<
+      ApiResponse<{ provider: string; enabled: boolean; base_url: string | null }>
+    >('/api/identity/ekyc/config');
+    if (!data.data) throw new Error(data.error?.message || 'Failed to fetch eKYC config');
+    return data.data;
+  },
 };
 
 // ===== VERIFICATION MODULE =====
@@ -563,6 +571,33 @@ export const verificationApi = {
     );
     if (!data.data) throw new Error(data.error?.message || 'Failed to fetch status');
     return toVerificationStatus(data.data);
+  },
+
+  async startSetuEkyc(
+    walletAddress: string,
+    consentProvided: boolean
+  ): Promise<{ verificationId: string; setuId: string; kycUrl: string }> {
+    const { data } = await apiClient.post<
+      ApiResponse<{ verification_id: string; setu_id: string; kyc_url: string }>
+    >(`/api/identity/${walletAddress}/aadhaar/ekyc/start`, {
+      consent_provided: consentProvided,
+    });
+    if (!data.data) throw new Error(data.error?.message || 'Failed to start Setu eKYC');
+    return {
+      verificationId: data.data.verification_id,
+      setuId: data.data.setu_id,
+      kycUrl: data.data.kyc_url,
+    };
+  },
+
+  async syncSetuEkyc(
+    setuId: string
+  ): Promise<{ verification_id: string; status: string; setu_status: string }> {
+    const { data } = await apiClient.post<
+      ApiResponse<{ verification_id: string; status: string; setu_status: string }>
+    >('/api/identity/ekyc/sync', { setu_id: setuId });
+    if (!data.data) throw new Error(data.error?.message || 'Failed to sync Setu eKYC');
+    return data.data;
   },
 };
 

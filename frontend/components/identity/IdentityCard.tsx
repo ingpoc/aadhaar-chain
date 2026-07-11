@@ -110,18 +110,18 @@ export function IdentityCard() {
           items={[
             {
               label: 'DID',
-              value: activeIdentity.did,
-              valueClassName: 'font-mono text-xs md:text-sm',
+              value: truncate(activeIdentity.did, 12),
+              valueClassName: 'font-mono text-xs',
             },
             {
               label: 'Owner',
-              value: activeIdentity.owner,
-              valueClassName: 'font-mono text-xs md:text-sm',
+              value: truncate(activeIdentity.owner, 8),
+              valueClassName: 'font-mono text-xs',
             },
             {
               label: 'Commitment',
               value: truncate(activeIdentity.commitment),
-              valueClassName: 'font-mono text-xs md:text-sm',
+              valueClassName: 'font-mono text-xs',
             },
             {
               label: 'Verification bitmap',
@@ -176,7 +176,10 @@ export function IdentityCard() {
                       },
                       {
                         label: 'Audit reference',
-                        value: verification.auditReceipts[0]?.reference ?? 'Pending',
+                        value: truncate(
+                          verification.auditReceipts[0]?.reference ?? 'Pending',
+                          14
+                        ),
                         valueClassName: 'font-mono text-xs',
                       },
                     ]}
