@@ -90,8 +90,9 @@ app.add_middleware(
 # Include identity router (no prefix, router already has prefix)
 app.include_router(identity_router)
 app.include_router(social_auth_router)
-app.include_router(ondc_router)
+# Onboard (/ondc/on_subscribe) before Beckn callbacks so subscribe is not ingested as catalog.
 app.include_router(ondc_onboard_router)
+app.include_router(ondc_router)
 app.include_router(commerce_integrations_router)
 app.include_router(agentguard_router)
 app.include_router(commerce_router)
