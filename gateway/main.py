@@ -30,6 +30,7 @@ from app.session_auth import (
 from app.social_auth_routes import router as social_auth_router
 from app.ondc_routes import router as ondc_router
 from app.ondc_onboard_routes import router as ondc_onboard_router
+from app.ondc_bpp import router as ondc_bpp_router
 from app.commerce_integrations_routes import router as commerce_integrations_router
 from app.state_store import load_gateway_state
 
@@ -92,6 +93,7 @@ app.include_router(identity_router)
 app.include_router(social_auth_router)
 # Onboard (/ondc/on_subscribe) before Beckn callbacks so subscribe is not ingested as catalog.
 app.include_router(ondc_onboard_router)
+app.include_router(ondc_bpp_router)
 app.include_router(ondc_router)
 app.include_router(commerce_integrations_router)
 app.include_router(agentguard_router)

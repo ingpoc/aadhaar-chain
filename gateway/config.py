@@ -1,8 +1,15 @@
 """Configuration management for aadhaar-chain gateway."""
 import os
 from pydantic_settings import BaseSettings
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from typing import Optional, Union
+
+
+def _default_data_dir() -> str:
+    """Render Free: writable ephemeral path. Local: ./data. Env DATA_DIR always wins."""
+    if os.environ.get("RENDER", "").lower() in {"true", "1"}:
+        return "/tmp/aadharchain-data"
+    return "./data"
 
 
 class Settings(BaseSettings):
@@ -73,8 +80,9 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = None
     openai_realtime_model: str = "gpt-realtime-2.1-mini"
 
-    # Storage
-    data_dir: str = "./data"
+    # Storage — on Render Free prefer /tmp (ephemeral, writable); never paid Disk.
+    # Override with DATA_DIR; Dockerfile also sets DATA_DIR=/tmp/aadharchain-data.
+    data_dir: str = Field(default_factory=_default_data_dir)
     aadhaar_chain_env: str = "demo"
     trust_store_backend: str = "local_file"
     database_url: Optional[str] = None
@@ -118,6 +126,11 @@ class Settings(BaseSettings):
     ondc_seller_keys_dir: Optional[str] = None
     # auto | portal | local — auto prefers portal-download PEMs when registry_env=preprod
     ondc_keys_source: str = "auto"
+    # Seller BPP (PreProd)
+    ondc_bpp_id: Optional[str] = "ondcseller.aadharcha.in"
+    ondc_bpp_uri: Optional[str] = "https://ondcseller.aadharcha.in/ondc"
+    ondc_seller_unique_key_id: Optional[str] = None
+    ondc_seller_signing_private_key_path: Optional[str] = None
 
     @field_validator("cors_origins", mode="before")
     @classmethod

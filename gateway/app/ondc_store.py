@@ -92,7 +92,12 @@ def catalogs_for_transaction(transaction_id: str) -> list[dict[str, Any]]:
             continue
         message = payload.get("message") or {}
         catalog = message.get("catalog") or {}
-        providers = catalog.get("providers") or catalog.get("bpp/providers") or []
+        providers = (
+            catalog.get("providers")
+            or catalog.get("bpp/providers")
+            or catalog.get("bpp_providers")
+            or []
+        )
         if not providers and catalog:
             providers = [catalog]
         bpp_id = ctx.get("bpp_id")
