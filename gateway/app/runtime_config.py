@@ -24,21 +24,45 @@ try:
     from cursor_agent_runtime.policy import (  # noqa: E402
         resolve_runtime_policy as _resolve_cursor_policy,
     )
-except ImportError:  # Docker gateway image has no workspace/shared
-    def _resolve_cursor_policy():  # type: ignore[misc]
-        @dataclass(frozen=True)
-        class _Unavailable:
-            runtime_available: bool = False
-            auth_mode: str = "unavailable"
-            model: str = ""
-            blocked_reason: Optional[str] = (
-                "cursor_agent_runtime not packaged in gateway image"
-            )
+except ImportError:  # Docker gateway image has no workspace/shared — use env + cursor-sdk
+    import importlib.util
+    import os
 
-        return _Unavailable()
+    @dataclass(frozen=True)
+    class _InlineCursorPolicy:
+        runtime_available: bool
+        auth_mode: str
+        model: str
+        blocked_reason: Optional[str]
+
+    @functools.lru_cache(maxsize=1)
+    def _resolve_cursor_policy():  # type: ignore[misc]
+        model = (os.getenv("CURSOR_AGENT_MODEL") or "composer-2.5").strip() or "composer-2.5"
+        has_sdk = importlib.util.find_spec("cursor_sdk") is not None
+        has_key = bool((os.getenv("CURSOR_API_KEY") or "").strip())
+        if not has_sdk:
+            return _InlineCursorPolicy(
+                runtime_available=False,
+                auth_mode="unavailable",
+                model=model,
+                blocked_reason="cursor-sdk is not installed in the gateway image",
+            )
+        if not has_key:
+            return _InlineCursorPolicy(
+                runtime_available=False,
+                auth_mode="unavailable",
+                model=model,
+                blocked_reason="CURSOR_API_KEY is required on the gateway",
+            )
+        return _InlineCursorPolicy(
+            runtime_available=True,
+            auth_mode="cursor_api_key",
+            model=model,
+            blocked_reason=None,
+        )
 
     def _clear_cursor_policy_cache() -> None:
-        return None
+        _resolve_cursor_policy.cache_clear()
 else:
     _clear_cursor_policy_cache: Callable[[], None] = (
         _resolve_cursor_policy.cache_clear  # type: ignore[attr-defined]
