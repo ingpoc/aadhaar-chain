@@ -278,34 +278,51 @@ async def bpp_status() -> JSONResponse:
     )
 
 
-@router.post("/api/ondc/bpp/ensure-demo-item")
-async def bpp_ensure_demo_item() -> JSONResponse:
-    """Idempotent publish of a distinctive PreProd marker SKU (no mock UI catalog)."""
+PREPROD_MARKER_TITLE = "AgentGuard PreProd Atta 1kg"
+PREPROD_MARKER_CREATE_KEY = "bpp-ensure-agentguard-atta"
+PREPROD_MARKER_PUBLISH_KEY = "bpp-ensure-agentguard-atta:publish"
+
+
+def ensure_preprod_marker_item() -> dict[str, Any]:
+    """Idempotent publish of PreProd marker SKU (shared by HTTP + lifespan wake).
+
+    Free `/tmp` DATA_DIR loses published catalog after spin-down; calling this on
+    boot restores network-visible inventory without a manual curl.
+    """
     from app.commerce_demo import create_item, publish_item
 
-    marker_title = "AgentGuard PreProd Atta 1kg"
     state = load_state()
     existing = next(
-        (i for i in state.items.values() if i.get("title") == marker_title and i.get("status") == "published"),
+        (
+            i
+            for i in state.items.values()
+            if i.get("title") == PREPROD_MARKER_TITLE and i.get("status") == "published"
+        ),
         None,
     )
     if existing:
-        return JSONResponse({"success": True, "data": {"item": existing, "created": False}})
+        return {"item": existing, "created": False}
     created = create_item(
         {
-            "title": marker_title,
+            "title": PREPROD_MARKER_TITLE,
             "description": "Network-visible Seller catalog item for PreProd Buyer discovery",
             "price_inr": 89,
             "inventory": 25,
             "seller_id": "ondcseller.aadharcha.in",
         },
-        idempotency_key="bpp-ensure-agentguard-atta",
+        idempotency_key=PREPROD_MARKER_CREATE_KEY,
     )
     published = publish_item(
         created["item"]["item_id"],
-        idempotency_key="bpp-ensure-agentguard-atta:publish",
+        idempotency_key=PREPROD_MARKER_PUBLISH_KEY,
     )
-    return JSONResponse({"success": True, "data": {"item": published["item"], "created": True}})
+    return {"item": published["item"], "created": True}
+
+
+@router.post("/api/ondc/bpp/ensure-demo-item")
+async def bpp_ensure_demo_item() -> JSONResponse:
+    """Idempotent publish of a distinctive PreProd marker SKU (no mock UI catalog)."""
+    return JSONResponse({"success": True, "data": ensure_preprod_marker_item()})
 
 # --- select / init / confirm (minimal PreProd stub) ---
 

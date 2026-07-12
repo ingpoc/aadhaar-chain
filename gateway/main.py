@@ -64,6 +64,20 @@ async def lifespan(_app: FastAPI):
             "⚠ AadhaarChain agent runtime unavailable: "
             f"{runtime_policy.blocked_reason}"
         )
+    # Free /tmp catalog is empty after spin-down; restore PreProd marker when ONDC is on.
+    if getattr(settings, "ondc_enabled", False):
+        try:
+            from app.ondc_bpp import ensure_preprod_marker_item
+
+            ensured = ensure_preprod_marker_item()
+            title = (ensured.get("item") or {}).get("title") or "marker"
+            created = ensured.get("created")
+            print(
+                f"✓ ONDC PreProd catalog ensure "
+                f"(created={created}, title={title})"
+            )
+        except Exception as exc:  # noqa: BLE001 — boot must not die on catalog restore
+            print(f"⚠ ONDC PreProd catalog ensure skipped: {exc}")
     yield
 
 
