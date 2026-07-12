@@ -124,3 +124,39 @@ def catalogs_for_transaction(transaction_id: str) -> list[dict[str, Any]]:
                     }
                 )
     return results
+
+
+def append_order(entry: dict[str, Any]) -> dict[str, Any]:
+    """Persist a stub ONDC order under DATA_DIR (select/init/confirm trail)."""
+    with _LOCK:
+        items = _read_list("orders.json")
+        items.append(entry)
+        _write_list("orders.json", items)
+    return entry
+
+
+def list_orders(limit: int = 50, *, transaction_id: Optional[str] = None) -> list[dict[str, Any]]:
+    with _LOCK:
+        items = _read_list("orders.json")
+    if transaction_id:
+        items = [i for i in items if i.get("transaction_id") == transaction_id]
+    return list(reversed(items[-limit:]))
+
+
+def callbacks_for_transaction(
+    transaction_id: str, *, action: Optional[str] = None
+) -> list[dict[str, Any]]:
+    """Return inbox on_* callbacks for a transaction (on_select / on_init / on_confirm)."""
+    results: list[dict[str, Any]] = []
+    for entry in list_inbox(limit=200, action=action):
+        payload = entry.get("payload") or {}
+        ctx = payload.get("context") or {}
+        if ctx.get("transaction_id") != transaction_id:
+            continue
+        act = entry.get("action") or ctx.get("action")
+        if action and act != action:
+            continue
+        if act not in {"on_select", "on_init", "on_confirm"} and action is None:
+            continue
+        results.append(entry)
+    return results

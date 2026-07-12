@@ -126,7 +126,7 @@ def _status_payload() -> dict[str, Any]:
         "outbox_depth": len(ondc_store.list_outbox(limit=500)),
         "inbox_depth": len(ondc_store.list_inbox(limit=500)),
         "note": (
-            "PreProd: signed lookup + search dispatch when enabled+configured. "
+            "PreProd: signed lookup + search + select/init/confirm when enabled+configured. "
             "Do not flip VITE_COMMERCE_DEMO_MODE without commerce_demo_mode_gate evidence."
         ),
     }
@@ -141,10 +141,20 @@ class SearchBody(BaseModel):
     query: Optional[str] = None
 
 
-class ConfirmBody(BaseModel):
+class OrderActionBody(BaseModel):
+    """select / init / confirm — order + target BPP."""
+
     order: dict[str, Any] = Field(default_factory=dict)
     message_id: Optional[str] = None
     transaction_id: Optional[str] = None
+    bpp_id: Optional[str] = None
+    bpp_uri: Optional[str] = None
+    city: Optional[str] = None
+    domain: Optional[str] = None
+
+
+class ConfirmBody(OrderActionBody):
+    """Backward-compatible alias for confirm."""
 
 
 class LookupBody(BaseModel):
@@ -329,51 +339,142 @@ async def ondc_search(body: SearchBody) -> JSONResponse:
     )
 
 
-@router.post("/api/ondc/confirm")
-async def ondc_confirm(body: ConfirmBody) -> JSONResponse:
+def _resolve_bpp_target(
+    body: OrderActionBody, *, transaction_id: str
+) -> tuple[str, str]:
+    """Resolve bpp_id + bpp_uri from body or prior on_search catalogs."""
+    bpp_id = (body.bpp_id or "").strip()
+    bpp_uri = (body.bpp_uri or "").rstrip("/")
+    if bpp_id and bpp_uri:
+        return bpp_id, bpp_uri
+    catalogs = ondc_store.catalogs_for_transaction(transaction_id)
+    for row in catalogs:
+        if not bpp_id and row.get("bpp_id"):
+            bpp_id = str(row["bpp_id"])
+        if not bpp_uri and row.get("bpp_uri"):
+            bpp_uri = str(row["bpp_uri"]).rstrip("/")
+        if bpp_id and bpp_uri:
+            break
+    if not bpp_id:
+        bpp_id = getattr(settings, "ondc_bpp_id", None) or "ondcseller.aadharcha.in"
+    if not bpp_uri:
+        bpp_uri = (
+            getattr(settings, "ondc_bpp_uri", None)
+            or f"https://{bpp_id}/ondc"
+        ).rstrip("/")
+    return bpp_id, bpp_uri
+
+
+async def _dispatch_order_action(action: str, body: OrderActionBody) -> JSONResponse:
+    """Signed select/init/confirm → bpp_uri/{action}; persist outbox."""
+    if action not in {"select", "init", "confirm"}:
+        raise HTTPException(status_code=400, detail=f"unsupported action: {action}")
     if not _ondc_configured():
         raise HTTPException(status_code=503, detail="ONDC adapter not ready.")
     message_id = body.message_id or str(uuid.uuid4())
     transaction_id = body.transaction_id or str(uuid.uuid4())
+    bpp_id, bpp_uri = _resolve_bpp_target(body, transaction_id=transaction_id)
     bap_id = getattr(settings, "ondc_bap_id", None) or _subscriber_id()
     envelope = {
         "context": {
-            "domain": DEFAULT_DOMAIN,
-            "action": "confirm",
+            "domain": body.domain or DEFAULT_DOMAIN,
+            "action": action,
             "country": "IND",
-            "city": DEFAULT_CITY,
+            "city": body.city or DEFAULT_CITY,
             "core_version": CORE_VERSION,
             "bap_id": bap_id,
             "bap_uri": _bap_uri(),
+            "bpp_id": bpp_id,
+            "bpp_uri": bpp_uri,
             "transaction_id": transaction_id,
             "message_id": message_id,
             "timestamp": _iso_now(),
             "ttl": "PT30S",
         },
-        "message": {"order": body.order},
+        "message": {"order": body.order or {}},
     }
     entry = {
         "id": f"out_{uuid.uuid4().hex[:12]}",
-        "action": "confirm",
+        "action": action,
         "payload": envelope,
         "created_at": int(time.time()),
         "status": "queued",
         "message_id": message_id,
         "transaction_id": transaction_id,
+        "bpp_id": bpp_id,
+        "bpp_uri": bpp_uri,
     }
     ondc_store.append_outbox(entry)
-    # Confirm goes to bpp_uri normally; keep as outbox until select/init wired.
-    ondc_store.update_outbox(entry["id"], status="held", note="confirm requires bpp_uri from on_select")
+    target = f"{bpp_uri}/{action}"
+    try:
+        status, data, _ = await _signed_post(target, envelope)
+    except HTTPException:
+        ondc_store.update_outbox(entry["id"], status="error", error="signing/config")
+        raise
+    except Exception as exc:  # noqa: BLE001
+        ondc_store.update_outbox(entry["id"], status="error", error=str(exc))
+        raise HTTPException(status_code=502, detail=f"ONDC BPP {action} failed: {exc}") from exc
+
+    ack = None
+    if isinstance(data, dict):
+        ack = ((data.get("message") or {}).get("ack") or {}).get("status")
+    dispatch_status = "sent" if status < 400 else "nack"
+    if ack == "NACK":
+        dispatch_status = "nack"
+    ondc_store.update_outbox(
+        entry["id"],
+        status=dispatch_status,
+        http_status=status,
+        bpp_response=data,
+    )
+    return JSONResponse(
+        {
+            "success": dispatch_status == "sent",
+            "data": {
+                "queued": False,
+                "dispatched": True,
+                "outbox_id": entry["id"],
+                "message_id": message_id,
+                "transaction_id": transaction_id,
+                "bpp_id": bpp_id,
+                "bpp_uri": bpp_uri,
+                "http_status": status,
+                "ack": ack,
+                "target": target,
+                "bpp_response": data,
+                "note": f"Poll GET /api/ondc/inbox?action=on_{action} or /api/ondc/orders?transaction_id=…",
+            },
+        }
+    )
+
+
+@router.post("/api/ondc/select")
+async def ondc_select(body: OrderActionBody) -> JSONResponse:
+    return await _dispatch_order_action("select", body)
+
+
+@router.post("/api/ondc/init")
+async def ondc_init(body: OrderActionBody) -> JSONResponse:
+    return await _dispatch_order_action("init", body)
+
+
+@router.post("/api/ondc/confirm")
+async def ondc_confirm(body: ConfirmBody) -> JSONResponse:
+    return await _dispatch_order_action("confirm", body)
+
+
+@router.get("/api/ondc/orders")
+async def ondc_orders(transaction_id: Optional[str] = None) -> JSONResponse:
     return JSONResponse(
         {
             "success": True,
             "data": {
-                "queued": True,
-                "outbox_id": entry["id"],
-                "message_id": message_id,
-                "transaction_id": transaction_id,
-                "ack": "ACK",
-                "note": "confirm dispatch to BPP not yet wired — use search e2e first.",
+                "items": ondc_store.list_orders(transaction_id=transaction_id),
+                "callbacks": (
+                    ondc_store.callbacks_for_transaction(transaction_id)
+                    if transaction_id
+                    else []
+                ),
             },
         }
     )

@@ -306,3 +306,201 @@ async def bpp_ensure_demo_item() -> JSONResponse:
         idempotency_key="bpp-ensure-agentguard-atta:publish",
     )
     return JSONResponse({"success": True, "data": {"item": published["item"], "created": True}})
+
+# --- select / init / confirm (minimal PreProd stub) ---
+
+def _order_from_request(body: dict[str, Any]) -> dict[str, Any]:
+    message = body.get("message") or {}
+    order = dict(message.get("order") or {})
+    if order.get("items"):
+        return order
+    # Build from published catalog when caller sends item ids only
+    providers = build_catalog_providers(query="")
+    catalog_items = (providers[0].get("items") if providers else []) or []
+    by_id = {i.get("id"): i for i in catalog_items}
+    requested = message.get("items") or order.get("item_ids") or []
+    items: list[dict[str, Any]] = []
+    if isinstance(requested, list):
+        for row in requested:
+            if isinstance(row, str):
+                found = by_id.get(row)
+                if found:
+                    items.append({**found, "quantity": {"count": "1"}})
+            elif isinstance(row, dict):
+                iid = row.get("id") or row.get("item_id")
+                found = by_id.get(iid) if iid else None
+                qty = row.get("quantity") or {"count": "1"}
+                if found:
+                    items.append({**found, "quantity": qty if isinstance(qty, dict) else {"count": str(qty)}})
+                elif iid:
+                    items.append({"id": iid, "quantity": qty if isinstance(qty, dict) else {"count": "1"}})
+    if not items and catalog_items:
+        items = [{**catalog_items[0], "quantity": {"count": "1"}}]
+    total = 0.0
+    for item in items:
+        try:
+            total += float(((item.get("price") or {}).get("value") or 0))
+        except (TypeError, ValueError):
+            pass
+    price_str = f"{total:.2f}"
+    return {
+        "provider": {"id": PROVIDER_ID, "descriptor": {"name": "AadhaarChain AgentGuard Seller"}},
+        "items": items,
+        "quote": {
+            "price": {"currency": "INR", "value": price_str},
+            "breakup": [
+                {
+                    "title": (item.get("descriptor") or {}).get("name") or item.get("id"),
+                    "@ondc/org/item_id": item.get("id"),
+                    "price": item.get("price") or {"currency": "INR", "value": "0.00"},
+                }
+                for item in items
+            ],
+        },
+        "fulfillments": [{"id": "1", "type": "Delivery", "tracking": False}],
+        "billing": order.get("billing")
+        or {
+            "name": "AgentGuard Buyer",
+            "address": {
+                "locality": "Bengaluru",
+                "city": "Bengaluru",
+                "area_code": "560001",
+                "state": "KA",
+            },
+            "phone": "9999999999",
+        },
+        "payment": order.get("payment")
+        or {
+            "type": "ON-ORDER",
+            "collected_by": "BPP",
+            "@ondc/org/buyer_app_finder_fee_type": "percent",
+            "@ondc/org/buyer_app_finder_fee_amount": "0",
+            "status": "NOT-PAID",
+        },
+    }
+
+
+async def _post_on_action(action: str, request_body: dict[str, Any]) -> None:
+    """ACK path already returned; post on_select / on_init / on_confirm to bap_uri."""
+    if not _bpp_ready():
+        logger.warning("BPP on_%s skipped — seller keys / ONDC_ENABLED not ready", action)
+        return
+    ctx = request_body.get("context") or {}
+    bap_uri = str(ctx.get("bap_uri") or "").rstrip("/")
+    if not bap_uri:
+        logger.warning("BPP on_%s skipped — missing bap_uri", action)
+        return
+    order = _order_from_request(request_body)
+    if action == "confirm":
+        order = {
+            **order,
+            "id": f"ord_{uuid.uuid4().hex[:12]}",
+            "state": "Accepted",
+            "payment": {
+                **(order.get("payment") or {}),
+                "status": "PAID",
+                "type": "ON-ORDER",
+            },
+        }
+        from app import ondc_store
+
+        ondc_store.append_order(
+            {
+                "id": order["id"],
+                "transaction_id": ctx.get("transaction_id"),
+                "bpp_id": _bpp_id(),
+                "state": order["state"],
+                "order": order,
+                "created_at": int(time.time()),
+            }
+        )
+    elif action == "init":
+        order = {**order, "payment": {**(order.get("payment") or {}), "status": "NOT-PAID"}}
+    message_id = str(uuid.uuid4())
+    on_action = f"on_{action}"
+    envelope = {
+        "context": {
+            "domain": ctx.get("domain") or DEFAULT_DOMAIN,
+            "action": on_action,
+            "country": ctx.get("country") or "IND",
+            "city": ctx.get("city") or "std:080",
+            "core_version": ctx.get("core_version") or CORE_VERSION,
+            "bap_id": ctx.get("bap_id"),
+            "bap_uri": bap_uri,
+            "bpp_id": _bpp_id(),
+            "bpp_uri": _bpp_uri(),
+            "transaction_id": ctx.get("transaction_id"),
+            "message_id": message_id,
+            "timestamp": _iso_now(),
+            "ttl": ctx.get("ttl") or "PT30S",
+        },
+        "message": {"order": order},
+    }
+    uk = _seller_uk_id()
+    pem = _seller_signing_pem()
+    if not uk or pem is None:
+        return
+    private_key = load_ed25519_private_pem(pem.read_bytes())
+    body_str = minify_json(envelope)
+    auth = create_authorization_header(
+        body_str,
+        subscriber_id=_bpp_id(),
+        unique_key_id=uk,
+        private_key=private_key,
+    )
+    url = f"{bap_uri}/{on_action}"
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(
+                url,
+                content=body_str.encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Authorization": auth,
+                },
+            )
+        logger.info("BPP %s → %s status=%s", on_action, url, resp.status_code)
+    except Exception:  # noqa: BLE001
+        logger.exception("BPP %s dispatch failed to %s", on_action, url)
+
+
+async def handle_bpp_order_action(
+    action: str, body: dict[str, Any], background: BackgroundTasks
+) -> JSONResponse:
+    if action not in {"select", "init", "confirm"}:
+        raise HTTPException(status_code=404, detail=f"unsupported BPP action: {action}")
+    if not getattr(settings, "ondc_enabled", False):
+        raise HTTPException(status_code=503, detail="ONDC_ENABLED=false")
+    background.add_task(_post_on_action, action, body)
+    return JSONResponse({"message": {"ack": {"status": "ACK"}}})
+
+
+@router.post("/ondc/np/seller/select")
+async def np_seller_select(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_order_action("select", await request.json(), background)
+
+
+@router.post("/ondc/np/seller/init")
+async def np_seller_init(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_order_action("init", await request.json(), background)
+
+
+@router.post("/ondc/np/seller/confirm")
+async def np_seller_confirm(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_order_action("confirm", await request.json(), background)
+
+
+@router.post("/ondc/select")
+async def root_select(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_order_action("select", await request.json(), background)
+
+
+@router.post("/ondc/init")
+async def root_init(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_order_action("init", await request.json(), background)
+
+
+@router.post("/ondc/confirm")
+async def root_confirm(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_order_action("confirm", await request.json(), background)

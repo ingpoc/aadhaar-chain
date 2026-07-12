@@ -143,3 +143,51 @@ def test_ondc_status_disabled_by_default(monkeypatch, tmp_path: Path):
     assert res.status_code == 200
     assert res.json()["data"]["enabled"] is False
     assert res.json()["data"]["configured"] is False
+
+
+def test_ondc_select_init_confirm_dispatch(tmp_path: Path, ed25519_pem: Path, monkeypatch):
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path / "data"))
+    monkeypatch.setattr(settings, "ondc_enabled", True)
+    monkeypatch.setattr(settings, "ondc_subscriber_id", "ondcbuyer.aadharcha.in")
+    monkeypatch.setattr(settings, "ondc_bap_id", "ondcbuyer.aadharcha.in")
+    monkeypatch.setattr(settings, "ondc_bap_uri", "https://ondcbuyer.aadharcha.in/ondc")
+    monkeypatch.setattr(settings, "ondc_unique_key_id", "test-uk-id")
+    monkeypatch.setattr(
+        settings, "ondc_signing_private_key_path", str(ed25519_pem / "signing_private.pem")
+    )
+    monkeypatch.setattr(settings, "ondc_buyer_keys_dir", str(ed25519_pem))
+
+    mock_resp = AsyncMock()
+    mock_resp.status_code = 200
+    mock_resp.json = lambda: {"message": {"ack": {"status": "ACK"}}}
+    mock_resp.text = '{"message":{"ack":{"status":"ACK"}}}'
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = None
+    mock_client.post = AsyncMock(return_value=mock_resp)
+
+    from main import app
+
+    body = {
+        "transaction_id": "txn-order-bap",
+        "bpp_id": "ondcseller.aadharcha.in",
+        "bpp_uri": "https://ondcseller.aadharcha.in/ondc",
+        "order": {"items": [{"id": "item_atta", "quantity": {"count": "1"}}]},
+    }
+    with patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client):
+        client = TestClient(app)
+        for action in ("select", "init", "confirm"):
+            res = client.post(f"/api/ondc/{action}", json=body)
+            assert res.status_code == 200, res.text
+            data = res.json()["data"]
+            assert data["dispatched"] is True
+            assert data["ack"] == "ACK"
+            assert data["bpp_uri"] == "https://ondcseller.aadharcha.in/ondc"
+
+    targets = [c.args[0] for c in mock_client.post.await_args_list]
+    assert any(t.endswith("/select") for t in targets)
+    assert any(t.endswith("/init") for t in targets)
+    assert any(t.endswith("/confirm") for t in targets)
+    sent = json.loads(mock_client.post.await_args_list[0].kwargs["content"].decode("utf-8"))
+    assert sent["context"]["bpp_id"] == "ondcseller.aadharcha.in"
+    assert "Authorization" in mock_client.post.await_args_list[0].kwargs["headers"]

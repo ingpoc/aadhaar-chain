@@ -108,3 +108,77 @@ def test_bpp_ensure_demo_item(tmp_path: Path, monkeypatch):
     assert first.json()["data"]["item"]["title"] == "AgentGuard PreProd Atta 1kg"
     second = client.post("/api/ondc/bpp/ensure-demo-item")
     assert second.json()["data"]["created"] is False
+
+
+def test_bpp_select_init_confirm_ack_and_callback(tmp_path: Path, seller_keys: Path, monkeypatch):
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path / "data"))
+    monkeypatch.setattr(settings, "ondc_enabled", True)
+    monkeypatch.setattr(settings, "ondc_seller_keys_dir", str(seller_keys))
+    monkeypatch.setattr(settings, "ondc_seller_unique_key_id", "seller-uk-id")
+    monkeypatch.setattr(
+        settings, "ondc_seller_signing_private_key_path", str(seller_keys / "signing_private.pem")
+    )
+    monkeypatch.setattr(settings, "ondc_bpp_id", "ondcseller.aadharcha.in")
+    monkeypatch.setattr(settings, "ondc_bpp_uri", "https://ondcseller.aadharcha.in/ondc")
+
+    from app.commerce_demo import create_item, publish_item
+
+    created = create_item(
+        {
+            "title": "AgentGuard PreProd Atta 1kg",
+            "description": "test",
+            "price_inr": 89,
+            "inventory": 10,
+            "seller_id": "ondcseller.aadharcha.in",
+        }
+    )
+    item_id = created["item"]["item_id"]
+    publish_item(item_id)
+
+    mock_resp = AsyncMock()
+    mock_resp.status_code = 200
+    mock_resp.text = '{"message":{"ack":{"status":"ACK"}}}'
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = None
+    mock_client.post = AsyncMock(return_value=mock_resp)
+
+    from main import app
+
+    envelope = {
+        "context": {
+            "action": "select",
+            "domain": "ONDC:RET10",
+            "bap_id": "ondcbuyer.aadharcha.in",
+            "bap_uri": "https://ondcbuyer.aadharcha.in/ondc",
+            "bpp_id": "ondcseller.aadharcha.in",
+            "bpp_uri": "https://ondcseller.aadharcha.in/ondc",
+            "transaction_id": "txn-order-1",
+            "message_id": "msg-sel",
+            "city": "std:080",
+            "country": "IND",
+            "core_version": "1.2.0",
+        },
+        "message": {"order": {"items": [{"id": item_id, "quantity": {"count": "1"}}]}},
+    }
+
+    with patch("app.ondc_bpp.httpx.AsyncClient", return_value=mock_client):
+        client = TestClient(app)
+        for action in ("select", "init", "confirm"):
+            envelope["context"]["action"] = action
+            envelope["context"]["message_id"] = f"msg-{action}"
+            res = client.post(f"/ondc/np/seller/{action}", json=envelope)
+            assert res.status_code == 200
+            assert res.json()["message"]["ack"]["status"] == "ACK"
+
+    assert mock_client.post.await_count >= 3
+    targets = [c.args[0] for c in mock_client.post.await_args_list]
+    assert any(t.endswith("/on_select") for t in targets)
+    assert any(t.endswith("/on_init") for t in targets)
+    assert any(t.endswith("/on_confirm") for t in targets)
+
+    from app import ondc_store
+
+    orders = ondc_store.list_orders(transaction_id="txn-order-1")
+    assert orders
+    assert orders[0]["state"] == "Accepted"
