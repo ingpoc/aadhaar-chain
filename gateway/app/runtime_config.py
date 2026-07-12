@@ -5,16 +5,44 @@ import functools
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Callable, Literal, Optional
 
-_WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+_HERE = Path(__file__).resolve()
+# gateway/app/runtime_config.py → parents[1] = gateway root (/app in Docker).
+# Monorepo checkout may also expose workspace/shared at parents[3].
+_GATEWAY_ROOT = _HERE.parents[1]
+_WORKSPACE_ROOT = _GATEWAY_ROOT
+if len(_HERE.parents) > 3:
+    candidate = _HERE.parents[3]
+    if (candidate / "shared" / "cursor_agent_runtime").is_dir():
+        _WORKSPACE_ROOT = candidate
 _SHARED_ROOT = _WORKSPACE_ROOT / "shared"
-if str(_SHARED_ROOT) not in sys.path:
+if _SHARED_ROOT.is_dir() and str(_SHARED_ROOT) not in sys.path:
     sys.path.insert(0, str(_SHARED_ROOT))
 
-from cursor_agent_runtime.policy import (  # noqa: E402
-    resolve_runtime_policy as _resolve_cursor_policy,
-)
+try:
+    from cursor_agent_runtime.policy import (  # noqa: E402
+        resolve_runtime_policy as _resolve_cursor_policy,
+    )
+except ImportError:  # Docker gateway image has no workspace/shared
+    def _resolve_cursor_policy():  # type: ignore[misc]
+        @dataclass(frozen=True)
+        class _Unavailable:
+            runtime_available: bool = False
+            auth_mode: str = "unavailable"
+            model: str = ""
+            blocked_reason: Optional[str] = (
+                "cursor_agent_runtime not packaged in gateway image"
+            )
+
+        return _Unavailable()
+
+    def _clear_cursor_policy_cache() -> None:
+        return None
+else:
+    _clear_cursor_policy_cache: Callable[[], None] = (
+        _resolve_cursor_policy.cache_clear  # type: ignore[attr-defined]
+    )
 
 AgentAuthMode = Literal["api_key", "unavailable", "cursor_api_key"]
 
@@ -45,4 +73,4 @@ def resolve_runtime_policy() -> AgentRuntimePolicy:
 
 def clear_runtime_policy_cache() -> None:
     resolve_runtime_policy.cache_clear()
-    _resolve_cursor_policy.cache_clear()
+    _clear_cursor_policy_cache()

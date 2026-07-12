@@ -17,14 +17,20 @@ from app.models import (
 )
 from app.routes import router as identity_router, identities, _build_did
 from app.agentguard_routes import router as agentguard_router
-from app.ondc_onboard_routes import router as ondc_onboard_router
+from app.commerce_routes import router as commerce_router
+from app.realtime_routes import router as realtime_router
 from app.agent_manager import agent_manager
 from app.runtime_config import resolve_runtime_policy
 from app.session_auth import (
     SESSION_COOKIE_NAME,
     clear_session_cookie,
     parse_session_token,
+    session_user_payload,
 )
+from app.social_auth_routes import router as social_auth_router
+from app.ondc_routes import router as ondc_router
+from app.ondc_onboard_routes import router as ondc_onboard_router
+from app.commerce_integrations_routes import router as commerce_integrations_router
 from app.state_store import load_gateway_state
 
 
@@ -83,8 +89,13 @@ app.add_middleware(
 
 # Include identity router (no prefix, router already has prefix)
 app.include_router(identity_router)
-app.include_router(agentguard_router)
+app.include_router(social_auth_router)
+app.include_router(ondc_router)
 app.include_router(ondc_onboard_router)
+app.include_router(commerce_integrations_router)
+app.include_router(agentguard_router)
+app.include_router(commerce_router)
+app.include_router(realtime_router)
 
 
 # Health check endpoint
@@ -106,7 +117,7 @@ async def api_health_check() -> JSONResponse:
 
 @app.get("/api/auth/me", tags=["auth"])
 async def auth_me(request: Request) -> JSONResponse:
-    """Return the authenticated portfolio user from the session cookie."""
+    """Return the authenticated principal from the session cookie."""
     session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
     if session is None:
         return JSONResponse(
@@ -121,10 +132,7 @@ async def auth_me(request: Request) -> JSONResponse:
         {
             "success": True,
             "message": "Authenticated identity session active.",
-            "data": {
-                "wallet_address": session["wallet_address"],
-                "did": session.get("did") or _build_did(session["wallet_address"]),
-            },
+            "data": session_user_payload(session),
         }
     )
 
@@ -144,16 +152,12 @@ async def auth_validate(request: Request) -> JSONResponse:
             }
         )
 
-    user = {
-        "wallet_address": session["wallet_address"],
-        "did": session.get("did") or _build_did(session["wallet_address"]),
-    }
     return JSONResponse(
         {
             "success": True,
             "data": {
                 "valid": True,
-                "user": user,
+                "user": session_user_payload(session),
             },
         }
     )

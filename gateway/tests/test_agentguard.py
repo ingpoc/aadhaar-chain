@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import agentguard
+from app.session_auth import SESSION_COOKIE_NAME, create_session_token
 from config import settings
 from main import app
 
@@ -191,3 +192,143 @@ def test_http_agentguard_checkout_action() -> None:
         json={"wallet_address": WALLET, "approval_id": approval_id},
     )
     assert replay.status_code == 409
+
+
+def test_session_principal_wins_over_body_wallet() -> None:
+    client = TestClient(app)
+    token = create_session_token(
+        wallet_address=WALLET,
+        did="did:aadharchain:test",
+        audience="ondcseller",
+    )
+    client.cookies.set(SESSION_COOKIE_NAME, token)
+    mismatch = client.post(
+        "/api/agentguard/actions/evaluate",
+        json={
+            "wallet_address": "DifferentAgentGuardWallet11111111111111",
+            "action": "refund",
+            "amount_inr": 100,
+            "resource_id": "ord-session-mismatch",
+        },
+    )
+    assert mismatch.status_code == 403
+
+    no_body_wallet = client.post(
+        "/api/agentguard/actions/evaluate",
+        json={
+            "action": "refund",
+            "amount_inr": 100,
+            "resource_id": "ord-session",
+        },
+    )
+    assert no_body_wallet.status_code == 200
+    assert no_body_wallet.json()["data"]["agent"]["principal_id"] == f"wallet:{WALLET}"
+
+
+def test_unknown_action_denies_fail_closed() -> None:
+    result = agentguard.evaluate_action(
+        wallet_address=WALLET,
+        action="seller.unknown.mutate",
+        amount_inr=0,
+        resource_id="resource-unknown",
+    )
+    assert result["decision"] == "deny"
+    assert result["reason_code"] == "action_not_allowed"
+
+
+def test_compile_and_confirm_mandate() -> None:
+    principal_id = f"wallet:{WALLET}"
+    mandate = agentguard.compile_mandate(
+        template="seller_ops_v1",
+        role="seller",
+        limits={"auto_approve_max_inr": {"seller.refund.issue": 2500}},
+        principal_id=principal_id,
+        wallet_address=WALLET,
+    )
+    assert mandate.status == "draft"
+
+    confirmed = agentguard.confirm_mandate(mandate.mandate_id, principal_id)
+    assert confirmed.status == "active"
+    assert confirmed.limits["auto_approve_max_inr"]["seller.refund.issue"] == 2500
+
+    need = agentguard.evaluate_action(
+        wallet_address=WALLET,
+        action="refund",
+        amount_inr=3000,
+        resource_id="ord-mandate",
+    )
+    assert need["decision"] == "need_approval"
+
+
+def test_compile_custom_allowed_actions_and_flat_limit() -> None:
+    principal_id = f"wallet:{WALLET}"
+    mandate = agentguard.compile_mandate(
+        template="seller_ops_v1",
+        role="seller",
+        limits={"refund_auto_max_inr": 1500},
+        allowed_actions=["seller.refund.issue", "seller.order.accept"],
+        principal_id=principal_id,
+        wallet_address=WALLET,
+    )
+    assert mandate.allowed_actions == ["seller.refund.issue", "seller.order.accept"]
+    assert mandate.limits["auto_approve_max_inr"]["seller.refund.issue"] == 1500
+    agentguard.confirm_mandate(mandate.mandate_id, principal_id)
+
+    denied = agentguard.evaluate_action(
+        wallet_address=WALLET,
+        action="seller.catalog.publish",
+        amount_inr=0,
+        resource_id="item-blocked",
+    )
+    assert denied["decision"] == "deny"
+    assert denied["reason_code"] == "action_not_allowed"
+
+
+def test_consume_approval_checks_bound_fields() -> None:
+    need = agentguard.evaluate_action(
+        wallet_address=WALLET,
+        action="refund",
+        amount_inr=7500,
+        resource_id="order-bound",
+    )
+    approval = need["approval"]
+    with pytest.raises(agentguard.ConflictError):
+        agentguard.consume_approval(
+            approval_id=approval["approval_id"],
+            wallet_address=WALLET,
+            action="refund",
+            amount_inr=7400,
+            resource_id="order-bound",
+        )
+
+    consumed = agentguard.consume_approval(
+        approval_id=approval["approval_id"],
+        wallet_address=WALLET,
+        action="refund",
+        amount_inr=7500,
+        resource_id="order-bound",
+        request_hash=approval["request_hash"],
+    )
+    assert consumed["receipt"]["outcome"] == "approved"
+
+
+def test_receipt_verify_and_tamper_detection() -> None:
+    client = TestClient(app)
+    allowed = client.post(
+        "/api/agentguard/actions/evaluate",
+        json={
+            "wallet_address": WALLET,
+            "action": "refund",
+            "amount_inr": 1000,
+            "resource_id": "ord-verify",
+        },
+    )
+    receipt = allowed.json()["data"]["receipt"]
+    verify = client.post("/api/agentguard/receipts/verify", json={"receipt_id": receipt["receipt_id"]})
+    assert verify.status_code == 200
+    assert verify.json()["data"]["valid"] is True
+
+    tampered = {**receipt, "amount_inr": 9999}
+    verify_tampered = client.post("/api/agentguard/receipts/verify", json={"receipt": tampered})
+    assert verify_tampered.status_code == 200
+    assert verify_tampered.json()["data"]["valid"] is False
