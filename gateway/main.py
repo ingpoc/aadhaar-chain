@@ -17,6 +17,7 @@ from app.models import (
 )
 from app.routes import router as identity_router, identities, _build_did
 from app.agentguard_routes import router as agentguard_router
+from app.ondc_onboard_routes import router as ondc_onboard_router
 from app.agent_manager import agent_manager
 from app.runtime_config import resolve_runtime_policy
 from app.session_auth import (
@@ -83,6 +84,7 @@ app.add_middleware(
 # Include identity router (no prefix, router already has prefix)
 app.include_router(identity_router)
 app.include_router(agentguard_router)
+app.include_router(ondc_onboard_router)
 
 
 # Health check endpoint

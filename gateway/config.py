@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     cursor_api_key: Optional[str] = None
     cursor_agent_model: str = "composer-2.5"
 
+    # OpenAI Realtime voice (Buyer M12) — server-side only
+    openai_api_key: Optional[str] = None
+    openai_realtime_model: str = "gpt-realtime-2.1-mini"
+
     # Storage
     data_dir: str = "./data"
     aadhaar_chain_env: str = "demo"
@@ -82,6 +86,38 @@ class Settings(BaseSettings):
     # Portfolio SSO session cookies (stateless signed tokens)
     session_secret: str = "aadhaarchain-local-dev-session-secret"
     session_ttl_hours: int = 24
+
+    # Social / demo principal (AgentGuard host identity — not wallet)
+    # Auth0 (preferred production IdP) — https://auth0.com/docs Authorization Code Flow
+    auth0_domain: Optional[str] = None
+    auth0_client_id: Optional[str] = None
+    auth0_client_secret: Optional[str] = None
+    auth0_audience: Optional[str] = None
+    auth0_redirect_uri: Optional[str] = None
+    # Legacy direct Google OAuth (optional; prefer Auth0 Google connection)
+    google_client_id: Optional[str] = None
+    google_client_secret: Optional[str] = None
+    google_redirect_uri: Optional[str] = None
+    auth_demo_continue: bool = True
+
+    # ONDC / Beckn (server-side only — never Vite secrets)
+    ondc_enabled: bool = False
+    ondc_subscriber_id: Optional[str] = None
+    ondc_bap_id: Optional[str] = None
+    ondc_bap_uri: Optional[str] = None
+    ondc_gateway_url: Optional[str] = None
+    ondc_registry_url: Optional[str] = None
+    ondc_signing_private_key_path: Optional[str] = None
+    ondc_encryption_private_key_path: Optional[str] = None
+    ondc_unique_key_id: Optional[str] = None
+    # Dual NP onboarding hosts (site verification + on_subscribe)
+    ondc_registry_env: str = "preprod"  # staging | preprod | prod — portal ACK is PreProd
+    ondc_buyer_subscriber_id: Optional[str] = "ondcbuyer.aadharcha.in"
+    ondc_seller_subscriber_id: Optional[str] = "ondcseller.aadharcha.in"
+    ondc_buyer_keys_dir: Optional[str] = None
+    ondc_seller_keys_dir: Optional[str] = None
+    # auto | portal | local — auto prefers portal-download PEMs when registry_env=preprod
+    ondc_keys_source: str = "auto"
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -147,3 +183,6 @@ def apply_runtime_environment() -> None:
 
     if settings.cursor_agent_model and not os.getenv("CURSOR_AGENT_MODEL"):
         os.environ["CURSOR_AGENT_MODEL"] = settings.cursor_agent_model
+
+    if settings.openai_api_key and not os.getenv("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = settings.openai_api_key
