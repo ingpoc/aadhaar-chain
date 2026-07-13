@@ -139,6 +139,7 @@ class SearchBody(BaseModel):
     city: Optional[str] = None
     domain: Optional[str] = None
     query: Optional[str] = None
+    include_configured_bpp: bool = False
 
 
 class OrderActionBody(BaseModel):
@@ -323,6 +324,30 @@ async def ondc_search(body: SearchBody) -> JSONResponse:
         http_status=status,
         gateway_response=data,
     )
+    direct_bpp: Optional[dict[str, Any]] = None
+    if body.include_configured_bpp:
+        # Portfolio proof: keep normal PreProd fanout, and send the same signed
+        # Beckn search to the server-configured BPP. Callers cannot supply a URL.
+        bpp_uri = str(getattr(settings, "ondc_bpp_uri", None) or "").rstrip("/")
+        if bpp_uri:
+            try:
+                bpp_status, bpp_data, _ = await _signed_post(f"{bpp_uri}/search", envelope)
+                bpp_ack = None
+                if isinstance(bpp_data, dict):
+                    bpp_ack = ((bpp_data.get("message") or {}).get("ack") or {}).get("status")
+                direct_bpp = {
+                    "bpp_uri": bpp_uri,
+                    "http_status": bpp_status,
+                    "ack": bpp_ack,
+                    "ok": bpp_status < 400 and bpp_ack != "NACK",
+                }
+                ondc_store.update_outbox(
+                    entry["id"],
+                    direct_bpp_response=bpp_data,
+                    direct_bpp_status=bpp_status,
+                )
+            except Exception as exc:  # noqa: BLE001
+                direct_bpp = {"bpp_uri": bpp_uri, "ok": False, "error": str(exc)}
     return JSONResponse(
         {
             "success": dispatch_status == "sent",
@@ -336,6 +361,7 @@ async def ondc_search(body: SearchBody) -> JSONResponse:
                 "ack": ack,
                 "gateway_url": _gateway_url(),
                 "gateway_response": data,
+                "direct_bpp": direct_bpp,
                 "note": "Poll GET /api/ondc/catalogs?transaction_id=… for on_search results.",
             },
         }

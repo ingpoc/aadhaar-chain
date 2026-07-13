@@ -94,6 +94,53 @@ def test_ondc_search_dispatches_when_configured(tmp_path: Path, ed25519_pem: Pat
     }
 
 
+def test_ondc_search_can_also_dispatch_to_configured_bpp(
+    tmp_path: Path, ed25519_pem: Path, monkeypatch
+):
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path / "data"))
+    monkeypatch.setattr(settings, "ondc_enabled", True)
+    monkeypatch.setattr(settings, "ondc_subscriber_id", "ondcbuyer.aadharcha.in")
+    monkeypatch.setattr(settings, "ondc_bap_id", "ondcbuyer.aadharcha.in")
+    monkeypatch.setattr(settings, "ondc_bap_uri", "https://ondcbuyer.aadharcha.in/ondc")
+    monkeypatch.setattr(settings, "ondc_bpp_uri", "https://ondcseller.aadharcha.in/ondc")
+    monkeypatch.setattr(settings, "ondc_unique_key_id", "test-uk-id")
+    monkeypatch.setattr(
+        settings, "ondc_signing_private_key_path", str(ed25519_pem / "signing_private.pem")
+    )
+    monkeypatch.setattr(settings, "ondc_gateway_url", "https://preprod.gateway.ondc.org/search")
+    monkeypatch.setattr(settings, "ondc_buyer_keys_dir", str(ed25519_pem))
+
+    mock_resp = AsyncMock()
+    mock_resp.status_code = 200
+    mock_resp.json = lambda: {"message": {"ack": {"status": "ACK"}}}
+    mock_resp.text = '{"message":{"ack":{"status":"ACK"}}}'
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = None
+    mock_client.post = AsyncMock(return_value=mock_resp)
+
+    from main import app
+
+    with patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client):
+        client = TestClient(app)
+        res = client.post(
+            "/api/ondc/search",
+            json={"query": "atta", "include_configured_bpp": True},
+        )
+
+    assert res.status_code == 200
+    assert res.json()["data"]["direct_bpp"] == {
+        "bpp_uri": "https://ondcseller.aadharcha.in/ondc",
+        "http_status": 200,
+        "ack": "ACK",
+        "ok": True,
+    }
+    assert [call.args[0] for call in mock_client.post.await_args_list] == [
+        "https://preprod.gateway.ondc.org/search",
+        "https://ondcseller.aadharcha.in/ondc/search",
+    ]
+
+
 def test_on_search_inbox_and_catalogs(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(settings, "data_dir", str(tmp_path / "data"))
     from main import app
