@@ -187,6 +187,9 @@ def _build_search_envelope(body: SearchBody) -> dict[str, Any]:
                 }
             },
         }
+    payment = intent.setdefault("payment", {})
+    payment.setdefault("@ondc/org/buyer_app_finder_fee_type", "percent")
+    payment.setdefault("@ondc/org/buyer_app_finder_fee_amount", "0")
     bap_id = getattr(settings, "ondc_bap_id", None) or _subscriber_id()
     return {
         "context": {

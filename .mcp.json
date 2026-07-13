@@ -19,10 +19,7 @@
         "run",
         "python",
         "server.py"
-      ],
-      "env": {
-        "VOYAGE_API_KEY": "pa-xq4te3GFOurtIgm4HMuCSZ6H4lG4LvfaH9ZiiOarwjT"
-      }
+      ]
     },
     "netlify": {
       "command": "npx",

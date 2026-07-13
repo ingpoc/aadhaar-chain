@@ -88,6 +88,10 @@ def test_ondc_search_dispatches_when_configured(tmp_path: Path, ed25519_pem: Pat
     assert sent["context"]["action"] == "search"
     assert sent["context"]["domain"] == "ONDC:RET10"
     assert sent["message"]["intent"]["item"]["descriptor"]["name"] == "banana"
+    assert sent["message"]["intent"]["payment"] == {
+        "@ondc/org/buyer_app_finder_fee_type": "percent",
+        "@ondc/org/buyer_app_finder_fee_amount": "0",
+    }
 
 
 def test_on_search_inbox_and_catalogs(tmp_path: Path, monkeypatch):
