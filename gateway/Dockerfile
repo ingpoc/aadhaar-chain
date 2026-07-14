@@ -16,6 +16,9 @@ COPY --chown=appuser:appuser . .
 
 ENV HOST=0.0.0.0
 ENV PORT=10000
+# Render Free: non-root cannot write ./data; ephemeral /tmp is the free path (no Disk).
+ENV DATA_DIR=/tmp/aadharchain-data
+ENV ONDC_ENV_KEYS_DIR=/tmp/ondc-env
 
 EXPOSE 10000
 

@@ -1,6 +1,8 @@
 """Tests for social/demo principal sessions."""
+import pytest
 from fastapi.testclient import TestClient
 
+from config import settings
 from main import app
 
 
@@ -40,7 +42,12 @@ def test_demo_continue_get_redirects() -> None:
     assert "aadharcha_session" in res.cookies
 
 
-def test_auth_providers_lists_demo() -> None:
+def test_auth_providers_lists_demo(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Isolate from local/.env Auth0 so CI and booth machines agree.
+    monkeypatch.setattr(settings, "auth0_domain", None)
+    monkeypatch.setattr(settings, "auth0_client_id", None)
+    monkeypatch.setattr(settings, "auth0_client_secret", None)
+    monkeypatch.setattr(settings, "auth_demo_continue", True)
     res = _client().get("/api/auth/providers")
     assert res.status_code == 200
     data = res.json()["data"]

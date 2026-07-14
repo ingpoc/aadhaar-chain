@@ -55,3 +55,4 @@ data/
 .pytest_cache/
 .coverage
 htmlcov/
+gateway/.local/
