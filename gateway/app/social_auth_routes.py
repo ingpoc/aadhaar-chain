@@ -294,6 +294,7 @@ async def demo_continue_post(body: DemoContinueBody) -> JSONResponse:
                     "principal_id": principal_id,
                     "identity_provider": "demo",
                     "display_name": body.display_name or "Demo User",
+                    "aud": body.audience,
                 }
             ),
         }

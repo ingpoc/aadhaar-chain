@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from app import commerce_demo
 from app.models import ApiResponse
+from config import get_runtime_mode
 
 router = APIRouter(prefix="/api/demo-commerce", tags=["demo-commerce"])
 
@@ -56,6 +57,14 @@ def _handle_error(exc: Exception) -> None:
     if isinstance(exc, ValueError):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     raise exc
+
+
+@router.post("/test-fixtures/cleanup", response_model=ApiResponse)
+async def cleanup_test_fixtures() -> ApiResponse:
+    if get_runtime_mode() != "demo":
+        raise HTTPException(status_code=404, detail="Not found")
+    result = commerce_demo.cleanup_test_artifacts()
+    return ApiResponse(success=True, message="Test fixtures removed", data=result)
 
 
 @router.post("/seller/items", response_model=ApiResponse)

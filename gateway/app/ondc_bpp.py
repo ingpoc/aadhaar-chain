@@ -278,7 +278,7 @@ async def bpp_status() -> JSONResponse:
     )
 
 
-PREPROD_MARKER_TITLE = "AgentGuard PreProd Atta 1kg"
+PREPROD_MARKER_TITLE = "AadhaarChain Whole Wheat Atta 1kg"
 PREPROD_MARKER_CREATE_KEY = "bpp-ensure-agentguard-atta"
 PREPROD_MARKER_PUBLISH_KEY = "bpp-ensure-agentguard-atta:publish"
 
@@ -305,7 +305,7 @@ def ensure_preprod_marker_item() -> dict[str, Any]:
     created = create_item(
         {
             "title": PREPROD_MARKER_TITLE,
-            "description": "Network-visible Seller catalog item for PreProd Buyer discovery",
+            "description": "Stone-ground whole wheat flour from AadhaarChain Seller.",
             "price_inr": 89,
             "inventory": 25,
             "seller_id": "ondcseller.aadharcha.in",
@@ -329,13 +329,12 @@ async def bpp_ensure_demo_item() -> JSONResponse:
 def _order_from_request(body: dict[str, Any]) -> dict[str, Any]:
     message = body.get("message") or {}
     order = dict(message.get("order") or {})
-    if order.get("items"):
-        return order
-    # Build from published catalog when caller sends item ids only
+    # Resolve requested ids against the published Seller catalog. A bare ACK
+    # with an unpriced item is not a useful select/init/confirm proof.
     providers = build_catalog_providers(query="")
     catalog_items = (providers[0].get("items") if providers else []) or []
     by_id = {i.get("id"): i for i in catalog_items}
-    requested = message.get("items") or order.get("item_ids") or []
+    requested = order.get("items") or message.get("items") or order.get("item_ids") or []
     items: list[dict[str, Any]] = []
     if isinstance(requested, list):
         for row in requested:
@@ -348,7 +347,13 @@ def _order_from_request(body: dict[str, Any]) -> dict[str, Any]:
                 found = by_id.get(iid) if iid else None
                 qty = row.get("quantity") or {"count": "1"}
                 if found:
-                    items.append({**found, "quantity": qty if isinstance(qty, dict) else {"count": str(qty)}})
+                    items.append(
+                        {
+                            **found,
+                            **row,
+                            "quantity": qty if isinstance(qty, dict) else {"count": str(qty)},
+                        }
+                    )
                 elif iid:
                     items.append({"id": iid, "quantity": qty if isinstance(qty, dict) else {"count": "1"}})
     if not items and catalog_items:
@@ -356,14 +361,18 @@ def _order_from_request(body: dict[str, Any]) -> dict[str, Any]:
     total = 0.0
     for item in items:
         try:
-            total += float(((item.get("price") or {}).get("value") or 0))
+            quantity = float(((item.get("quantity") or {}).get("count") or 1))
+            total += float(((item.get("price") or {}).get("value") or 0)) * quantity
         except (TypeError, ValueError):
             pass
     price_str = f"{total:.2f}"
     return {
-        "provider": {"id": PROVIDER_ID, "descriptor": {"name": "AadhaarChain AgentGuard Seller"}},
+        **order,
+        "provider": order.get("provider")
+        or {"id": PROVIDER_ID, "descriptor": {"name": "AadhaarChain AgentGuard Seller"}},
         "items": items,
-        "quote": {
+        "quote": order.get("quote")
+        or {
             "price": {"currency": "INR", "value": price_str},
             "breakup": [
                 {

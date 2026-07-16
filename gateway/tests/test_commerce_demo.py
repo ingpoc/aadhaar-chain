@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
+from app.commerce_demo import load_state
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +43,7 @@ def test_publish_search_order_and_idempotency() -> None:
     search = client.get("/api/demo-commerce/buyer/search", params={"q": "Token Nxt"})
     assert search.status_code == 200
     assert search.json()["data"]["count"] == 1
+    assert search.json()["data"]["items"][0]["inventory"] == 4
 
     order_payload = {
         "idempotency_key": "order-create-1",
@@ -59,3 +61,33 @@ def test_publish_search_order_and_idempotency() -> None:
     assert seller_orders.status_code == 200
     assert seller_orders.json()["data"]["count"] == 1
     assert seller_orders.json()["data"]["orders"][0]["buyer_id"] == "buyer-demo"
+
+
+def test_cleanup_removes_only_deterministic_test_artifacts() -> None:
+    client = TestClient(app)
+    fixture = client.post(
+        "/api/demo-commerce/seller/items",
+        json={
+            "title": "Matrix Fresh Atta 123456",
+            "description": "Fresh local Samantha checkout fixture",
+            "price_inr": 100,
+            "inventory": 1,
+        },
+    ).json()["data"]["item"]
+    real = client.post(
+        "/api/demo-commerce/seller/items",
+        json={
+            "title": "Whole Wheat Atta 1kg",
+            "description": "Stone-ground whole wheat flour",
+            "price_inr": 120,
+            "inventory": 10,
+        },
+    ).json()["data"]["item"]
+
+    cleanup = client.post("/api/demo-commerce/test-fixtures/cleanup")
+
+    assert cleanup.status_code == 200
+    assert cleanup.json()["data"]["items"] == 1
+    ids = set(load_state().items)
+    assert fixture["item_id"] not in ids
+    assert real["item_id"] in ids

@@ -328,7 +328,13 @@ async def ondc_search(body: SearchBody) -> JSONResponse:
     if body.include_configured_bpp:
         # Portfolio proof: keep normal PreProd fanout, and send the same signed
         # Beckn search to the server-configured BPP. Callers cannot supply a URL.
-        bpp_uri = str(getattr(settings, "ondc_bpp_uri", None) or "").rstrip("/")
+        # An explicitly blank Render env used to suppress the Settings default,
+        # leaving direct_bpp=null while gateway fanout still ACKed. Keep the
+        # portfolio Seller route fail-closed and deterministic.
+        bpp_uri = str(
+            getattr(settings, "ondc_bpp_uri", None)
+            or "https://ondcseller.aadharcha.in/ondc"
+        ).rstrip("/")
         if bpp_uri:
             try:
                 bpp_status, bpp_data, _ = await _signed_post(f"{bpp_uri}/search", envelope)

@@ -21,6 +21,7 @@ def test_demo_continue_issues_principal_session() -> None:
     assert body["success"] is True
     assert body["data"]["principal_id"].startswith("principal:demo:")
     assert body["data"]["identity_provider"] == "demo"
+    assert body["data"]["audience"] == "ondcbuyer"
     assert "wallet_address" not in body["data"]
     assert "aadharcha_session" in res.cookies
 
@@ -28,6 +29,7 @@ def test_demo_continue_issues_principal_session() -> None:
     assert me.status_code == 200
     assert me.json()["data"]["principal_id"] == body["data"]["principal_id"]
     assert me.json()["data"]["display_name"] == "Booth Demo"
+    assert me.json()["data"]["audience"] == "ondcbuyer"
 
 
 def test_demo_continue_get_redirects() -> None:

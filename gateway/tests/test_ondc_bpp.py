@@ -1,6 +1,7 @@
 """Seller BPP search → on_search from published demo-commerce items."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -43,7 +44,7 @@ def test_bpp_search_acks_and_posts_on_search(tmp_path: Path, seller_keys: Path, 
 
     created = create_item(
         {
-            "title": "AgentGuard PreProd Atta 1kg",
+            "title": "AadhaarChain Whole Wheat Atta 1kg",
             "description": "test",
             "price_inr": 89,
             "inventory": 10,
@@ -105,7 +106,7 @@ def test_bpp_ensure_demo_item(tmp_path: Path, monkeypatch):
     client = TestClient(app)
     first = client.post("/api/ondc/bpp/ensure-demo-item")
     assert first.status_code == 200
-    assert first.json()["data"]["item"]["title"] == "AgentGuard PreProd Atta 1kg"
+    assert first.json()["data"]["item"]["title"] == "AadhaarChain Whole Wheat Atta 1kg"
     second = client.post("/api/ondc/bpp/ensure-demo-item")
     assert second.json()["data"]["created"] is False
 
@@ -125,7 +126,7 @@ def test_bpp_select_init_confirm_ack_and_callback(tmp_path: Path, seller_keys: P
 
     created = create_item(
         {
-            "title": "AgentGuard PreProd Atta 1kg",
+            "title": "AadhaarChain Whole Wheat Atta 1kg",
             "description": "test",
             "price_inr": 89,
             "inventory": 10,
@@ -159,7 +160,7 @@ def test_bpp_select_init_confirm_ack_and_callback(tmp_path: Path, seller_keys: P
             "country": "IND",
             "core_version": "1.2.0",
         },
-        "message": {"order": {"items": [{"id": item_id, "quantity": {"count": "1"}}]}},
+        "message": {"order": {"items": [{"id": item_id, "quantity": {"count": "2"}}]}},
     }
 
     with patch("app.ondc_bpp.httpx.AsyncClient", return_value=mock_client):
@@ -176,9 +177,25 @@ def test_bpp_select_init_confirm_ack_and_callback(tmp_path: Path, seller_keys: P
     assert any(t.endswith("/on_select") for t in targets)
     assert any(t.endswith("/on_init") for t in targets)
     assert any(t.endswith("/on_confirm") for t in targets)
+    callback_orders = {}
+    for call in mock_client.post.await_args_list:
+        payload = json.loads(call.kwargs["content"].decode("utf-8"))
+        callback_orders[payload["context"]["action"]] = payload["message"]["order"]
+    assert set(callback_orders) == {"on_select", "on_init", "on_confirm"}
+    for order in callback_orders.values():
+        assert order["provider"]["id"] == "aadhaar-seller-isn"
+        assert order["items"][0]["id"] == item_id
+        assert order["items"][0]["quantity"]["count"] == "2"
+        assert order["items"][0]["price"]["value"] == "89.00"
+        assert order["quote"]["price"]["value"] == "178.00"
+    assert callback_orders["on_init"]["payment"]["status"] == "NOT-PAID"
+    assert callback_orders["on_confirm"]["payment"]["status"] == "PAID"
+    assert callback_orders["on_confirm"]["state"] == "Accepted"
 
     from app import ondc_store
 
     orders = ondc_store.list_orders(transaction_id="txn-order-1")
     assert orders
     assert orders[0]["state"] == "Accepted"
+    assert orders[0]["order"]["items"][0]["id"] == item_id
+    assert orders[0]["order"]["quote"]["price"]["value"] == "178.00"

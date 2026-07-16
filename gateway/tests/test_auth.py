@@ -51,6 +51,7 @@ def test_sso_login_proof_token_works_without_identity_anchor() -> None:
         assert body["data"]["wallet_address"] == wallet_address
         assert body["data"]["principal_id"] == f"wallet:{wallet_address}"
         assert body["data"]["did"] == f"did:solana:{wallet_address}"
+        assert body["data"]["audience"] == "buyer"
 
         validate = client.get("/api/auth/validate", cookies=verify.cookies)
         assert validate.json()["data"]["valid"] is True

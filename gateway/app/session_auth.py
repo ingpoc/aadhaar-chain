@@ -138,6 +138,7 @@ def session_user_payload(session: dict[str, Any]) -> dict[str, Any]:
         "principal_id": principal_id,
         "identity_provider": session.get("identity_provider") or "wallet",
         "assurance_level": "demo" if session.get("identity_provider") == "demo" else "social",
+        "audience": session.get("aud"),
     }
     if session.get("display_name"):
         data["display_name"] = session["display_name"]

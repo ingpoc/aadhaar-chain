@@ -107,6 +107,66 @@ def update_item(item_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {"item": updated, "inventory": state.inventory.get(item_id, 0), "message_id": _new_id("msg")}
 
 
+def cleanup_test_artifacts() -> dict[str, int]:
+    """Remove deterministic local test fixtures without touching operator-created listings."""
+    state = load_state()
+    fixture_descriptions = {
+        "Shared local commerce item for AgentGuard two-sided proof.",
+        "Local Samantha order-lifecycle fixture",
+        "Fresh local Samantha checkout fixture",
+    }
+    item_ids = {
+        item_id
+        for item_id, item in state.items.items()
+        if str(item.get("title") or "").startswith(
+            ("Token Nxt proof SKU ", "Matrix ", "Evening Ragi Flour")
+        )
+        or str(item.get("description") or "") in fixture_descriptions
+        or str(item.get("seller_id") or "").startswith("seller-ag-")
+    }
+    order_ids = {
+        order_id
+        for order_id, order in state.orders.items()
+        if order.get("item_id") in item_ids
+        or order.get("item_id") in {"local-cart", "demo-atta-5kg"}
+        or str(order.get("seller_id") or "").startswith("seller-ag-")
+    }
+    issue_ids = {
+        issue_id
+        for issue_id, issue in state.issues.items()
+        if issue.get("order_id") in order_ids
+    }
+    remedy_ids = {
+        remedy_id
+        for remedy_id, remedy in state.remedies.items()
+        if remedy.get("order_id") in order_ids or remedy.get("issue_id") in issue_ids
+    }
+
+    for item_id in item_ids:
+        state.items.pop(item_id, None)
+        state.inventory.pop(item_id, None)
+    for order_id in order_ids:
+        state.orders.pop(order_id, None)
+    for issue_id in issue_ids:
+        state.issues.pop(issue_id, None)
+    for remedy_id in remedy_ids:
+        state.remedies.pop(remedy_id, None)
+
+    artifact_ids = item_ids | order_ids | issue_ids | remedy_ids
+    for key, value in list(state.idempotency.items()):
+        serialized = json.dumps(value, sort_keys=True)
+        if any(artifact_id in serialized for artifact_id in artifact_ids):
+            state.idempotency.pop(key, None)
+
+    save_state(state)
+    return {
+        "items": len(item_ids),
+        "orders": len(order_ids),
+        "issues": len(issue_ids),
+        "remedies": len(remedy_ids),
+    }
+
+
 def publish_item(item_id: str, *, idempotency_key: Optional[str] = None) -> dict[str, Any]:
     state = load_state()
     idem = _idempotency_key(f"seller.items.publish.{item_id}", idempotency_key)
@@ -125,7 +185,11 @@ def publish_item(item_id: str, *, idempotency_key: Optional[str] = None) -> dict
 
 def search_items(query: Optional[str] = None) -> dict[str, Any]:
     state = load_state()
-    rows = [item for item in state.items.values() if item.get("status") == "published"]
+    rows = [
+        {**item, "inventory": state.inventory.get(item_id, 0)}
+        for item_id, item in state.items.items()
+        if item.get("status") == "published"
+    ]
     if query:
         lowered = query.lower()
         rows = [item for item in rows if lowered in str(item.get("title", "")).lower()]
