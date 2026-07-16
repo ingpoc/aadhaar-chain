@@ -107,7 +107,7 @@ def update_item(item_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {"item": updated, "inventory": state.inventory.get(item_id, 0), "message_id": _new_id("msg")}
 
 
-def cleanup_test_artifacts() -> dict[str, int]:
+def cleanup_test_artifacts(*, explicit_order_ids: Optional[set[str]] = None) -> dict[str, int]:
     """Remove deterministic local test fixtures without touching operator-created listings."""
     state = load_state()
     fixture_descriptions = {
@@ -131,6 +131,13 @@ def cleanup_test_artifacts() -> dict[str, int]:
         or order.get("item_id") in {"local-cart", "demo-atta-5kg"}
         or str(order.get("seller_id") or "").startswith("seller-ag-")
     }
+    explicit_order_ids = explicit_order_ids or set()
+    explicit_orders = {
+        order_id: state.orders[order_id]
+        for order_id in explicit_order_ids
+        if order_id in state.orders
+    }
+    order_ids.update(explicit_orders)
     issue_ids = {
         issue_id
         for issue_id, issue in state.issues.items()
@@ -145,6 +152,13 @@ def cleanup_test_artifacts() -> dict[str, int]:
     for item_id in item_ids:
         state.items.pop(item_id, None)
         state.inventory.pop(item_id, None)
+    restored_inventory = 0
+    for order_id, order in explicit_orders.items():
+        item_id = str(order.get("item_id") or "")
+        quantity = int(order.get("quantity") or 0)
+        if item_id in state.items and quantity > 0:
+            state.inventory[item_id] = state.inventory.get(item_id, 0) + quantity
+            restored_inventory += quantity
     for order_id in order_ids:
         state.orders.pop(order_id, None)
     for issue_id in issue_ids:
@@ -164,6 +178,7 @@ def cleanup_test_artifacts() -> dict[str, int]:
         "orders": len(order_ids),
         "issues": len(issue_ids),
         "remedies": len(remedy_ids),
+        "restored_inventory": restored_inventory,
     }
 
 

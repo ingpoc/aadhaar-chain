@@ -91,3 +91,27 @@ def test_cleanup_removes_only_deterministic_test_artifacts() -> None:
     ids = set(load_state().items)
     assert fixture["item_id"] not in ids
     assert real["item_id"] in ids
+
+
+def test_cleanup_exact_order_restores_real_item_inventory() -> None:
+    client = TestClient(app)
+    item = client.post(
+        "/api/demo-commerce/seller/items",
+        json={"title": "Millet Flour", "price_inr": 120, "inventory": 3},
+    ).json()["data"]["item"]
+    client.post(f"/api/demo-commerce/seller/items/{item['item_id']}/publish")
+    order = client.post(
+        "/api/demo-commerce/buyer/orders",
+        json={"item_id": item["item_id"], "quantity": 2},
+    ).json()["data"]["order"]
+
+    cleanup = client.post(
+        "/api/demo-commerce/test-fixtures/cleanup",
+        json={"data": {"order_ids": [order["order_id"]]}},
+    )
+
+    assert cleanup.status_code == 200
+    assert cleanup.json()["data"]["orders"] == 1
+    assert cleanup.json()["data"]["restored_inventory"] == 2
+    assert load_state().inventory[item["item_id"]] == 3
+    assert order["order_id"] not in load_state().orders

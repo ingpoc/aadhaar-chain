@@ -60,10 +60,14 @@ def _handle_error(exc: Exception) -> None:
 
 
 @router.post("/test-fixtures/cleanup", response_model=ApiResponse)
-async def cleanup_test_fixtures() -> ApiResponse:
+async def cleanup_test_fixtures(body: CommerceBody = CommerceBody()) -> ApiResponse:
     if get_runtime_mode() != "demo":
         raise HTTPException(status_code=404, detail="Not found")
-    result = commerce_demo.cleanup_test_artifacts()
+    requested = body.data.get("order_ids") or []
+    explicit_order_ids = {
+        str(order_id) for order_id in requested if isinstance(order_id, str) and order_id.strip()
+    }
+    result = commerce_demo.cleanup_test_artifacts(explicit_order_ids=explicit_order_ids)
     return ApiResponse(success=True, message="Test fixtures removed", data=result)
 
 
