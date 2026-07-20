@@ -135,8 +135,8 @@ async def _stream_cursor(
         f"Subject: {subject_id}\n"
         f"Mode: {session['mode']}\n"
         f"Allowed capabilities: {', '.join(session['allowed_capabilities']) or 'none'}\n"
-        "Stay concise. Do not claim live UPI, production ONDC, or payment settlement.\n"
-        "Payment rails are simulated; AgentGuard authorization is real when tools use it.\n"
+        "Stay concise. Do not claim payment settlement or network status that the recorded tool result does not prove.\n"
+        "AgentGuard authorization must complete before any protected commerce tool reports success.\n"
         f"Caller context JSON: {json.dumps(body.context)[:4000]}"
     )
 

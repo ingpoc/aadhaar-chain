@@ -6,9 +6,6 @@ import secrets
 from time import monotonic
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
-from solders.pubkey import Pubkey
-from solders.signature import Signature
-
 from app.models import (
     AgentRunProvenance,
     AuditReceiptReference,
@@ -108,6 +105,8 @@ async def _apply_on_chain_verification_bitmap(
 
 
 def _register_solana_bridge_hooks() -> None:
+    if not settings.solana_on_chain_enabled:
+        return
     from app.solana_bridge import get_solana_bridge
 
     get_solana_bridge().set_on_chain_approved_handler(_apply_on_chain_verification_bitmap)
@@ -1230,6 +1229,9 @@ def _verify_signed_identity_proof(data: SignedIdentityProofRequest) -> SignedIde
         )
 
     try:
+        from solders.pubkey import Pubkey
+        from solders.signature import Signature
+
         public_key = Pubkey.from_string(data.wallet_address)
         signature = Signature.from_string(data.signature)
     except Exception:

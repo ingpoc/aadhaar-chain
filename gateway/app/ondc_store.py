@@ -116,6 +116,7 @@ def catalogs_for_transaction(transaction_id: str) -> list[dict[str, Any]]:
                         "currency": price.get("currency") or "INR",
                         "provider_id": provider.get("id"),
                         "provider_name": descriptor.get("name"),
+                        "delivery_areas": item.get("delivery_areas") or [],
                         "bpp_id": bpp_id,
                         "bpp_uri": bpp_uri,
                         "transaction_id": transaction_id,

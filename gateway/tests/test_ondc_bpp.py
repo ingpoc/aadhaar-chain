@@ -44,11 +44,13 @@ def test_bpp_search_acks_and_posts_on_search(tmp_path: Path, seller_keys: Path, 
 
     created = create_item(
         {
-            "title": "AadhaarChain Whole Wheat Atta 1kg",
+            "title": "Sampoorna Whole Wheat Atta 1kg",
             "description": "test",
             "price_inr": 89,
             "inventory": 10,
             "seller_id": "ondcseller.aadharcha.in",
+            "seller_name": "Sampoorna Foods",
+            "delivery_areas": ["Pune", "411001"],
         }
     )
     publish_item(created["item"]["item_id"])
@@ -97,18 +99,7 @@ def test_bpp_search_acks_and_posts_on_search(tmp_path: Path, seller_keys: Path, 
     assert providers
     names = [i["descriptor"]["name"] for i in providers[0]["items"]]
     assert any("Atta" in n for n in names)
-
-
-def test_bpp_ensure_demo_item(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr(settings, "data_dir", str(tmp_path / "data"))
-    from main import app
-
-    client = TestClient(app)
-    first = client.post("/api/ondc/bpp/ensure-demo-item")
-    assert first.status_code == 200
-    assert first.json()["data"]["item"]["title"] == "AadhaarChain Whole Wheat Atta 1kg"
-    second = client.post("/api/ondc/bpp/ensure-demo-item")
-    assert second.json()["data"]["created"] is False
+    assert providers[0]["items"][0]["delivery_areas"] == ["Pune", "411001"]
 
 
 def test_bpp_select_init_confirm_ack_and_callback(tmp_path: Path, seller_keys: Path, monkeypatch):
@@ -126,11 +117,12 @@ def test_bpp_select_init_confirm_ack_and_callback(tmp_path: Path, seller_keys: P
 
     created = create_item(
         {
-            "title": "AadhaarChain Whole Wheat Atta 1kg",
+            "title": "Sampoorna Whole Wheat Atta 1kg",
             "description": "test",
             "price_inr": 89,
             "inventory": 10,
             "seller_id": "ondcseller.aadharcha.in",
+            "seller_name": "Sampoorna Foods",
         }
     )
     item_id = created["item"]["item_id"]

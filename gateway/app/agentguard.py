@@ -5,6 +5,7 @@ import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Any, Callable, Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -24,6 +25,7 @@ from config import settings
 
 STATE_FILE = "agentguard-state.json"
 APPROVAL_TTL_MINUTES = 15
+_STATE_LOCK = RLock()
 
 Decision = Literal["allow", "need_approval", "deny"]
 AgentStatus = Literal["active", "paused", "revoked"]
@@ -422,6 +424,11 @@ def compile_mandate(
 
 
 def confirm_mandate(mandate_id: str, principal_id: str) -> MandateRecord:
+    with _STATE_LOCK:
+        return _confirm_mandate_locked(mandate_id, principal_id)
+
+
+def _confirm_mandate_locked(mandate_id: str, principal_id: str) -> MandateRecord:
     state = load_state()
     mandate = state.mandates.get(mandate_id)
     if not mandate:
@@ -438,6 +445,7 @@ def confirm_mandate(mandate_id: str, principal_id: str) -> MandateRecord:
     state.agents[agent.agent_id] = agent
     state.mandates[mandate_id] = mandate
     state.policies[policy_id] = _policy_from_mandate(policy_id, mandate)
+    _expire_pending_approvals(state, agent.agent_id)
     state.mandate_history.append(
         {"event": "confirmed", "mandate_id": mandate_id, "principal_id": principal_id, "at": now}
     )
@@ -458,6 +466,11 @@ def resume_agent(agent_id: str) -> AgentRecord:
 
 
 def revoke_agent(agent_id: str) -> AgentRecord:
+    with _STATE_LOCK:
+        return _revoke_agent_locked(agent_id)
+
+
+def _revoke_agent_locked(agent_id: str) -> AgentRecord:
     state = load_state()
     agent = state.agents.get(agent_id)
     if not agent:
@@ -469,19 +482,29 @@ def revoke_agent(agent_id: str) -> AgentRecord:
         state.mandates[agent.mandate_id] = state.mandates[agent.mandate_id].model_copy(
             update={"status": "revoked"}
         )
+    _expire_pending_approvals(state, agent_id)
     save_state(state)
     return agent
+
+
+def _expire_pending_approvals(state: AgentGuardState, agent_id: str) -> None:
+    for approval_id, approval in list(state.approvals.items()):
+        if approval.agent_id == agent_id and approval.status == "issued":
+            state.approvals[approval_id] = approval.model_copy(update={"status": "expired"})
 
 
 def _set_agent_status(agent_id: str, status: AgentStatus) -> AgentRecord:
-    state = load_state()
-    agent = state.agents.get(agent_id)
-    if not agent:
-        raise KeyError(f"Unknown agent: {agent_id}")
-    agent = agent.model_copy(update={"status": status, "updated_at": _utcnow()})
-    state.agents[agent_id] = agent
-    save_state(state)
-    return agent
+    with _STATE_LOCK:
+        state = load_state()
+        agent = state.agents.get(agent_id)
+        if not agent:
+            raise KeyError(f"Unknown agent: {agent_id}")
+        agent = agent.model_copy(update={"status": status, "updated_at": _utcnow()})
+        state.agents[agent_id] = agent
+        if status != "active":
+            _expire_pending_approvals(state, agent_id)
+        save_state(state)
+        return agent
 
 
 def evaluate_action(
@@ -803,6 +826,37 @@ def consume_approval(
     amount_inr: Optional[int] = None,
     resource_id: Optional[str] = None,
     request_hash: Optional[str] = None,
+    counterparty_id: Optional[str] = None,
+    payload: Optional[dict[str, Any]] = None,
+    validate_request: bool = False,
+) -> dict[str, Any]:
+    with _STATE_LOCK:
+        return _consume_approval_locked(
+            approval_id=approval_id,
+            wallet_address=wallet_address,
+            principal_id=principal_id,
+            action=action,
+            amount_inr=amount_inr,
+            resource_id=resource_id,
+            request_hash=request_hash,
+            counterparty_id=counterparty_id,
+            payload=payload,
+            validate_request=validate_request,
+        )
+
+
+def _consume_approval_locked(
+    *,
+    approval_id: str,
+    wallet_address: Optional[str] = None,
+    principal_id: Optional[str] = None,
+    action: Optional[str] = None,
+    amount_inr: Optional[int] = None,
+    resource_id: Optional[str] = None,
+    request_hash: Optional[str] = None,
+    counterparty_id: Optional[str] = None,
+    payload: Optional[dict[str, Any]] = None,
+    validate_request: bool = False,
 ) -> dict[str, Any]:
     state = load_state()
     approval = state.approvals.get(approval_id)
@@ -833,19 +887,49 @@ def consume_approval(
     if request_hash and request_hash != approval.request_hash:
         raise ConflictError("Approval request hash mismatch.")
 
+    agent = state.agents.get(approval.agent_id)
+    if not agent or agent.principal_id != approval.principal_id:
+        raise ConflictError("Approval agent is no longer valid.")
+    if agent.status != "active":
+        raise ConflictError(f"Approval invalidated: agent is {agent.status}.")
+    if agent.mandate_id != approval.mandate_id:
+        raise ConflictError("Approval invalidated by mandate replacement.")
+    mandate = state.mandates.get(approval.mandate_id)
+    if not mandate or mandate.status != "active":
+        raise ConflictError("Approval mandate is no longer active.")
+    if mandate.version != approval.mandate_version:
+        raise ConflictError("Approval invalidated by mandate version change.")
+    policy = state.policies.get(agent.policy_id or "")
+    if not policy or policy.status != "active" or policy.version != approval.policy_version:
+        raise ConflictError("Approval invalidated by policy version change.")
+    if validate_request:
+        candidate = _action_request(
+            principal_id=approval.principal_id,
+            wallet_address=approval.wallet_address,
+            role=mandate.role,
+            agent_id=approval.agent_id,
+            action=normalize_action(action or approval.action) or "",
+            amount_inr=approval.amount_inr if amount_inr is None else amount_inr,
+            resource_id=resource_id or approval.resource_id,
+            nonce=approval.nonce,
+            expires_at=approval.expires_at,
+            counterparty_id=counterparty_id,
+            payload=payload,
+        )
+        if sha256_hex(canonicalize(candidate)) != approval.request_hash:
+            raise ConflictError("Approval canonical request mismatch.")
+
     now = _utcnow()
     approval = approval.model_copy(update={"status": "consumed", "consumed_at": now})
     state.approvals[approval_id] = approval
     state.consumed_nonces[approval.nonce] = approval_id
     save_state(state)
 
-    agent = get_agent(approval.agent_id)
-    mandate = get_mandate(approval.mandate_id)
     receipt = _write_receipt(
         principal_id=approval.principal_id,
         wallet_address=approval.wallet_address,
         agent_id=approval.agent_id,
-        policy_id=agent.policy_id if agent else None,
+        policy_id=agent.policy_id,
         mandate_id=approval.mandate_id,
         mandate_version=approval.mandate_version,
         action=approval.action,
@@ -858,7 +942,7 @@ def consume_approval(
     )
     return {
         "approval": approval.model_dump(),
-        "mandate": mandate.model_dump() if mandate else None,
+        "mandate": mandate.model_dump(),
         "receipt": receipt.model_dump(),
     }
 
@@ -894,6 +978,8 @@ def execute_action(
             action=normalized,
             amount_inr=amount_inr,
             resource_id=resource_id,
+            payload=payload,
+            validate_request=True,
         )
         agent = get_agent(consumed["approval"]["agent_id"])
         mandate = get_mandate(consumed["approval"]["mandate_id"])
@@ -945,6 +1031,26 @@ def execute_action(
         request_hash=request_hash,
         result=result,
     )
+    if normalized == "buyer.checkout.commit":
+        from app import commerce_demo
+
+        order = result.get("order") if isinstance(result, dict) else None
+        order_id = order.get("order_id") if isinstance(order, dict) else None
+        if order_id:
+            result = {
+                **result,
+                "order": commerce_demo.record_order_authorization(
+                    str(order_id),
+                    {
+                        "decision": "allow",
+                        "reason_code": "exact_approval" if approval_id else "within_policy",
+                        "receipt_id": receipt.receipt_id,
+                        "approval_id": approval_id,
+                        "amount_inr": amount_inr,
+                        "recorded_at": receipt.created_at,
+                    },
+                ),
+            }
     return {
         "decision": "allow",
         "reason": "Executed.",
@@ -1028,19 +1134,72 @@ def _commerce_executor(action: str) -> Executor:
         from app import commerce_demo
 
         payload = context["payload"]
-        key = context["idempotency_key"]
+        principal_id = str(context.get("principal_id") or "")
+        if not principal_id:
+            raise PermissionError("Authenticated principal required for commerce execution.")
+        resource_id = str(context["resource_id"])
+        # Client idempotency keys are scoped to the authenticated tenant before
+        # they reach the shared commerce store. The same raw key from another
+        # principal must never replay a foreign result.
+        key = f"{principal_id}:{context['idempotency_key']}"
         if action == "seller.catalog.publish":
-            return commerce_demo.publish_item_from_payload(payload, idempotency_key=key)
+            return commerce_demo.publish_item_from_payload(
+                payload,
+                principal_id=principal_id,
+                resource_id=resource_id,
+                idempotency_key=key,
+            )
+        if action == "seller.catalog.archive":
+            return commerce_demo.archive_item_from_payload(
+                payload,
+                principal_id=principal_id,
+                resource_id=resource_id,
+                idempotency_key=key,
+            )
         if action == "buyer.checkout.commit":
-            return commerce_demo.create_order_from_payload(payload, idempotency_key=key)
+            return commerce_demo.create_order_from_payload(
+                payload,
+                principal_id=principal_id,
+                idempotency_key=key,
+            )
         if action in {"seller.order.accept", "seller.order.reject", "seller.fulfilment.commit"}:
-            return commerce_demo.transition_order_from_payload(action, payload, idempotency_key=key)
+            return commerce_demo.transition_order_from_payload(
+                action,
+                payload,
+                principal_id=principal_id,
+                resource_id=resource_id,
+                idempotency_key=key,
+            )
         if action == "seller.refund.issue":
-            return commerce_demo.refund_from_payload(payload, amount_inr=context["amount_inr"], idempotency_key=key)
-        if action in {"buyer.return.submit", "buyer.order.cancel", "buyer.remedy.accept"}:
-            return commerce_demo.issue_from_payload(action, payload, idempotency_key=key)
+            return commerce_demo.refund_from_payload(
+                payload,
+                principal_id=principal_id,
+                resource_id=resource_id,
+                amount_inr=context["amount_inr"],
+                idempotency_key=key,
+            )
+        if action in {"buyer.return.submit", "buyer.order.cancel"}:
+            return commerce_demo.issue_from_payload(
+                action,
+                payload,
+                principal_id=principal_id,
+                resource_id=resource_id,
+                idempotency_key=key,
+            )
+        if action == "buyer.remedy.accept":
+            return commerce_demo.accept_remedy_from_payload(
+                payload,
+                principal_id=principal_id,
+                resource_id=resource_id,
+                idempotency_key=key,
+            )
         if action == "seller.remedy.promise":
-            return commerce_demo.remedy_from_payload(payload, idempotency_key=key)
+            return commerce_demo.remedy_from_payload(
+                payload,
+                principal_id=principal_id,
+                resource_id=resource_id,
+                idempotency_key=key,
+            )
         raise ExecutionError("Unsupported protected action.")
 
     return _execute

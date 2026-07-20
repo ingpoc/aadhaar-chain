@@ -137,7 +137,10 @@ SELLER_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "catalog_publish",
-        "description": "Short tool: publish one catalog item.",
+        "description": (
+            "Publish or update one catalog item. If a live SKU with the same title "
+            "already exists, updates that listing instead of creating a duplicate."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -147,6 +150,18 @@ SELLER_TOOLS: list[dict[str, Any]] = [
                 "description": {"type": "string"},
             },
             "required": ["title", "price_inr"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "list_pending_orders",
+        "description": (
+            "Read tool: summarize pending Seller orders awaiting accept or fulfillment."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
         },
     },
     {
@@ -233,6 +248,8 @@ SAMANTHA_BUYER = (
     "Never claim longer work finished unless a later update says so. "
     "Never invent work the user did not ask for. Report AgentGuard outcomes honestly. Do not send users to /agent. "
     "Never say cart actions are unavailable: use clear_cart, remove_from_cart, or set_cart_quantity. "
+    "Checkout or pay only after an explicit pay/place-order/checkout request — call checkout_commit then. "
+    "If they only ask to fill details or prefill address: open /checkout and ask them to confirm — do not checkout_commit yet. "
     "Short tools: search_catalog, navigate_to, add_to_cart, clear_cart, remove_from_cart, set_cart_quantity, remember_preference, checkout_commit. "
     "Use stored user memory when suggesting products."
 )
@@ -243,11 +260,13 @@ SAMANTHA_SELLER = (
     "Greetings or chitchat: reply briefly with no tools. Do not volunteer work they did not ask for. "
     "Actionable short asks: choose and call the right tool(s). Chain several short tools in one turn when one request needs multiple steps. "
     "Never claim an action without a successful tool call. "
+    "Catalog: call catalog_publish with the exact price said; existing same-title SKUs are updated, not duplicated. "
+    "Pending orders: call list_pending_orders and summarize the tool result. "
     "Long or multi-step ops: call delegate_to_runtime_agent once. "
     "When that tool returns started: say you started and will let them know when done — never mention another agent, Cursor, or /agent. "
     "Never claim longer work finished unless a later update says so. "
     "Never invent work the user did not ask for. Report AgentGuard allow / need_approval / deny honestly. Do not send users to /agent. "
-    "Short tools: navigate_to, catalog_publish, refund_issue, remember_preference."
+    "Short tools: navigate_to, catalog_publish, list_pending_orders, refund_issue, remember_preference."
 )
 
 

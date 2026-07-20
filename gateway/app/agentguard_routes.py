@@ -332,6 +332,8 @@ async def execute_action(request: Request, body: ExecuteRequest) -> ApiResponse:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except agentguard.ExecutionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (KeyError, PermissionError) as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     return ApiResponse(success=True, message=result.get("reason") or "Executed", data=result)

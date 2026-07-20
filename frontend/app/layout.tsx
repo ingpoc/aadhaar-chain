@@ -24,8 +24,9 @@ const ibmPlexMono = IBM_Plex_Mono({
 })
 
 export const metadata: Metadata = {
-  title: "AadhaarChain",
-  description: "Verify once. Wallet-bound trust for portfolio apps.",
+  title: "AadhaarCha — AgentGuard for ONDC Buyer & Seller",
+  description:
+    "AgentGuard keeps consequential agent actions inside human intent. Open the ONDC Buyer or ONDC Seller demo.",
 }
 
 export default function RootLayout({

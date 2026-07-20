@@ -213,6 +213,40 @@ def test_runtime_mode_normalizes_production_alias() -> None:
         assert get_runtime_mode() == "staging"
         settings.aadhaar_chain_env = "local"
         assert get_runtime_mode() == "demo"
+        settings.aadhaar_chain_env = "prodction"
+        assert get_runtime_mode() == "unknown"
+    finally:
+        settings.aadhaar_chain_env = original_env
+
+
+def test_runtime_mode_honors_app_env_when_primary_setting_is_unset() -> None:
+    original_setting = settings.aadhaar_chain_env
+    original_values = {name: os.environ.get(name) for name in ("AADHAAR_CHAIN_ENV", "APP_ENV", "ENVIRONMENT")}
+    try:
+        settings.aadhaar_chain_env = None
+        os.environ.pop("AADHAAR_CHAIN_ENV", None)
+        os.environ.pop("ENVIRONMENT", None)
+        os.environ["APP_ENV"] = "production"
+        assert get_runtime_mode() == "production"
+    finally:
+        settings.aadhaar_chain_env = original_setting
+        for name, value in original_values.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def test_unknown_runtime_mode_fails_startup_validation() -> None:
+    original_env = settings.aadhaar_chain_env
+    try:
+        settings.aadhaar_chain_env = "prodction"
+        try:
+            validate_runtime_storage_config()
+        except RuntimeError as exc:
+            assert "explicit AADHAAR_CHAIN_ENV" in str(exc)
+        else:
+            raise AssertionError("unknown runtime mode must fail closed")
     finally:
         settings.aadhaar_chain_env = original_env
 

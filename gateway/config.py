@@ -83,7 +83,7 @@ class Settings(BaseSettings):
     # Storage — on Render Free prefer /tmp (ephemeral, writable); never paid Disk.
     # Override with DATA_DIR; Dockerfile also sets DATA_DIR=/tmp/aadharchain-data.
     data_dir: str = Field(default_factory=_default_data_dir)
-    aadhaar_chain_env: str = "demo"
+    aadhaar_chain_env: Optional[str] = None
     trust_store_backend: str = "local_file"
     database_url: Optional[str] = None
     evidence_encryption_key: Optional[str] = None
@@ -151,26 +151,33 @@ settings = Settings()
 
 
 def get_runtime_mode() -> str:
-    """Return normalized AadhaarChain runtime mode."""
+    """Return a normalized, fail-closed AadhaarChain runtime mode."""
     raw_mode = (
         settings.aadhaar_chain_env
         or os.getenv("AADHAAR_CHAIN_ENV")
         or os.getenv("APP_ENV")
         or os.getenv("ENVIRONMENT")
-        or "demo"
+        or "unknown"
     )
     normalized = raw_mode.strip().lower()
     if normalized in {"prod", "production"}:
         return "production"
     if normalized in {"stage", "staging"}:
         return "staging"
-    return "demo"
+    if normalized in {"demo", "dev", "development", "local"}:
+        return "demo"
+    return "unknown"
 
 
 def validate_runtime_storage_config() -> None:
     """Fail loud when production would use non-production trust storage."""
     backend = (settings.trust_store_backend or "local_file").strip().lower()
-    if get_runtime_mode() != "production":
+    runtime_mode = get_runtime_mode()
+    if runtime_mode == "unknown":
+        raise RuntimeError(
+            "AadhaarChain requires an explicit AADHAAR_CHAIN_ENV of demo, staging, or production."
+        )
+    if runtime_mode != "production":
         return
 
     if backend != "postgres":

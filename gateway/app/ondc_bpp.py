@@ -111,10 +111,8 @@ def build_catalog_providers(*, query: str = "") -> list[dict[str, Any]]:
     """Map published demo-commerce items → Beckn Retail providers/items."""
     result = search_items(query or None)
     rows = result.get("items") or []
-    # If filtered empty but we have any published inventory, still return all
-    # when query is generic (gateway often sends broad grocery searches).
-    if not rows and query:
-        rows = (search_items(None).get("items") or [])
+    # Never widen a specific miss into the full catalog (TV must not return oil).
+    # Only browse-style empty queries may list the whole published inventory.
     state = load_state()
     beckn_items: list[dict[str, Any]] = []
     for item in rows:
@@ -138,6 +136,7 @@ def build_catalog_providers(*, query: str = "") -> list[dict[str, Any]]:
                 "category_id": "Foodgrains",
                 "fulfillment_id": "1",
                 "location_id": "L1",
+                "delivery_areas": list(item.get("delivery_areas") or []),
                 "@ondc/org/returnable": False,
                 "@ondc/org/cancellable": True,
                 "@ondc/org/available_on_cod": False,
@@ -150,8 +149,8 @@ def build_catalog_providers(*, query: str = "") -> list[dict[str, Any]]:
         {
             "id": PROVIDER_ID,
             "descriptor": {
-                "name": "AadhaarChain AgentGuard Seller",
-                "short_desc": "PreProd ISN seller for AgentGuard Token Nxt demo",
+                "name": "Sampoorna Groceries",
+                "short_desc": "Grocery seller on ONDC",
             },
             "fulfillments": [{"id": "1", "type": "Delivery"}],
             "locations": [
@@ -204,7 +203,7 @@ async def _post_on_search(search_body: dict[str, Any]) -> None:
         "message": {
             "catalog": {
                 "bpp/descriptor": {
-                    "name": "AadhaarChain AgentGuard Seller",
+                    "name": "Sampoorna Groceries",
                 },
                 "bpp/providers": providers,
                 "providers": providers,
@@ -278,53 +277,7 @@ async def bpp_status() -> JSONResponse:
     )
 
 
-PREPROD_MARKER_TITLE = "AadhaarChain Whole Wheat Atta 1kg"
-PREPROD_MARKER_CREATE_KEY = "bpp-ensure-agentguard-atta"
-PREPROD_MARKER_PUBLISH_KEY = "bpp-ensure-agentguard-atta:publish"
-
-
-def ensure_preprod_marker_item() -> dict[str, Any]:
-    """Idempotent publish of PreProd marker SKU (shared by HTTP + lifespan wake).
-
-    Free `/tmp` DATA_DIR loses published catalog after spin-down; calling this on
-    boot restores network-visible inventory without a manual curl.
-    """
-    from app.commerce_demo import create_item, publish_item
-
-    state = load_state()
-    existing = next(
-        (
-            i
-            for i in state.items.values()
-            if i.get("title") == PREPROD_MARKER_TITLE and i.get("status") == "published"
-        ),
-        None,
-    )
-    if existing:
-        return {"item": existing, "created": False}
-    created = create_item(
-        {
-            "title": PREPROD_MARKER_TITLE,
-            "description": "Stone-ground whole wheat flour from AadhaarChain Seller.",
-            "price_inr": 89,
-            "inventory": 25,
-            "seller_id": "ondcseller.aadharcha.in",
-        },
-        idempotency_key=PREPROD_MARKER_CREATE_KEY,
-    )
-    published = publish_item(
-        created["item"]["item_id"],
-        idempotency_key=PREPROD_MARKER_PUBLISH_KEY,
-    )
-    return {"item": published["item"], "created": True}
-
-
-@router.post("/api/ondc/bpp/ensure-demo-item")
-async def bpp_ensure_demo_item() -> JSONResponse:
-    """Idempotent publish of a distinctive PreProd marker SKU (no mock UI catalog)."""
-    return JSONResponse({"success": True, "data": ensure_preprod_marker_item()})
-
-# --- select / init / confirm (minimal PreProd stub) ---
+# --- select / init / confirm ---
 
 def _order_from_request(body: dict[str, Any]) -> dict[str, Any]:
     message = body.get("message") or {}
@@ -369,7 +322,7 @@ def _order_from_request(body: dict[str, Any]) -> dict[str, Any]:
     return {
         **order,
         "provider": order.get("provider")
-        or {"id": PROVIDER_ID, "descriptor": {"name": "AadhaarChain AgentGuard Seller"}},
+        or {"id": PROVIDER_ID, "descriptor": {"name": "Sampoorna Groceries"}},
         "items": items,
         "quote": order.get("quote")
         or {

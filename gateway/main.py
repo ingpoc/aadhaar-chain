@@ -32,7 +32,6 @@ from app.social_auth_routes import router as social_auth_router
 from app.ondc_routes import router as ondc_router
 from app.ondc_onboard_routes import router as ondc_onboard_router
 from app.ondc_bpp import router as ondc_bpp_router
-from app.commerce_integrations_routes import router as commerce_integrations_router
 from app.state_store import load_gateway_state
 
 
@@ -65,27 +64,27 @@ async def lifespan(_app: FastAPI):
             "⚠ AadhaarChain agent runtime unavailable: "
             f"{runtime_policy.blocked_reason}"
         )
-    # Free /tmp catalog is empty after spin-down; restore PreProd marker when ONDC is on.
+    # Free /tmp catalog is empty after spin-down; restore the canonical item when ONDC is on.
     if getattr(settings, "ondc_enabled", False):
         try:
-            from app.ondc_bpp import ensure_preprod_marker_item
+            from app.ondc_bpp import ensure_catalog_marker_item
 
-            ensured = ensure_preprod_marker_item()
+            ensured = ensure_catalog_marker_item()
             title = (ensured.get("item") or {}).get("title") or "marker"
             created = ensured.get("created")
             print(
-                f"✓ ONDC PreProd catalog ensure "
+                f"✓ ONDC catalog ensure "
                 f"(created={created}, title={title})"
             )
         except Exception as exc:  # noqa: BLE001 — boot must not die on catalog restore
-            print(f"⚠ ONDC PreProd catalog ensure skipped: {exc}")
+            print(f"⚠ ONDC catalog ensure skipped: {exc}")
     yield
 
 
 # Create FastAPI app
 app = FastAPI(
     title=settings.app_name,
-    description="Gateway for AadhaarChain identity trust and AgentGuard authorization",
+    description="Gateway for AgentGuard authorization and ONDC commerce",
     version="1.0.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc",
@@ -110,7 +109,6 @@ app.include_router(social_auth_router)
 app.include_router(ondc_onboard_router)
 app.include_router(ondc_bpp_router)
 app.include_router(ondc_router)
-app.include_router(commerce_integrations_router)
 app.include_router(agentguard_router)
 app.include_router(portfolio_agent_router)
 app.include_router(commerce_router)

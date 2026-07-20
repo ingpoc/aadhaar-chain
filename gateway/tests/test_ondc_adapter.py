@@ -166,6 +166,7 @@ def test_on_search_inbox_and_catalogs(tmp_path: Path, monkeypatch):
                                 "id": "sku-1",
                                 "descriptor": {"name": "Robusta Bananas"},
                                 "price": {"currency": "INR", "value": "40"},
+                                "delivery_areas": ["Pune", "411001"],
                             }
                         ],
                     }
@@ -182,6 +183,7 @@ def test_on_search_inbox_and_catalogs(tmp_path: Path, monkeypatch):
     assert len(items) == 1
     assert items[0]["name"] == "Robusta Bananas"
     assert items[0]["bpp_id"] == "seller.example"
+    assert items[0]["delivery_areas"] == ["Pune", "411001"]
 
 
 def test_ondc_status_disabled_by_default(monkeypatch, tmp_path: Path):

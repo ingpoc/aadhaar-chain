@@ -1,5 +1,6 @@
-import { SimpleLanding } from '@/components/landing/SimpleLanding';
+import { redirect } from 'next/navigation';
 
+/** Apex landing is the static AgentGuard ONDC hub (Buyer + Seller links). */
 export default function LandingPage() {
-  return <SimpleLanding />;
+  redirect('/hub.html');
 }
