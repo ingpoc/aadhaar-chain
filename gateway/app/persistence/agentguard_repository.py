@@ -23,6 +23,30 @@ class AgentGuardPermissionDenied(PermissionError):
     """A record exists but belongs to another principal."""
 
 
+def receipt_contract_view(record: dict[str, Any]) -> dict[str, Any]:
+    """Flatten a durable receipt row into the signed receipt API contract."""
+    payload = record.get("payload")
+    signed = dict(payload) if isinstance(payload, dict) else {}
+    bound_action = signed.get("bound_action")
+    bound = bound_action if isinstance(bound_action, dict) else {}
+    return {
+        **signed,
+        "receipt_id": record["receipt_id"],
+        "principal_id": record["principal_id"],
+        "agent_id": record["agent_id"],
+        "mandate_id": record["mandate_id"],
+        "mandate_version": record["mandate_version"],
+        "decision_id": record.get("decision_id"),
+        "approval_id": record.get("approval_id"),
+        "intent_id": record.get("intent_id"),
+        "status": record["status"],
+        "action": signed.get("action") or bound.get("action"),
+        "resource_id": bound.get("resource_id"),
+        "amount_inr": bound.get("amount_inr"),
+        "created_at": signed.get("created_at") or record.get("created_at"),
+    }
+
+
 class AgentGuardRepository:
     """Principal-scoped AgentGuard operations inside one active unit of work."""
 
@@ -468,7 +492,7 @@ class AgentGuardRepository:
                 """,
                 (principal_id, limit),
             )
-            return list(await cursor.fetchall())
+            return [receipt_contract_view(row) for row in await cursor.fetchall()]
 
     async def _insert_one(
         self, statement: str, parameters: tuple[Any, ...]
