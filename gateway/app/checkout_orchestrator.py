@@ -288,6 +288,8 @@ class CheckoutOrchestrator:
             )
             if decision is None:
                 raise AgentGuardNotFound("decision not found")
+            if decision["expiry"] is not None and decision["expiry"] <= _utcnow():
+                raise AgentGuardConflict("decision expired")
             _quote, bound = await self._bound_quote(
                 commerce,
                 principal_id=principal_id,
@@ -303,6 +305,12 @@ class CheckoutOrchestrator:
                 decision["mandate_version"],
             ) != (mandate["mandate_id"], mandate["version"]):
                 raise AgentGuardConflict("decision mandate is stale")
+            if approval_id:
+                approval = await agentguard.get_approval(
+                    principal_id=principal_id, approval_id=approval_id
+                )
+                if approval is None or approval["decision_id"] != decision_id:
+                    raise AgentGuardConflict("approval does not match the decision")
             intent, created = await agentguard.create_execution_intent(
                 intent_id=f"intent_{uuid4().hex}",
                 principal_id=principal_id,

@@ -98,6 +98,19 @@ async def test_over_limit_exact_approval_checkout_replays_one_paid_order(
     )
     assert decision["decision"] == "need_approval"
     assert decision["bound_action"]["landed_total_paise"] == 20_000
+    other_decision = await orchestrator.evaluate_checkout(
+        principal_id=principal_id, quote_id=quote["quote_id"]
+    )
+
+    with pytest.raises(AgentGuardConflict, match="approval does not match"):
+        await orchestrator.execute_checkout(
+            principal_id=principal_id,
+            quote_id=quote["quote_id"],
+            decision_id=decision["decision_id"],
+            approval_id=other_decision["approval"]["approval_id"],
+            idempotency_key="checkout-wrong-approval",
+            correlation_id="correlation-wrong-approval",
+        )
 
     with pytest.raises(AgentGuardConflict, match="exact approval"):
         await orchestrator.execute_checkout(
