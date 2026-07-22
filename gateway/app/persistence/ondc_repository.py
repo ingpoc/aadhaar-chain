@@ -138,7 +138,7 @@ class ONDCRepository:
                     action, correlation_id, raw_envelope_commitment,
                     envelope, redacted_payload
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (event_commitment) DO NOTHING
+                ON CONFLICT DO NOTHING
                 RETURNING {columns}
                 """,
                 (
