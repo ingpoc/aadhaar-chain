@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 from typing import Any, Literal, Optional
+from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from app import agentguard
@@ -314,7 +315,20 @@ def _consume_response(
 
 
 @router.post("/actions/execute", response_model=ApiResponse)
-async def execute_action(request: Request, body: ExecuteRequest) -> ApiResponse:
+async def execute_action(
+    request: Request,
+    response: Response,
+    body: ExecuteRequest,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    correlation_id: Optional[str] = Header(default=None, alias="X-Correlation-ID"),
+) -> ApiResponse:
+    if idempotency_key and body.idempotency_key and idempotency_key != body.idempotency_key:
+        raise HTTPException(status_code=422, detail="Idempotency key header and body disagree.")
+    effective_idempotency_key = idempotency_key or body.idempotency_key
+    if not effective_idempotency_key:
+        raise HTTPException(status_code=422, detail="Idempotency-Key is required.")
+    effective_correlation_id = correlation_id or f"correlation_{uuid4().hex}"
+    response.headers["X-Correlation-ID"] = effective_correlation_id
     principal_id, wallet_address = _principal(request, wallet_address=body.wallet_address)
     try:
         result = agentguard.execute_action(
@@ -325,8 +339,8 @@ async def execute_action(request: Request, body: ExecuteRequest) -> ApiResponse:
             action=body.action,
             amount_inr=body.amount_inr,
             resource_id=body.resource_id,
-            idempotency_key=body.idempotency_key,
-            payload=body.payload,
+            idempotency_key=effective_idempotency_key,
+            payload={**body.payload, "correlation_id": effective_correlation_id},
         )
     except agentguard.ConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -336,7 +350,11 @@ async def execute_action(request: Request, body: ExecuteRequest) -> ApiResponse:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (KeyError, PermissionError) as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
-    return ApiResponse(success=True, message=result.get("reason") or "Executed", data=result)
+    return ApiResponse(
+        success=True,
+        message=result.get("reason") or "Executed",
+        data={**result, "correlation_id": effective_correlation_id},
+    )
 
 
 @router.post("/agents/{agent_id}/pause", response_model=ApiResponse)

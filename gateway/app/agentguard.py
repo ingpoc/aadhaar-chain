@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from app.agentguard_contract import (
     AGENTGUARD_ACTIONS,
+    DECISION_SCHEMA_VERSION,
     SCHEMA_VERSION,
     PrincipalRef,
     canonicalize,
@@ -25,9 +26,12 @@ from config import settings
 
 STATE_FILE = "agentguard-state.json"
 APPROVAL_TTL_MINUTES = 15
+DECISION_TTL_MINUTES = 5
 _STATE_LOCK = RLock()
 
 Decision = Literal["allow", "need_approval", "deny"]
+RequiredAction = Literal["none", "review", "strong_authentication", "contact_support"]
+RiskLevel = Literal["read_only", "low", "medium", "high", "critical"]
 AgentStatus = Literal["active", "paused", "revoked"]
 Role = Literal["buyer", "seller"]
 MandateStatus = Literal["draft", "active", "revoked", "expired"]
@@ -43,6 +47,71 @@ def _parse_dt(value: str) -> datetime:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
+
+
+def _risk_level(action: str) -> RiskLevel:
+    if action in {
+        "buyer.checkout.commit",
+        "buyer.order.cancel",
+        "buyer.return.submit",
+        "buyer.remedy.accept",
+        "seller.refund.issue",
+        "seller.remedy.promise",
+    }:
+        return "high"
+    if action in {
+        "seller.catalog.publish",
+        "seller.catalog.archive",
+        "seller.price.change",
+        "seller.inventory.commit",
+        "seller.order.accept",
+        "seller.order.reject",
+        "seller.fulfilment.commit",
+    }:
+        return "medium"
+    return "low"
+
+
+def _required_action(
+    decision: Decision,
+    reason_code: str,
+    risk_level: RiskLevel,
+) -> RequiredAction:
+    if decision == "allow":
+        return "none"
+    if decision == "need_approval":
+        return "strong_authentication" if risk_level == "critical" else "review"
+    if reason_code == "principal_mismatch":
+        return "contact_support"
+    return "review"
+
+
+def _decision_v2_fields(
+    *,
+    decision: Decision,
+    reason_code: str,
+    action: str,
+    human_reason: str,
+    policy_id: str = "agentguard.system",
+    policy_version: int = 1,
+    approval: Optional[ApprovalRecord] = None,
+) -> dict[str, Any]:
+    risk_level = _risk_level(action)
+    expires_at = (
+        approval.expires_at
+        if approval is not None
+        else (datetime.now(timezone.utc) + timedelta(minutes=DECISION_TTL_MINUTES)).isoformat()
+    )
+    return {
+        "schema_version": DECISION_SCHEMA_VERSION,
+        "decision_id": _new_id("decision"),
+        "policy_id": policy_id,
+        "human_reason": human_reason,
+        "required_action": _required_action(decision, reason_code, risk_level),
+        "risk_level": risk_level,
+        "policy_version": policy_version,
+        "expires_at": expires_at,
+    }
 
 
 def _principal_role_key(principal_id: str, role: Role) -> str:
@@ -522,9 +591,16 @@ def evaluate_action(
 ) -> dict[str, Any]:
     normalized = normalize_action(action)
     if normalized is None:
+        reason = f"Unsupported action: {action}"
         return {
+            **_decision_v2_fields(
+                decision="deny",
+                reason_code="action_not_allowed",
+                action=action,
+                human_reason=reason,
+            ),
             "decision": "deny",
-            "reason": f"Unsupported action: {action}",
+            "reason": reason,
             "reason_code": "action_not_allowed",
             "agent": None,
             "policy": None,
@@ -576,9 +652,13 @@ def evaluate_action(
             if write_receipt
             else None
         )
-        return _decision("deny", reason_code, agent, mandate, policy, receipt, None, request_hash)
+        return _decision(
+            "deny", reason_code, normalized, agent, mandate, policy, receipt, None, request_hash
+        )
     if reason_code:
-        return _decision("deny", reason_code, agent, mandate, policy, None, None, request_hash)
+        return _decision(
+            "deny", reason_code, normalized, agent, mandate, policy, None, None, request_hash
+        )
 
     auto_max = int(mandate.limits.get("auto_approve_max_inr", {}).get(normalized, 0))
     if amount_inr <= auto_max:
@@ -600,7 +680,9 @@ def evaluate_action(
             if write_receipt
             else None
         )
-        return _decision("allow", "within_policy", agent, mandate, policy, receipt, None, request_hash)
+        return _decision(
+            "allow", "within_policy", normalized, agent, mandate, policy, receipt, None, request_hash
+        )
 
     approval = _issue_approval(
         principal_id=principal_id,
@@ -616,6 +698,7 @@ def evaluate_action(
     return _decision(
         "need_approval",
         "approval_required_amount",
+        normalized,
         agent,
         mandate,
         policy,
@@ -669,9 +752,17 @@ def _resolve_agent_mandate_policy(
 
 
 def _deny_without_agent(action: str, amount_inr: int, resource_id: str, reason_code: str) -> dict[str, Any]:
+    del amount_inr, resource_id
+    human_reason = "The authenticated customer does not match this action."
     return {
+        **_decision_v2_fields(
+            decision="deny",
+            reason_code=reason_code,
+            action=action,
+            human_reason=human_reason,
+        ),
         "decision": "deny",
-        "reason": reason_code,
+        "reason": human_reason,
         "reason_code": reason_code,
         "agent": None,
         "policy": None,
@@ -685,6 +776,7 @@ def _deny_without_agent(action: str, amount_inr: int, resource_id: str, reason_c
 def _decision(
     decision: Decision,
     reason_code: str,
+    action: str,
     agent: AgentRecord,
     mandate: MandateRecord,
     policy: PolicyRecord,
@@ -692,9 +784,19 @@ def _decision(
     approval: Optional[ApprovalRecord],
     request_hash: Optional[str],
 ) -> dict[str, Any]:
+    human_reason = _reason_message(decision, reason_code, approval, policy)
     return {
+        **_decision_v2_fields(
+            decision=decision,
+            reason_code=reason_code,
+            action=action,
+            human_reason=human_reason,
+            policy_id=policy.policy_id,
+            policy_version=policy.version,
+            approval=approval,
+        ),
         "decision": decision,
-        "reason": _reason_message(decision, reason_code, approval, policy),
+        "reason": human_reason,
         "reason_code": reason_code,
         "agent": agent.model_dump(),
         "policy": policy.model_dump(),
@@ -1052,8 +1154,16 @@ def execute_action(
                 ),
             }
     return {
+        **_decision_v2_fields(
+            decision="allow",
+            reason_code="within_policy",
+            action=normalized,
+            human_reason="Executed and verified.",
+            policy_id=agent.policy_id or "agentguard.system",
+            policy_version=mandate.version,
+        ),
         "decision": "allow",
-        "reason": "Executed.",
+        "reason": "Executed and verified.",
         "reason_code": "within_policy",
         "result": result,
         "receipt": receipt.model_dump(),

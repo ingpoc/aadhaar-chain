@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from app.agentguard_contract import canonicalize, sha256_hex
+from app.agentguard_contract import DecisionV2, canonicalize, sha256_hex
 
 
 FIXTURES = Path(__file__).resolve().parents[3] / "shared" / "agentguard-contract" / "fixtures"
@@ -19,3 +19,14 @@ def test_python_canonicalizes_and_hashes_shared_golden_action_request() -> None:
     assert canonical == expected
     assert sha256_hex(canonical) == "b1845e24832e79a73abc2f3502a3130f9d947caf5b1c89e3c2cf8e74fa9ebab2"
     assert canonicalize(dict(reversed(list(action_request.items())))) == expected
+
+
+def test_python_validates_shared_golden_decision_v2() -> None:
+    decision = DecisionV2.model_validate_json(
+        (FIXTURES / "golden-decision-v2.json").read_text(encoding="utf-8")
+    )
+
+    assert decision.schema_version == "2"
+    assert decision.decision == "need_approval"
+    assert decision.required_action == "review"
+    assert decision.risk_level == "medium"

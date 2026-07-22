@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from app import agentguard, commerce_demo
+from app import agentguard, agentguard_routes, commerce_demo
 from app.session_auth import SESSION_COOKIE_NAME, create_session_token
 from config import settings
 from main import app
@@ -41,6 +41,14 @@ def test_evaluate_allow_need_approval_and_pause() -> None:
         resource_id="order-1",
     )
     assert allow["decision"] == "allow"
+    assert allow["schema_version"] == "2"
+    assert allow["decision_id"].startswith("decision_")
+    assert allow["policy_id"].startswith("policy_")
+    assert allow["human_reason"] == allow["reason"]
+    assert allow["required_action"] == "none"
+    assert allow["risk_level"] == "high"
+    assert allow["policy_version"] == 1
+    assert datetime.fromisoformat(allow["expires_at"]) > datetime.now(timezone.utc)
     assert allow["receipt"]["outcome"] == "allowed"
 
     need = agentguard.evaluate_action(
@@ -50,6 +58,9 @@ def test_evaluate_allow_need_approval_and_pause() -> None:
         resource_id="order-2",
     )
     assert need["decision"] == "need_approval"
+    assert need["schema_version"] == "2"
+    assert need["required_action"] == "review"
+    assert need["expires_at"] == need["approval"]["expires_at"]
     assert need["approval"]["approval_id"]
 
     agent_id = allow["agent"]["agent_id"]
@@ -61,6 +72,8 @@ def test_evaluate_allow_need_approval_and_pause() -> None:
         resource_id="order-3",
     )
     assert denied["decision"] == "deny"
+    assert denied["schema_version"] == "2"
+    assert denied["required_action"] == "review"
     assert denied["receipt"]["outcome"] == "paused"
 
 
@@ -194,6 +207,52 @@ def test_http_agentguard_checkout_action() -> None:
         json={"wallet_address": WALLET, "approval_id": approval_id},
     )
     assert replay.status_code == 409
+
+
+def test_execute_requires_idempotency_key_and_returns_correlation_id(monkeypatch) -> None:
+    client = TestClient(app)
+    captured: dict[str, object] = {}
+
+    def _execute(**kwargs):
+        captured.update(kwargs)
+        return {"reason": "Executed", "order_id": "order-correlation"}
+
+    monkeypatch.setattr(agentguard_routes.agentguard, "execute_action", _execute)
+    missing = client.post(
+        "/api/agentguard/actions/execute",
+        json={
+            "wallet_address": WALLET,
+            "action": "buyer.checkout.commit",
+            "resource_id": "cart-correlation",
+        },
+    )
+    assert missing.status_code == 422
+
+    executed = client.post(
+        "/api/agentguard/actions/execute",
+        headers={"Idempotency-Key": "checkout-correlation-1", "X-Correlation-ID": "corr-test-1"},
+        json={
+            "wallet_address": WALLET,
+            "action": "buyer.checkout.commit",
+            "resource_id": "cart-correlation",
+        },
+    )
+    assert executed.status_code == 200
+    assert executed.headers["X-Correlation-ID"] == "corr-test-1"
+    assert executed.json()["data"]["correlation_id"] == "corr-test-1"
+    assert captured["idempotency_key"] == "checkout-correlation-1"
+    assert captured["payload"] == {"correlation_id": "corr-test-1"}
+
+    mismatch = client.post(
+        "/api/agentguard/actions/execute",
+        headers={"Idempotency-Key": "header-key"},
+        json={
+            "action": "buyer.checkout.commit",
+            "resource_id": "cart-correlation",
+            "idempotency_key": "body-key",
+        },
+    )
+    assert mismatch.status_code == 422
 
 
 def test_session_principal_wins_over_body_wallet() -> None:

@@ -5,9 +5,10 @@ import hashlib
 import json
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 SCHEMA_VERSION = "1"
+DECISION_SCHEMA_VERSION = "2"
 
 AGENTGUARD_ACTIONS = (
     "buyer.checkout.commit",
@@ -72,6 +73,9 @@ AgentGuardAction = Literal[
     "seller.refund.issue",
 ]
 Role = Literal["buyer", "seller"]
+DecisionValue = Literal["allow", "need_approval", "deny"]
+RequiredAction = Literal["none", "review", "strong_authentication", "contact_support"]
+RiskLevel = Literal["read_only", "low", "medium", "high", "critical"]
 
 
 class PrincipalRef(BaseModel):
@@ -79,6 +83,31 @@ class PrincipalRef(BaseModel):
     principal_id: str
     role: Optional[Role] = None
     wallet_address: Optional[str] = None
+
+
+class DecisionV2(BaseModel):
+    """Additive live decision envelope shared by every AgentGuard client."""
+
+    schema_version: Literal["2"] = DECISION_SCHEMA_VERSION
+    decision_id: str
+    policy_id: str
+    decision: DecisionValue
+    reason_code: str
+    human_reason: str
+    required_action: RequiredAction
+    risk_level: RiskLevel
+    policy_version: int
+    expires_at: str
+    request_hash: Optional[str] = None
+    approval: Optional[dict[str, Any]] = None
+    receipt: Optional[dict[str, Any]] = None
+
+    @field_validator("reason_code")
+    @classmethod
+    def _known_reason(cls, value: str) -> str:
+        if value not in DECISION_REASONS:
+            raise ValueError("Unknown AgentGuard decision reason")
+        return value
 
 
 def normalize_action(action: str) -> Optional[str]:
