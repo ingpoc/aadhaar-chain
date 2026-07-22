@@ -24,6 +24,7 @@ from app.persistence.agentguard_repository import (
 )
 from app.receipt_signing import verify_receipt
 from app.session_auth import SESSION_COOKIE_NAME, create_principal_session_token
+from config import settings
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 MIGRATIONS = Path(__file__).parents[1] / "migrations"
@@ -271,3 +272,41 @@ async def test_http_mandate_preview_decision_execute_and_replay(
         )
         assert verified.status_code == 200
         assert verified.json()["data"]["valid"] is True
+
+
+async def test_legacy_buyer_mandate_stays_on_compatibility_adapter(
+    pool: ConnectionPool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path))
+    api = FastAPI()
+    api.state.persistence_pool = pool
+    api.include_router(agentguard_router)
+    token = create_principal_session_token(
+        principal_id="principal:legacy-buyer",
+        audience="ondcbuyer",
+        identity_provider="demo",
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=api),
+        base_url="http://test",
+        cookies={SESSION_COOKIE_NAME: token},
+    ) as client:
+        compiled = await client.post(
+            "/api/agentguard/mandates/compile",
+            json={
+                "role": "buyer",
+                "template": "buyer_shop_v1",
+                "limits": {"auto_approve_max_inr": {"buyer.checkout.commit": 4_321}},
+            },
+        )
+        assert compiled.status_code == 200
+        mandate = compiled.json()["data"]["mandate"]
+        assert (
+            mandate["limits"]["auto_approve_max_inr"]["buyer.checkout.commit"] == 4_321
+        )
+        confirmed = await client.post(
+            f"/api/agentguard/mandates/{mandate['mandate_id']}/confirm", json={}
+        )
+        assert confirmed.status_code == 200

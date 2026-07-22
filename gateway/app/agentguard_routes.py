@@ -252,7 +252,7 @@ async def compile_mandate(request: Request, body: CompileMandateRequest) -> ApiR
         request, wallet_address=body.wallet_address, role=body.role
     )
     pool = _persistence_pool(request)
-    if pool is not None and body.role == "buyer":
+    if pool is not None and body.role == "buyer" and "max_order_paise" in body.limits:
         try:
             result = await CheckoutOrchestrator(pool).compile_mandate(
                 principal_id=principal_id, limits=body.limits
@@ -287,7 +287,7 @@ async def confirm_mandate(
 ) -> ApiResponse:
     principal_id, _wallet = _principal(request, wallet_address=body.wallet_address)
     pool = _persistence_pool(request)
-    if pool is not None:
+    if pool is not None and mandate_id == CheckoutOrchestrator.mandate_id(principal_id):
         try:
             result = await CheckoutOrchestrator(pool).current_mandate(
                 principal_id=principal_id
