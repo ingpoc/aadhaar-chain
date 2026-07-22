@@ -1,4 +1,5 @@
 """HTTP routes for AgentGuard control plane."""
+
 from __future__ import annotations
 
 from typing import Any, Literal, Optional
@@ -9,7 +10,14 @@ from pydantic import BaseModel, Field
 
 from app import agentguard
 from app.agentguard_contract import principal_id_from_wallet
+from app.checkout_orchestrator import CheckoutOrchestrator
 from app.models import ApiResponse
+from app.persistence import ConnectionPool
+from app.persistence.agentguard_repository import (
+    AgentGuardConflict,
+    AgentGuardNotFound,
+    AgentGuardPermissionDenied,
+)
 from app.session_auth import SESSION_COOKIE_NAME, parse_session_token
 
 router = APIRouter(prefix="/api/agentguard", tags=["agentguard"])
@@ -64,6 +72,7 @@ class ExecuteRequest(BaseModel):
     wallet_address: Optional[str] = Field(None, min_length=32, max_length=64)
     agent_id: Optional[str] = None
     approval_id: Optional[str] = None
+    decision_id: Optional[str] = None
     action: str
     amount_inr: int = Field(0, ge=0)
     resource_id: str = Field(..., min_length=1)
@@ -91,13 +100,21 @@ def _principal(
         if not principal_id and session_wallet:
             principal_id = principal_id_from_wallet(session_wallet)
         if not principal_id:
-            raise HTTPException(status_code=401, detail="AgentGuard principal required.")
+            raise HTTPException(
+                status_code=401, detail="AgentGuard principal required."
+            )
         if wallet_address and session_wallet and wallet_address != session_wallet:
-            raise HTTPException(status_code=403, detail="Wallet does not match session principal.")
+            raise HTTPException(
+                status_code=403, detail="Wallet does not match session principal."
+            )
         if wallet_address and not session_wallet:
             # Social/demo session: callers must not select another principal via body wallet.
-            raise HTTPException(status_code=403, detail="Body wallet cannot override session principal.")
-        return str(principal_id), session_wallet if isinstance(session_wallet, str) else None
+            raise HTTPException(
+                status_code=403, detail="Body wallet cannot override session principal."
+            )
+        return str(principal_id), session_wallet if isinstance(
+            session_wallet, str
+        ) else None
     if wallet_address:
         # Legacy pytest / fixture path without cookie — maps to wallet:* principal.
         return principal_id_from_wallet(wallet_address), wallet_address
@@ -113,9 +130,28 @@ def _assert_agent_principal(agent_id: str, principal_id: str) -> agentguard.Agen
     return agent
 
 
+def _persistence_pool(request: Request) -> ConnectionPool | None:
+    pool = getattr(request.app.state, "persistence_pool", None)
+    return pool if isinstance(pool, ConnectionPool) and pool.is_open else None
+
+
+def _raise_persistent_error(error: Exception) -> None:
+    if isinstance(error, AgentGuardNotFound):
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    if isinstance(error, AgentGuardPermissionDenied):
+        raise HTTPException(status_code=403, detail=str(error)) from error
+    if isinstance(error, AgentGuardConflict):
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if isinstance(error, ValueError):
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    raise error
+
+
 @router.post("/agents/ensure", response_model=ApiResponse)
 async def ensure_agent(request: Request, body: EnsureAgentRequest) -> ApiResponse:
-    principal_id, wallet_address = _principal(request, wallet_address=body.wallet_address, role=body.role)
+    principal_id, wallet_address = _principal(
+        request, wallet_address=body.wallet_address, role=body.role
+    )
     if body.role == "seller" and wallet_address:
         agent, policy = agentguard.ensure_seller_ops_agent(wallet_address)
         mandate = agentguard.get_mandate(agent.mandate_id or "")
@@ -138,7 +174,9 @@ async def ensure_agent(request: Request, body: EnsureAgentRequest) -> ApiRespons
 
 @router.post("/agents", response_model=ApiResponse)
 async def create_agent(request: Request, body: AgentCreateRequest) -> ApiResponse:
-    principal_id, wallet_address = _principal(request, wallet_address=body.wallet_address, role=body.role)
+    principal_id, wallet_address = _principal(
+        request, wallet_address=body.wallet_address, role=body.role
+    )
     agent, mandate, policy = agentguard.ensure_agent(
         principal_id=principal_id,
         role=body.role,
@@ -148,12 +186,18 @@ async def create_agent(request: Request, body: AgentCreateRequest) -> ApiRespons
     return ApiResponse(
         success=True,
         message="AgentGuard agent ready",
-        data={"agent": agent.model_dump(), "mandate": mandate.model_dump(), "policy": policy.model_dump()},
+        data={
+            "agent": agent.model_dump(),
+            "mandate": mandate.model_dump(),
+            "policy": policy.model_dump(),
+        },
     )
 
 
 @router.get("/agents/current", response_model=ApiResponse)
-async def get_current_agent(request: Request, role: Role, wallet_address: Optional[str] = None) -> ApiResponse:
+async def get_current_agent(
+    request: Request, role: Role, wallet_address: Optional[str] = None
+) -> ApiResponse:
     principal_id, wallet = _principal(request, wallet_address=wallet_address, role=role)
     agent = agentguard.get_current_agent(principal_id, role)
     if not agent:
@@ -166,7 +210,8 @@ async def get_current_agent(request: Request, role: Role, wallet_address: Option
         mandate = agentguard.get_mandate(agent.mandate_id or "")
         policy = agentguard.get_policy(agent.policy_id or "")
     receipts = [
-        r.model_dump() for r in agentguard.list_receipts_for_principal(principal_id)[:20]
+        r.model_dump()
+        for r in agentguard.list_receipts_for_principal(principal_id)[:20]
     ]
     return ApiResponse(
         success=True,
@@ -203,8 +248,25 @@ async def get_wallet_agentguard(wallet_address: str) -> ApiResponse:
 
 @router.post("/mandates/compile", response_model=ApiResponse)
 async def compile_mandate(request: Request, body: CompileMandateRequest) -> ApiResponse:
-    principal_id, wallet_address = _principal(request, wallet_address=body.wallet_address, role=body.role)
-    template = body.template or ("buyer_shop_v1" if body.role == "buyer" else "seller_ops_v1")
+    principal_id, wallet_address = _principal(
+        request, wallet_address=body.wallet_address, role=body.role
+    )
+    pool = _persistence_pool(request)
+    if pool is not None and body.role == "buyer":
+        try:
+            result = await CheckoutOrchestrator(pool).compile_mandate(
+                principal_id=principal_id, limits=body.limits
+            )
+        except Exception as error:
+            _raise_persistent_error(error)
+        return ApiResponse(
+            success=True,
+            message="Mandate compiled and activated",
+            data=result,
+        )
+    template = body.template or (
+        "buyer_shop_v1" if body.role == "buyer" else "seller_ops_v1"
+    )
     mandate = agentguard.compile_mandate(
         template=template,
         role=body.role,
@@ -214,19 +276,43 @@ async def compile_mandate(request: Request, body: CompileMandateRequest) -> ApiR
         wallet_address=wallet_address,
         agent_id=body.agent_id,
     )
-    return ApiResponse(success=True, message="Mandate compiled", data={"mandate": mandate.model_dump()})
+    return ApiResponse(
+        success=True, message="Mandate compiled", data={"mandate": mandate.model_dump()}
+    )
 
 
 @router.post("/mandates/{mandate_id}/confirm", response_model=ApiResponse)
-async def confirm_mandate(mandate_id: str, request: Request, body: PauseRequest) -> ApiResponse:
+async def confirm_mandate(
+    mandate_id: str, request: Request, body: PauseRequest
+) -> ApiResponse:
     principal_id, _wallet = _principal(request, wallet_address=body.wallet_address)
+    pool = _persistence_pool(request)
+    if pool is not None:
+        try:
+            result = await CheckoutOrchestrator(pool).current_mandate(
+                principal_id=principal_id
+            )
+            mandate = result["mandate"]
+            if mandate["mandate_id"] != mandate_id:
+                raise AgentGuardNotFound("mandate not found")
+        except Exception as error:
+            _raise_persistent_error(error)
+        return ApiResponse(
+            success=True,
+            message="Mandate confirmed",
+            data={"mandate": mandate},
+        )
     try:
         mandate = agentguard.confirm_mandate(mandate_id, principal_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
-    return ApiResponse(success=True, message="Mandate confirmed", data={"mandate": mandate.model_dump()})
+    return ApiResponse(
+        success=True,
+        message="Mandate confirmed",
+        data={"mandate": mandate.model_dump()},
+    )
 
 
 @router.get("/mandates/{mandate_id}", response_model=ApiResponse)
@@ -234,12 +320,30 @@ async def get_mandate(mandate_id: str) -> ApiResponse:
     mandate = agentguard.get_mandate(mandate_id)
     if not mandate:
         raise HTTPException(status_code=404, detail="Unknown mandate")
-    return ApiResponse(success=True, message="Mandate", data={"mandate": mandate.model_dump()})
+    return ApiResponse(
+        success=True, message="Mandate", data={"mandate": mandate.model_dump()}
+    )
 
 
 @router.post("/actions/evaluate", response_model=ApiResponse)
 async def evaluate_action(request: Request, body: EvaluateRequest) -> ApiResponse:
-    principal_id, wallet_address = _principal(request, wallet_address=body.wallet_address)
+    principal_id, wallet_address = _principal(
+        request, wallet_address=body.wallet_address
+    )
+    pool = _persistence_pool(request)
+    if (
+        pool is not None
+        and agentguard.normalize_action(body.action) == "buyer.checkout.commit"
+        and body.payload.get("quote_id")
+    ):
+        quote_id = str(body.payload["quote_id"])
+        try:
+            result = await CheckoutOrchestrator(pool).evaluate_checkout(
+                principal_id=principal_id, quote_id=quote_id
+            )
+        except Exception as error:
+            _raise_persistent_error(error)
+        return ApiResponse(success=True, message=result["human_reason"], data=result)
     try:
         result = agentguard.evaluate_action(
             principal_id=principal_id,
@@ -261,11 +365,15 @@ async def evaluate_action(request: Request, body: EvaluateRequest) -> ApiRespons
 
 
 @router.post("/approvals/consume", response_model=ApiResponse)
-async def consume_approval(request: Request, body: ConsumeApprovalRequest) -> ApiResponse:
+async def consume_approval(
+    request: Request, body: ConsumeApprovalRequest
+) -> ApiResponse:
     approval_id = body.approval_id
     if not approval_id:
         raise HTTPException(status_code=422, detail="approval_id required")
-    principal_id, wallet_address = _principal(request, wallet_address=body.wallet_address)
+    principal_id, wallet_address = _principal(
+        request, wallet_address=body.wallet_address
+    )
     return _consume_response(
         approval_id=approval_id,
         principal_id=principal_id,
@@ -276,8 +384,12 @@ async def consume_approval(request: Request, body: ConsumeApprovalRequest) -> Ap
 
 
 @router.post("/approvals/{approval_id}/approve", response_model=ApiResponse)
-async def approve_approval(approval_id: str, request: Request, body: ConsumeApprovalRequest) -> ApiResponse:
-    principal_id, wallet_address = _principal(request, wallet_address=body.wallet_address)
+async def approve_approval(
+    approval_id: str, request: Request, body: ConsumeApprovalRequest
+) -> ApiResponse:
+    principal_id, wallet_address = _principal(
+        request, wallet_address=body.wallet_address
+    )
     return _consume_response(
         approval_id=approval_id,
         principal_id=principal_id,
@@ -322,14 +434,48 @@ async def execute_action(
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     correlation_id: Optional[str] = Header(default=None, alias="X-Correlation-ID"),
 ) -> ApiResponse:
-    if idempotency_key and body.idempotency_key and idempotency_key != body.idempotency_key:
-        raise HTTPException(status_code=422, detail="Idempotency key header and body disagree.")
+    if (
+        idempotency_key
+        and body.idempotency_key
+        and idempotency_key != body.idempotency_key
+    ):
+        raise HTTPException(
+            status_code=422, detail="Idempotency key header and body disagree."
+        )
     effective_idempotency_key = idempotency_key or body.idempotency_key
     if not effective_idempotency_key:
         raise HTTPException(status_code=422, detail="Idempotency-Key is required.")
     effective_correlation_id = correlation_id or f"correlation_{uuid4().hex}"
     response.headers["X-Correlation-ID"] = effective_correlation_id
-    principal_id, wallet_address = _principal(request, wallet_address=body.wallet_address)
+    principal_id, wallet_address = _principal(
+        request, wallet_address=body.wallet_address
+    )
+    pool = _persistence_pool(request)
+    if (
+        pool is not None
+        and agentguard.normalize_action(body.action) == "buyer.checkout.commit"
+        and body.payload.get("quote_id")
+    ):
+        if not body.decision_id:
+            raise HTTPException(status_code=422, detail="decision_id is required.")
+        quote_id = str(body.payload["quote_id"])
+        try:
+            result = await CheckoutOrchestrator(pool).execute_checkout(
+                principal_id=principal_id,
+                quote_id=quote_id,
+                decision_id=body.decision_id,
+                approval_id=body.approval_id,
+                idempotency_key=effective_idempotency_key,
+                correlation_id=effective_correlation_id,
+                payment_outcome=str(body.payload.get("payment_outcome", "succeeded")),
+            )
+        except Exception as error:
+            _raise_persistent_error(error)
+        return ApiResponse(
+            success=True,
+            message=result["human_reason"],
+            data={**result, "correlation_id": effective_correlation_id},
+        )
     try:
         result = agentguard.execute_action(
             principal_id=principal_id,
@@ -358,46 +504,114 @@ async def execute_action(
 
 
 @router.post("/agents/{agent_id}/pause", response_model=ApiResponse)
-async def pause_agent(agent_id: str, request: Request, body: PauseRequest) -> ApiResponse:
+async def pause_agent(
+    agent_id: str, request: Request, body: PauseRequest
+) -> ApiResponse:
     principal_id, _wallet = _principal(request, wallet_address=body.wallet_address)
+    pool = _persistence_pool(request)
+    if pool is not None and agent_id == CheckoutOrchestrator.agent_id(principal_id):
+        try:
+            paused = await CheckoutOrchestrator(pool).set_agent_status(
+                principal_id=principal_id, agent_id=agent_id, status="paused"
+            )
+        except Exception as error:
+            _raise_persistent_error(error)
+        return ApiResponse(success=True, message="Agent paused", data={"agent": paused})
     _assert_agent_principal(agent_id, principal_id)
     paused = agentguard.pause_agent(agent_id)
-    return ApiResponse(success=True, message="Agent paused", data={"agent": paused.model_dump()})
+    return ApiResponse(
+        success=True, message="Agent paused", data={"agent": paused.model_dump()}
+    )
 
 
 @router.post("/agents/{agent_id}/resume", response_model=ApiResponse)
-async def resume_agent(agent_id: str, request: Request, body: PauseRequest) -> ApiResponse:
+async def resume_agent(
+    agent_id: str, request: Request, body: PauseRequest
+) -> ApiResponse:
     principal_id, _wallet = _principal(request, wallet_address=body.wallet_address)
+    pool = _persistence_pool(request)
+    if pool is not None and agent_id == CheckoutOrchestrator.agent_id(principal_id):
+        try:
+            resumed = await CheckoutOrchestrator(pool).set_agent_status(
+                principal_id=principal_id, agent_id=agent_id, status="active"
+            )
+        except Exception as error:
+            _raise_persistent_error(error)
+        return ApiResponse(
+            success=True, message="Agent resumed", data={"agent": resumed}
+        )
     _assert_agent_principal(agent_id, principal_id)
     resumed = agentguard.resume_agent(agent_id)
-    return ApiResponse(success=True, message="Agent resumed", data={"agent": resumed.model_dump()})
+    return ApiResponse(
+        success=True, message="Agent resumed", data={"agent": resumed.model_dump()}
+    )
 
 
 @router.post("/agents/{agent_id}/revoke", response_model=ApiResponse)
-async def revoke_agent(agent_id: str, request: Request, body: PauseRequest) -> ApiResponse:
+async def revoke_agent(
+    agent_id: str, request: Request, body: PauseRequest
+) -> ApiResponse:
     principal_id, _wallet = _principal(request, wallet_address=body.wallet_address)
+    pool = _persistence_pool(request)
+    if pool is not None and agent_id == CheckoutOrchestrator.agent_id(principal_id):
+        try:
+            revoked = await CheckoutOrchestrator(pool).set_agent_status(
+                principal_id=principal_id, agent_id=agent_id, status="revoked"
+            )
+        except Exception as error:
+            _raise_persistent_error(error)
+        return ApiResponse(
+            success=True, message="Agent revoked", data={"agent": revoked}
+        )
     _assert_agent_principal(agent_id, principal_id)
     revoked = agentguard.revoke_agent(agent_id)
-    return ApiResponse(success=True, message="Agent revoked", data={"agent": revoked.model_dump()})
+    return ApiResponse(
+        success=True, message="Agent revoked", data={"agent": revoked.model_dump()}
+    )
 
 
 @router.post("/receipts/verify", response_model=ApiResponse)
-async def verify_receipt(body: ReceiptVerifyRequest) -> ApiResponse:
+async def verify_receipt(request: Request, body: ReceiptVerifyRequest) -> ApiResponse:
+    pool = _persistence_pool(request)
+    if pool is not None and body.receipt_id:
+        principal_id, _wallet = _principal(request, wallet_address=None)
+        try:
+            stored = await CheckoutOrchestrator(pool).get_receipt(
+                principal_id=principal_id, receipt_id=body.receipt_id
+            )
+        except Exception as error:
+            _raise_persistent_error(error)
+        result = agentguard.verify_receipt_payload(stored["payload"])
+        return ApiResponse(success=True, message="Receipt verified", data=result)
     try:
         if body.receipt_id:
             result = agentguard.verify_receipt_by_id(body.receipt_id)
         elif body.receipt:
             result = agentguard.verify_receipt_payload(body.receipt)
         else:
-            raise HTTPException(status_code=422, detail="receipt_id or receipt required")
+            raise HTTPException(
+                status_code=422, detail="receipt_id or receipt required"
+            )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return ApiResponse(success=True, message="Receipt verified", data=result)
 
 
 @router.get("/receipts/{receipt_id}", response_model=ApiResponse)
-async def get_receipt(receipt_id: str) -> ApiResponse:
+async def get_receipt(receipt_id: str, request: Request) -> ApiResponse:
+    pool = _persistence_pool(request)
+    if pool is not None:
+        principal_id, _wallet = _principal(request, wallet_address=None)
+        try:
+            receipt = await CheckoutOrchestrator(pool).get_receipt(
+                principal_id=principal_id, receipt_id=receipt_id
+            )
+        except Exception as error:
+            _raise_persistent_error(error)
+        return ApiResponse(success=True, message="Receipt", data={"receipt": receipt})
     receipt = agentguard.get_receipt(receipt_id)
     if not receipt:
         raise HTTPException(status_code=404, detail="Unknown receipt")
-    return ApiResponse(success=True, message="Receipt", data={"receipt": receipt.model_dump()})
+    return ApiResponse(
+        success=True, message="Receipt", data={"receipt": receipt.model_dump()}
+    )
