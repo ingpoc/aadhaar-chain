@@ -163,6 +163,19 @@ class AgentGuardRepository:
             (principal_id, mandate_id, version),
         )
 
+    async def get_latest_mandate_for_agent(
+        self, *, principal_id: str, agent_id: str
+    ) -> dict[str, Any] | None:
+        return await self._fetch_one(
+            """
+            SELECT * FROM agentguard_mandate_versions
+            WHERE principal_id = %s AND agent_id = %s
+            ORDER BY version DESC
+            LIMIT 1
+            """,
+            (principal_id, agent_id),
+        )
+
     async def record_decision(
         self,
         *,

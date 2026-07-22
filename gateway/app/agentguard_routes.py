@@ -261,7 +261,7 @@ async def compile_mandate(request: Request, body: CompileMandateRequest) -> ApiR
             _raise_persistent_error(error)
         return ApiResponse(
             success=True,
-            message="Mandate compiled and activated",
+            message="Mandate compiled; confirmation required",
             data=result,
         )
     template = body.template or (
@@ -289,12 +289,10 @@ async def confirm_mandate(
     pool = _persistence_pool(request)
     if pool is not None and mandate_id == CheckoutOrchestrator.mandate_id(principal_id):
         try:
-            result = await CheckoutOrchestrator(pool).current_mandate(
-                principal_id=principal_id
+            result = await CheckoutOrchestrator(pool).confirm_mandate(
+                principal_id=principal_id, mandate_id=mandate_id
             )
             mandate = result["mandate"]
-            if mandate["mandate_id"] != mandate_id:
-                raise AgentGuardNotFound("mandate not found")
         except Exception as error:
             _raise_persistent_error(error)
         return ApiResponse(
@@ -471,6 +469,8 @@ async def execute_action(
             )
         except Exception as error:
             _raise_persistent_error(error)
+        if result["reason_code"] == "PAYMENT_STATUS_UNKNOWN":
+            response.status_code = 202
         return ApiResponse(
             success=True,
             message=result["human_reason"],

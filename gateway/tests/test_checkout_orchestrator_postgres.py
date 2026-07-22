@@ -20,6 +20,7 @@ from app.commerce_v1_routes import router as commerce_v1_router
 from app.persistence import ConnectionPool, MigrationRunner
 from app.persistence.agentguard_repository import (
     AgentGuardConflict,
+    AgentGuardNotFound,
     AgentGuardRepository,
 )
 from app.receipt_signing import verify_receipt
@@ -65,7 +66,7 @@ async def test_over_limit_exact_approval_checkout_replays_one_paid_order(
     principal_id = "principal:checkout-e2e"
     commerce = CommerceV1(pool)
     orchestrator = CheckoutOrchestrator(pool)
-    await orchestrator.compile_mandate(
+    compiled = await orchestrator.compile_mandate(
         principal_id=principal_id, limits={"max_order_paise": 15_000}
     )
     await commerce.upsert_inventory(
@@ -93,6 +94,14 @@ async def test_over_limit_exact_approval_checkout_replays_one_paid_order(
         cart_id=cart["cart_id"],
         expected_version=cart["version"],
         idempotency_key="preview-e2e",
+    )
+    with pytest.raises(AgentGuardNotFound, match="mandate"):
+        await orchestrator.evaluate_checkout(
+            principal_id=principal_id, quote_id=quote["quote_id"]
+        )
+    await orchestrator.confirm_mandate(
+        principal_id=principal_id,
+        mandate_id=compiled["mandate"]["mandate_id"],
     )
     decision = await orchestrator.evaluate_checkout(
         principal_id=principal_id, quote_id=quote["quote_id"]
@@ -203,6 +212,8 @@ async def test_http_mandate_preview_decision_execute_and_replay(
             json={"role": "buyer", "limits": {"max_order_paise": 10_000}},
         )
         assert mandate.status_code == 200
+        mandate_record = mandate.json()["data"]["mandate"]
+        assert mandate_record["status"] == "draft"
 
         cart_response = await client.post(
             "/api/commerce/v1/carts",
@@ -222,6 +233,23 @@ async def test_http_mandate_preview_decision_execute_and_replay(
             json={"expected_version": cart["version"]},
         )
         quote = preview_response.json()["data"]["quote"]
+
+        before_confirmation = await client.post(
+            "/api/agentguard/actions/evaluate",
+            json={
+                "action": "buyer.checkout.commit",
+                "amount_inr": 0,
+                "resource_id": quote["quote_id"],
+                "payload": {"quote_id": quote["quote_id"]},
+            },
+        )
+        assert before_confirmation.status_code == 404
+        confirmed = await client.post(
+            f"/api/agentguard/mandates/{mandate_record['mandate_id']}/confirm",
+            json={},
+        )
+        assert confirmed.status_code == 200
+        assert confirmed.json()["data"]["mandate"]["status"] == "active"
 
         evaluation = await client.post(
             "/api/agentguard/actions/evaluate",
@@ -272,6 +300,106 @@ async def test_http_mandate_preview_decision_execute_and_replay(
         )
         assert verified.status_code == 200
         assert verified.json()["data"]["valid"] is True
+
+        async def execute_outcome(outcome: str):
+            outcome_cart = (
+                await client.post(
+                    "/api/commerce/v1/carts",
+                    headers={"Idempotency-Key": f"{outcome}-cart"},
+                    json={"seller_id": "seller-http-checkout"},
+                )
+            ).json()["data"]["cart"]
+            outcome_cart = (
+                await client.put(
+                    f"/api/commerce/v1/carts/{outcome_cart['cart_id']}/lines/rice-http-checkout",
+                    headers={"Idempotency-Key": f"{outcome}-line"},
+                    json={"quantity": 1, "expected_version": outcome_cart["version"]},
+                )
+            ).json()["data"]["cart"]
+            outcome_quote = (
+                await client.post(
+                    f"/api/commerce/v1/carts/{outcome_cart['cart_id']}/checkout-preview",
+                    headers={"Idempotency-Key": f"{outcome}-preview"},
+                    json={"expected_version": outcome_cart["version"]},
+                )
+            ).json()["data"]["quote"]
+            outcome_decision = (
+                await client.post(
+                    "/api/agentguard/actions/evaluate",
+                    json={
+                        "action": "buyer.checkout.commit",
+                        "amount_inr": 0,
+                        "resource_id": outcome_quote["quote_id"],
+                        "payload": {"quote_id": outcome_quote["quote_id"]},
+                    },
+                )
+            ).json()["data"]
+            body = {
+                "action": "buyer.checkout.commit",
+                "resource_id": outcome_quote["quote_id"],
+                "decision_id": outcome_decision["decision_id"],
+                "approval_id": outcome_decision["approval"]["approval_id"],
+                "payload": {
+                    "quote_id": outcome_quote["quote_id"],
+                    "payment_outcome": outcome,
+                },
+            }
+            return await client.post(
+                "/api/agentguard/actions/execute",
+                headers={"Idempotency-Key": f"{outcome}-checkout"},
+                json=body,
+            ), body
+
+        unknown, unknown_body = await execute_outcome("unknown")
+        assert unknown.status_code == 202
+        assert unknown.json()["data"]["reason_code"] == "PAYMENT_STATUS_UNKNOWN"
+        assert unknown.json()["data"]["receipt"]["outcome"] == "payment_unknown"
+        unknown_replay = await client.post(
+            "/api/agentguard/actions/execute",
+            headers={"Idempotency-Key": "unknown-checkout"},
+            json=unknown_body,
+        )
+        assert unknown_replay.status_code == 202
+        assert (
+            unknown_replay.json()["data"]["receipt"]["receipt_id"]
+            == unknown.json()["data"]["receipt"]["receipt_id"]
+        )
+        await CommerceV1(pool).reconcile_payment(
+            principal_id=principal_id,
+            payment_attempt_id=unknown.json()["data"]["result"]["payment_attempt"][
+                "payment_attempt_id"
+            ],
+            outcome="succeeded",
+            detail={"simulated_reconciliation": True},
+        )
+        reconciled = await client.post(
+            "/api/agentguard/actions/execute",
+            headers={"Idempotency-Key": "unknown-checkout"},
+            json=unknown_body,
+        )
+        assert reconciled.status_code == 200
+        assert reconciled.json()["data"]["reason_code"] == "EXECUTED_AND_VERIFIED"
+        assert reconciled.json()["data"]["result"]["order"]["status"] == "paid"
+
+        failed, _failed_body = await execute_outcome("failed")
+        assert failed.status_code == 409
+        assert "Payment failed" in failed.json()["detail"]
+        async with pool.connection() as connection:
+            failed_record = await connection.execute(
+                """
+                SELECT intent.status, receipt.status, receipt.payload->>'outcome'
+                FROM agentguard_execution_intents AS intent
+                JOIN agentguard_receipts AS receipt
+                  ON receipt.intent_id = intent.intent_id
+                WHERE intent.principal_id = %s AND intent.idempotency_key = %s
+                """,
+                (principal_id, "failed-checkout"),
+            )
+            assert await failed_record.fetchone() == (
+                "failed",
+                "failed",
+                "payment_failed",
+            )
 
 
 async def test_legacy_buyer_mandate_stays_on_compatibility_adapter(

@@ -83,7 +83,10 @@ class CheckoutOrchestrator:
                 )
             if agent["status"] == "revoked":
                 raise AgentGuardConflict("agent is revoked")
-            version = int(agent.get("current_mandate_version") or 0) + 1
+            latest = await repository.get_latest_mandate_for_agent(
+                principal_id=principal_id, agent_id=agent_id
+            )
+            version = int((latest or {}).get("version") or 0) + 1
             mandate = await repository.create_mandate_version(
                 mandate_id=mandate_id,
                 version=version,
@@ -94,11 +97,58 @@ class CheckoutOrchestrator:
                     "max_order_paise": max_order_paise,
                     "currency": "INR",
                 },
+                status="draft",
+                activate=False,
             )
             agent = await repository.get_agent(
                 principal_id=principal_id, agent_id=agent_id
             )
         return {"agent": _jsonable(agent), "mandate": _jsonable(mandate)}
+
+    async def confirm_mandate(
+        self, *, principal_id: str, mandate_id: str
+    ) -> dict[str, Any]:
+        agent_id = self.agent_id(principal_id)
+        async with UnitOfWork(self.pool) as unit_of_work:
+            repository = AgentGuardRepository(unit_of_work)
+            agent = await repository.get_agent(
+                principal_id=principal_id, agent_id=agent_id
+            )
+            if agent is None:
+                raise AgentGuardNotFound("buyer mandate not found")
+            if (
+                agent.get("current_mandate_id") == mandate_id
+                and agent.get("current_mandate_version") is not None
+            ):
+                active = await repository.get_mandate_version(
+                    principal_id=principal_id,
+                    mandate_id=mandate_id,
+                    version=agent["current_mandate_version"],
+                )
+                if active is not None and active["status"] == "active":
+                    return {"agent": _jsonable(agent), "mandate": _jsonable(active)}
+            latest = await repository.get_latest_mandate_for_agent(
+                principal_id=principal_id, agent_id=agent_id
+            )
+            if (
+                latest is None
+                or latest["mandate_id"] != mandate_id
+                or latest["status"] != "draft"
+            ):
+                raise AgentGuardConflict("latest mandate is not confirmable")
+            active = await repository.create_mandate_version(
+                mandate_id=mandate_id,
+                version=latest["version"] + 1,
+                principal_id=principal_id,
+                agent_id=agent_id,
+                payload=latest["payload"],
+                status="active",
+                activate=True,
+            )
+            agent = await repository.get_agent(
+                principal_id=principal_id, agent_id=agent_id
+            )
+        return {"agent": _jsonable(agent), "mandate": _jsonable(active)}
 
     async def _authority(
         self, repository: AgentGuardRepository, principal_id: str
@@ -177,19 +227,6 @@ class CheckoutOrchestrator:
     async def evaluate_checkout(
         self, *, principal_id: str, quote_id: str
     ) -> dict[str, Any]:
-        try:
-            async with UnitOfWork(self.pool) as unit_of_work:
-                agentguard = AgentGuardRepository(unit_of_work)
-                commerce = CommerceRepository(unit_of_work)
-                try:
-                    agent, mandate = await self._authority(agentguard, principal_id)
-                except AgentGuardNotFound:
-                    agent = mandate = None
-        except AgentGuardNotFound:  # pragma: no cover - retained for adapter safety
-            agent = mandate = None
-        if agent is None or mandate is None:
-            await self.compile_mandate(principal_id=principal_id, limits={})
-
         async with UnitOfWork(self.pool) as unit_of_work:
             agentguard = AgentGuardRepository(unit_of_work)
             commerce = CommerceRepository(unit_of_work)
@@ -361,6 +398,12 @@ class CheckoutOrchestrator:
                 ],
             )
             current_status = payment_state["payment_attempt"]["status"]
+            if (
+                not created
+                and current_status == "unknown"
+                and intent.get("result") is not None
+            ):
+                return intent["result"]
             if current_status == "pending":
                 payment_result = await self.commerce.record_payment_result(
                     principal_id=principal_id,
@@ -372,9 +415,17 @@ class CheckoutOrchestrator:
                     detail={"simulated": True},
                 )
             elif (
-                payment_outcome == "succeeded"
-                and current_status in {"succeeded", "reconciled"}
-            ) or current_status == payment_outcome:
+                (
+                    not created
+                    and current_status
+                    in {"succeeded", "reconciled", "failed", "unknown"}
+                )
+                or (
+                    payment_outcome == "succeeded"
+                    and current_status in {"succeeded", "reconciled"}
+                )
+                or current_status == payment_outcome
+            ):
                 payment_result = payment_state
             else:
                 raise AgentGuardConflict(
@@ -391,6 +442,31 @@ class CheckoutOrchestrator:
                 )
             raise
 
+        payment_status = verified_result["payment_attempt"]["status"]
+        if payment_status in {"succeeded", "reconciled"}:
+            intent_status = "succeeded"
+            receipt_status = "executed"
+            receipt_outcome = "executed"
+            reason_code = "EXECUTED_AND_VERIFIED"
+            human_reason = "Payment and order state were verified."
+            required_action = "none"
+        elif payment_status == "failed":
+            intent_status = "failed"
+            receipt_status = "failed"
+            receipt_outcome = "payment_failed"
+            reason_code = "PAYMENT_FAILED"
+            human_reason = "Payment failed. No successful purchase was recorded."
+            required_action = "review"
+        else:
+            intent_status = "executing"
+            receipt_status = "pending"
+            receipt_outcome = "payment_unknown"
+            reason_code = "PAYMENT_STATUS_UNKNOWN"
+            human_reason = (
+                "Payment status is unknown. The order is pending reconciliation."
+            )
+            required_action = "contact_support"
+
         receipt_id = f"receipt_{uuid4().hex}"
         receipt_payload = sign_receipt(
             {
@@ -405,7 +481,7 @@ class CheckoutOrchestrator:
                 "correlation_id": correlation_id,
                 "bound_action": bound,
                 "result": verified_result,
-                "outcome": "executed",
+                "outcome": receipt_outcome,
                 "created_at": _utcnow().isoformat(),
             }
         )
@@ -414,10 +490,10 @@ class CheckoutOrchestrator:
             "decision": "allow",
             "decision_id": decision_id,
             "policy_id": self.policy_id,
-            "reason_code": "EXECUTED_AND_VERIFIED",
-            "human_reason": "Payment and order state were verified.",
-            "reason": "Payment and order state were verified.",
-            "required_action": "none",
+            "reason_code": reason_code,
+            "human_reason": human_reason,
+            "reason": human_reason,
+            "required_action": required_action,
             "risk_level": "high",
             "policy_version": mandate["version"],
             "expires_at": decision["expiry"].isoformat(),
@@ -429,7 +505,7 @@ class CheckoutOrchestrator:
             await agentguard.set_execution_intent_status(
                 principal_id=principal_id,
                 intent_id=intent["intent_id"],
-                status="succeeded",
+                status=intent_status,
                 result=response,
             )
             await agentguard.record_receipt(
@@ -441,9 +517,11 @@ class CheckoutOrchestrator:
                 decision_id=decision_id,
                 approval_id=approval_id,
                 intent_id=intent["intent_id"],
-                status="executed",
+                status=receipt_status,
                 payload=receipt_payload,
             )
+        if payment_status == "failed":
+            raise AgentGuardConflict(human_reason)
         return response
 
 
