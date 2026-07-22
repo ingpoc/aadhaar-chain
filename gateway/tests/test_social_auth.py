@@ -19,7 +19,7 @@ def test_demo_continue_issues_principal_session() -> None:
     assert res.status_code == 200
     body = res.json()
     assert body["success"] is True
-    assert body["data"]["principal_id"].startswith("principal:demo:")
+    assert body["data"]["principal_id"] == "principal:demo:buyer"
     assert body["data"]["identity_provider"] == "demo"
     assert body["data"]["audience"] == "ondcbuyer"
     assert "wallet_address" not in body["data"]
@@ -42,6 +42,26 @@ def test_demo_continue_get_redirects() -> None:
     assert res.status_code == 302
     assert res.headers["location"] == "http://127.0.0.1:43103/dashboard"
     assert "aadharcha_session" in res.cookies
+
+    me = client.get("/api/auth/me", cookies=res.cookies)
+    assert me.json()["data"]["principal_id"] == "principal:demo:seller"
+
+
+def test_demo_continue_is_stable_per_role_and_isolates_roles() -> None:
+    client = _client()
+    buyer_first = client.post("/api/auth/demo-continue", json={"audience": "ondcbuyer"})
+    buyer_second = client.post("/api/auth/demo-continue", json={"audience": "ondcbuyer"})
+    seller = client.post("/api/auth/demo-continue", json={"audience": "ondcseller"})
+
+    assert buyer_first.json()["data"]["principal_id"] == "principal:demo:buyer"
+    assert buyer_second.json()["data"]["principal_id"] == "principal:demo:buyer"
+    assert seller.json()["data"]["principal_id"] == "principal:demo:seller"
+
+
+def test_demo_continue_rejects_unknown_audience() -> None:
+    res = _client().post("/api/auth/demo-continue", json={"audience": "unknown-app"})
+    assert res.status_code == 422
+    assert res.json()["detail"] == "Unsupported demo audience."
 
 
 def test_auth_providers_lists_demo(monkeypatch: pytest.MonkeyPatch) -> None:

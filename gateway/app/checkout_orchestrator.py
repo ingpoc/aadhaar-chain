@@ -58,12 +58,69 @@ class CheckoutOrchestrator:
     def mandate_id(principal_id: str) -> str:
         return f"mandate_buyer_{sha256(principal_id.encode()).hexdigest()[:20]}"
 
+    @classmethod
+    def _mandate_view(cls, mandate: dict[str, Any] | None) -> dict[str, Any] | None:
+        if mandate is None:
+            return None
+        payload = mandate.get("payload") or {}
+        maximum = int(payload.get("max_order_paise") or 0)
+        return _jsonable(
+            {
+                **mandate,
+                "allowed_actions": payload.get("allowed_actions") or [cls.operation],
+                "limits": {
+                    "auto_approve_max_inr": {cls.operation: maximum // 100},
+                    "max_order_paise": maximum,
+                },
+            }
+        )
+
+    @classmethod
+    def _policy_view(cls) -> dict[str, Any]:
+        return {
+            "policy_id": cls.policy_id,
+            "version": 1,
+            "allowed_actions": [cls.operation],
+        }
+
+    async def ensure_agent(self, *, principal_id: str) -> dict[str, Any]:
+        agent_id = self.agent_id(principal_id)
+        async with UnitOfWork(self.pool) as unit_of_work:
+            repository = AgentGuardRepository(unit_of_work)
+            agent = await repository.get_agent(
+                principal_id=principal_id, agent_id=agent_id
+            )
+            if agent is None:
+                agent = await repository.create_agent(
+                    agent_id=agent_id,
+                    principal_id=principal_id,
+                    role="buyer",
+                    payload={"name": "Buyer commerce agent"},
+                )
+            mandate = await repository.get_latest_mandate_for_agent(
+                principal_id=principal_id, agent_id=agent_id
+            )
+            receipts = await repository.list_receipts(
+                principal_id=principal_id, limit=20
+            )
+        return {
+            "agent": _jsonable(agent),
+            "mandate": self._mandate_view(mandate),
+            "policy": self._policy_view(),
+            "receipts": _jsonable(receipts),
+        }
+
     async def compile_mandate(
         self, *, principal_id: str, limits: dict[str, Any]
     ) -> dict[str, Any]:
         max_order_paise = limits.get("max_order_paise")
         if max_order_paise is None:
-            max_order_paise = int(limits.get("checkout_auto_max_inr", 10_000)) * 100
+            automatic = limits.get("auto_approve_max_inr")
+            if isinstance(automatic, dict):
+                automatic = automatic.get(self.operation)
+            if automatic is None:
+                automatic = limits.get("checkout_auto_max_inr", 10_000)
+            max_order_paise = int(automatic) * 100
         max_order_paise = int(max_order_paise)
         if max_order_paise < 0:
             raise ValueError("max order amount must be non-negative")
@@ -103,7 +160,7 @@ class CheckoutOrchestrator:
             agent = await repository.get_agent(
                 principal_id=principal_id, agent_id=agent_id
             )
-        return {"agent": _jsonable(agent), "mandate": _jsonable(mandate)}
+        return {"agent": _jsonable(agent), "mandate": self._mandate_view(mandate)}
 
     async def confirm_mandate(
         self, *, principal_id: str, mandate_id: str
@@ -148,7 +205,7 @@ class CheckoutOrchestrator:
             agent = await repository.get_agent(
                 principal_id=principal_id, agent_id=agent_id
             )
-        return {"agent": _jsonable(agent), "mandate": _jsonable(active)}
+        return {"agent": _jsonable(agent), "mandate": self._mandate_view(active)}
 
     async def _authority(
         self, repository: AgentGuardRepository, principal_id: str
@@ -174,7 +231,7 @@ class CheckoutOrchestrator:
             agent, mandate = await self._authority(
                 AgentGuardRepository(unit_of_work), principal_id
             )
-        return {"agent": _jsonable(agent), "mandate": _jsonable(mandate)}
+        return {"agent": _jsonable(agent), "mandate": self._mandate_view(mandate)}
 
     async def set_agent_status(
         self, *, principal_id: str, agent_id: str, status: str

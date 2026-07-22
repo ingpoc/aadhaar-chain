@@ -346,7 +346,10 @@ async def test_http_mandate_preview_decision_execute_and_replay(
             }
             return await client.post(
                 "/api/agentguard/actions/execute",
-                headers={"Idempotency-Key": f"{outcome}-checkout"},
+                headers={
+                    "Idempotency-Key": f"{outcome}-checkout",
+                    "X-Correlation-ID": f"correlation-{outcome}",
+                },
                 json=body,
             ), body
 
@@ -356,7 +359,10 @@ async def test_http_mandate_preview_decision_execute_and_replay(
         assert unknown.json()["data"]["receipt"]["outcome"] == "payment_unknown"
         unknown_replay = await client.post(
             "/api/agentguard/actions/execute",
-            headers={"Idempotency-Key": "unknown-checkout"},
+            headers={
+                "Idempotency-Key": "unknown-checkout",
+                "X-Correlation-ID": "correlation-unknown",
+            },
             json=unknown_body,
         )
         assert unknown_replay.status_code == 202
@@ -374,7 +380,10 @@ async def test_http_mandate_preview_decision_execute_and_replay(
         )
         reconciled = await client.post(
             "/api/agentguard/actions/execute",
-            headers={"Idempotency-Key": "unknown-checkout"},
+            headers={
+                "Idempotency-Key": "unknown-checkout",
+                "X-Correlation-ID": "correlation-unknown",
+            },
             json=unknown_body,
         )
         assert reconciled.status_code == 200
@@ -402,12 +411,19 @@ async def test_http_mandate_preview_decision_execute_and_replay(
             )
 
 
-async def test_legacy_buyer_mandate_stays_on_compatibility_adapter(
+async def test_legacy_buyer_mandate_shape_uses_postgres_control_plane(
     pool: ConnectionPool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "data_dir", str(tmp_path))
+
+    def reject_file_fork(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("PostgreSQL-selected AgentGuard touched file state")
+
+    monkeypatch.setattr(
+        "app.agentguard_routes.agentguard.compile_mandate", reject_file_fork
+    )
     api = FastAPI()
     api.state.persistence_pool = pool
     api.include_router(agentguard_router)
@@ -438,3 +454,21 @@ async def test_legacy_buyer_mandate_stays_on_compatibility_adapter(
             f"/api/agentguard/mandates/{mandate['mandate_id']}/confirm", json={}
         )
         assert confirmed.status_code == 200
+        ensured = await client.post(
+            "/api/agentguard/agents/ensure", json={"role": "buyer"}
+        )
+        assert ensured.status_code == 200
+        assert ensured.json()["data"]["mandate"]["status"] == "active"
+        current = await client.get("/api/agentguard/agents/current?role=buyer")
+        assert current.status_code == 200
+        agent_id = current.json()["data"]["agent"]["agent_id"]
+        paused = await client.post(
+            f"/api/agentguard/agents/{agent_id}/pause", json={}
+        )
+        assert paused.status_code == 200
+        assert paused.json()["data"]["agent"]["status"] == "paused"
+        resumed = await client.post(
+            f"/api/agentguard/agents/{agent_id}/resume", json={}
+        )
+        assert resumed.status_code == 200
+        assert resumed.json()["data"]["agent"]["status"] == "active"

@@ -4,6 +4,7 @@ Catalog source: published rows in demo-commerce state (DATA_DIR) — no mock gro
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
@@ -15,7 +16,15 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from app.commerce_demo import load_state, search_items
+from app.commerce_compat import CommerceCompatibilityAdapter
 from app.ondc_crypto import create_authorization_header, load_ed25519_private_pem, minify_json
+from app.persistence.ondc_repository import (
+    CorrelationMismatch,
+    EnvelopeCommitmentMismatch,
+    ONDCRepository,
+    persist_callback_before_ack,
+)
+from app.persistence.transaction import UnitOfWork
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -25,6 +34,113 @@ router = APIRouter(tags=["ondc-bpp"])
 CORE_VERSION = "1.2.0"
 DEFAULT_DOMAIN = "ONDC:RET10"
 PROVIDER_ID = "aadhaar-seller-isn"
+
+
+async def _persist_bpp_inbound(
+    request: Request, action: str, body: dict[str, Any]
+) -> tuple[Any | None, bool]:
+    """Persist an inbound BPP command before ACK and identify exact replays."""
+    pool = getattr(request.app.state, "persistence_pool", None)
+    if pool is None:
+        return None, True
+    context = body.get("context") or {}
+    transaction_id = str(context.get("transaction_id") or "").strip()
+    message_id = str(context.get("message_id") or "").strip()
+    subscriber_id = str(context.get("bap_id") or "").strip()
+    if not transaction_id or not message_id or not subscriber_id:
+        raise HTTPException(
+            status_code=400,
+            detail="context.bap_id, transaction_id, and message_id are required",
+        )
+    try:
+        created, _ = await persist_callback_before_ack(
+            pool,
+            subscriber_id=subscriber_id,
+            transaction_id=transaction_id,
+            message_id=message_id,
+            action=action,
+            correlation_id=(
+                request.headers.get("X-Correlation-ID") or transaction_id
+            ).strip(),
+            raw_envelope=body,
+            redacted_payload={"status": "received", "role": "bpp"},
+        )
+    except (CorrelationMismatch, EnvelopeCommitmentMismatch, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503, detail="BPP request persistence unavailable"
+        ) from exc
+    return pool, created
+
+
+async def _stage_bpp_callback(
+    pool: Any | None,
+    envelope: dict[str, Any],
+    destination: str,
+) -> dict[str, Any] | None:
+    if pool is None:
+        return None
+    context = envelope["context"]
+    async with UnitOfWork(pool) as unit_of_work:
+        repository = ONDCRepository(unit_of_work)
+        _, persisted = await repository.enqueue_outbox(
+            subscriber_id=_bpp_id(),
+            transaction_id=str(context["transaction_id"]),
+            message_id=str(context["message_id"]),
+            action=str(context["action"]),
+            destination=destination,
+            raw_envelope=envelope,
+            redacted_payload={"status": "queued", "role": "bpp"},
+            correlation_id=str(context["transaction_id"]),
+        )
+        if persisted["state"] == "delivered":
+            return {"pool": pool, "record": persisted, "delivered": True}
+        claimed = await repository.claim_outbox_record(
+            persisted["outbox_id"],
+            worker_id=f"bpp-inline:{uuid.uuid4().hex}",
+            lease_seconds=60,
+        )
+    if claimed is None:
+        return {"pool": pool, "record": persisted, "delivered": False}
+    return {"pool": pool, "record": claimed, "delivered": False}
+
+
+async def _finish_bpp_callback(
+    staged: dict[str, Any] | None, *, delivered: bool, error: str = ""
+) -> None:
+    if staged is None or staged.get("delivered"):
+        return
+    record = staged["record"]
+    lease_token = record.get("lease_token")
+    if lease_token is None:
+        return
+    async with UnitOfWork(staged["pool"]) as unit_of_work:
+        repository = ONDCRepository(unit_of_work)
+        if delivered:
+            await repository.mark_delivered(
+                "outbox", record["outbox_id"], lease_token
+            )
+        else:
+            await repository.schedule_retry(
+                "outbox", record["outbox_id"], lease_token, error=error
+            )
+
+
+def _bap_acknowledged(response: httpx.Response) -> bool:
+    if response.status_code >= 400:
+        return False
+    try:
+        payload = json.loads(response.text)
+    except Exception:  # noqa: BLE001
+        try:
+            payload = response.json()
+        except Exception:  # noqa: BLE001
+            return True
+    if not isinstance(payload, dict):
+        return True
+    ack = ((payload.get("message") or {}).get("ack") or {}).get("status")
+    return ack != "NACK"
 
 
 def _seller_paths() -> dict[str, Path]:
@@ -170,7 +286,74 @@ def build_catalog_providers(*, query: str = "") -> list[dict[str, Any]]:
     ]
 
 
-async def _post_on_search(search_body: dict[str, Any]) -> None:
+async def _durable_catalog_providers(
+    pool: Any | None, *, query: str = ""
+) -> list[dict[str, Any]]:
+    """Use CommerceV1 as the BPP catalog owner whenever PostgreSQL is selected."""
+    if pool is None:
+        return build_catalog_providers(query=query)
+    result = await CommerceCompatibilityAdapter(pool).list_items(
+        query=query or None,
+        published_only=True,
+    )
+    rows = result.get("items") or []
+    beckn_items: list[dict[str, Any]] = []
+    for item in rows:
+        item_id = item.get("item_id")
+        quantity = int(item.get("inventory") or 0)
+        price = f"{float(item.get('price_inr') or 0):.2f}"
+        beckn_items.append(
+            {
+                "id": item_id,
+                "descriptor": {
+                    "name": item.get("title") or item_id,
+                    "code": item_id,
+                    "short_desc": item.get("description") or item.get("title") or "",
+                    "long_desc": item.get("description") or item.get("title") or "",
+                },
+                "price": {"currency": "INR", "value": price, "maximum_value": price},
+                "quantity": {
+                    "available": {"count": str(max(quantity, 0))},
+                    "maximum": {"count": str(max(quantity, 0))},
+                },
+                "category_id": item.get("category_id") or "Foodgrains",
+                "fulfillment_id": "1",
+                "location_id": "L1",
+                "delivery_areas": list(item.get("delivery_areas") or []),
+                "@ondc/org/returnable": False,
+                "@ondc/org/cancellable": True,
+                "@ondc/org/available_on_cod": False,
+                "@ondc/org/time_to_ship": "P1D",
+            }
+        )
+    if not beckn_items:
+        return []
+    return [
+        {
+            "id": PROVIDER_ID,
+            "descriptor": {
+                "name": "Sampoorna Groceries",
+                "short_desc": "Grocery seller on ONDC",
+            },
+            "fulfillments": [{"id": "1", "type": "Delivery"}],
+            "locations": [
+                {
+                    "id": "L1",
+                    "gps": "12.9715987,77.5945627",
+                    "address": {
+                        "locality": "Bengaluru",
+                        "city": "Bengaluru",
+                        "area_code": "560001",
+                        "state": "KA",
+                    },
+                }
+            ],
+            "items": beckn_items,
+        }
+    ]
+
+
+async def _post_on_search(search_body: dict[str, Any], pool: Any | None = None) -> None:
     if not _bpp_ready():
         logger.warning("BPP on_search skipped — seller keys / ONDC_ENABLED not ready")
         return
@@ -180,10 +363,15 @@ async def _post_on_search(search_body: dict[str, Any]) -> None:
         logger.warning("BPP on_search skipped — missing bap_uri")
         return
     query = _intent_query(search_body)
-    providers = build_catalog_providers(query=query)
+    providers = await _durable_catalog_providers(pool, query=query)
     if not providers:
         logger.info("BPP on_search — no published items; sending empty catalog")
-    message_id = str(uuid.uuid4())
+    message_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"{ctx.get('transaction_id')}:{ctx.get('message_id')}:on_search",
+        )
+    )
     envelope = {
         "context": {
             "domain": ctx.get("domain") or DEFAULT_DOMAIN,
@@ -223,6 +411,11 @@ async def _post_on_search(search_body: dict[str, Any]) -> None:
         private_key=private_key,
     )
     url = f"{bap_uri}/on_search"
+    staged = await _stage_bpp_callback(pool, envelope, url)
+    if staged is not None and (
+        staged.get("delivered") or staged["record"].get("lease_token") is None
+    ):
+        return
     try:
         async with httpx.AsyncClient(timeout=45.0) as client:
             resp = await client.post(
@@ -235,33 +428,49 @@ async def _post_on_search(search_body: dict[str, Any]) -> None:
                 },
             )
         logger.info("BPP on_search → %s status=%s", url, resp.status_code)
-    except Exception:  # noqa: BLE001
+        await _finish_bpp_callback(
+            staged,
+            delivered=_bap_acknowledged(resp),
+            error=f"BAP returned HTTP {resp.status_code}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        await _finish_bpp_callback(staged, delivered=False, error=str(exc))
         logger.exception("BPP on_search dispatch failed to %s", url)
 
 
-async def handle_bpp_search(body: dict[str, Any], background: BackgroundTasks) -> JSONResponse:
+async def handle_bpp_search(
+    request: Request, body: dict[str, Any], background: BackgroundTasks
+) -> JSONResponse:
     if not getattr(settings, "ondc_enabled", False):
         raise HTTPException(status_code=503, detail="ONDC_ENABLED=false")
-    background.add_task(_post_on_search, body)
+    pool, created = await _persist_bpp_inbound(request, "search", body)
+    if created:
+        background.add_task(_post_on_search, body, pool)
     return JSONResponse({"message": {"ack": {"status": "ACK"}}})
 
 
 @router.post("/ondc/np/seller/search")
 async def np_seller_search(request: Request, background: BackgroundTasks) -> JSONResponse:
     body = await request.json()
-    return await handle_bpp_search(body, background)
+    return await handle_bpp_search(request, body, background)
 
 
 @router.post("/ondc/search")
 async def root_search(request: Request, background: BackgroundTasks) -> JSONResponse:
     """BPP search when called on Seller subscriber URI (after Vercel rewrite use /ondc/np/seller/search)."""
     body = await request.json()
-    return await handle_bpp_search(body, background)
+    return await handle_bpp_search(request, body, background)
 
 
 @router.get("/api/ondc/bpp/status")
-async def bpp_status() -> JSONResponse:
-    published = search_items(None)
+async def bpp_status(request: Request) -> JSONResponse:
+    pool = getattr(request.app.state, "persistence_pool", None)
+    if pool is None:
+        published = search_items(None)
+    else:
+        published = await CommerceCompatibilityAdapter(pool).list_items(
+            published_only=True
+        )
     return JSONResponse(
         {
             "success": True,
@@ -279,12 +488,14 @@ async def bpp_status() -> JSONResponse:
 
 # --- select / init / confirm ---
 
-def _order_from_request(body: dict[str, Any]) -> dict[str, Any]:
+def _order_from_request(
+    body: dict[str, Any], providers: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
     message = body.get("message") or {}
     order = dict(message.get("order") or {})
     # Resolve requested ids against the published Seller catalog. A bare ACK
     # with an unpriced item is not a useful select/init/confirm proof.
-    providers = build_catalog_providers(query="")
+    providers = providers if providers is not None else build_catalog_providers(query="")
     catalog_items = (providers[0].get("items") if providers else []) or []
     by_id = {i.get("id"): i for i in catalog_items}
     requested = order.get("items") or message.get("items") or order.get("item_ids") or []
@@ -359,7 +570,9 @@ def _order_from_request(body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _post_on_action(action: str, request_body: dict[str, Any]) -> None:
+async def _post_on_action(
+    action: str, request_body: dict[str, Any], pool: Any | None = None
+) -> None:
     """ACK path already returned; post on_select / on_init / on_confirm to bap_uri."""
     if not _bpp_ready():
         logger.warning("BPP on_%s skipped — seller keys / ONDC_ENABLED not ready", action)
@@ -369,7 +582,8 @@ async def _post_on_action(action: str, request_body: dict[str, Any]) -> None:
     if not bap_uri:
         logger.warning("BPP on_%s skipped — missing bap_uri", action)
         return
-    order = _order_from_request(request_body)
+    providers = await _durable_catalog_providers(pool, query="")
+    order = _order_from_request(request_body, providers)
     if action == "confirm":
         order = {
             **order,
@@ -381,21 +595,27 @@ async def _post_on_action(action: str, request_body: dict[str, Any]) -> None:
                 "type": "ON-ORDER",
             },
         }
-        from app import ondc_store
+        if pool is None:
+            from app import ondc_store
 
-        ondc_store.append_order(
-            {
-                "id": order["id"],
-                "transaction_id": ctx.get("transaction_id"),
-                "bpp_id": _bpp_id(),
-                "state": order["state"],
-                "order": order,
-                "created_at": int(time.time()),
-            }
-        )
+            ondc_store.append_order(
+                {
+                    "id": order["id"],
+                    "transaction_id": ctx.get("transaction_id"),
+                    "bpp_id": _bpp_id(),
+                    "state": order["state"],
+                    "order": order,
+                    "created_at": int(time.time()),
+                }
+            )
     elif action == "init":
         order = {**order, "payment": {**(order.get("payment") or {}), "status": "NOT-PAID"}}
-    message_id = str(uuid.uuid4())
+    message_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"{ctx.get('transaction_id')}:{ctx.get('message_id')}:on_{action}",
+        )
+    )
     on_action = f"on_{action}"
     envelope = {
         "context": {
@@ -428,6 +648,11 @@ async def _post_on_action(action: str, request_body: dict[str, Any]) -> None:
         private_key=private_key,
     )
     url = f"{bap_uri}/{on_action}"
+    staged = await _stage_bpp_callback(pool, envelope, url)
+    if staged is not None and (
+        staged.get("delivered") or staged["record"].get("lease_token") is None
+    ):
+        return
     try:
         async with httpx.AsyncClient(timeout=45.0) as client:
             resp = await client.post(
@@ -440,46 +665,57 @@ async def _post_on_action(action: str, request_body: dict[str, Any]) -> None:
                 },
             )
         logger.info("BPP %s → %s status=%s", on_action, url, resp.status_code)
-    except Exception:  # noqa: BLE001
+        await _finish_bpp_callback(
+            staged,
+            delivered=_bap_acknowledged(resp),
+            error=f"BAP returned HTTP {resp.status_code}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        await _finish_bpp_callback(staged, delivered=False, error=str(exc))
         logger.exception("BPP %s dispatch failed to %s", on_action, url)
 
 
 async def handle_bpp_order_action(
-    action: str, body: dict[str, Any], background: BackgroundTasks
+    request: Request,
+    action: str,
+    body: dict[str, Any],
+    background: BackgroundTasks,
 ) -> JSONResponse:
     if action not in {"select", "init", "confirm"}:
         raise HTTPException(status_code=404, detail=f"unsupported BPP action: {action}")
     if not getattr(settings, "ondc_enabled", False):
         raise HTTPException(status_code=503, detail="ONDC_ENABLED=false")
-    background.add_task(_post_on_action, action, body)
+    pool, created = await _persist_bpp_inbound(request, action, body)
+    if created:
+        background.add_task(_post_on_action, action, body, pool)
     return JSONResponse({"message": {"ack": {"status": "ACK"}}})
 
 
 @router.post("/ondc/np/seller/select")
 async def np_seller_select(request: Request, background: BackgroundTasks) -> JSONResponse:
-    return await handle_bpp_order_action("select", await request.json(), background)
+    return await handle_bpp_order_action(request, "select", await request.json(), background)
 
 
 @router.post("/ondc/np/seller/init")
 async def np_seller_init(request: Request, background: BackgroundTasks) -> JSONResponse:
-    return await handle_bpp_order_action("init", await request.json(), background)
+    return await handle_bpp_order_action(request, "init", await request.json(), background)
 
 
 @router.post("/ondc/np/seller/confirm")
 async def np_seller_confirm(request: Request, background: BackgroundTasks) -> JSONResponse:
-    return await handle_bpp_order_action("confirm", await request.json(), background)
+    return await handle_bpp_order_action(request, "confirm", await request.json(), background)
 
 
 @router.post("/ondc/select")
 async def root_select(request: Request, background: BackgroundTasks) -> JSONResponse:
-    return await handle_bpp_order_action("select", await request.json(), background)
+    return await handle_bpp_order_action(request, "select", await request.json(), background)
 
 
 @router.post("/ondc/init")
 async def root_init(request: Request, background: BackgroundTasks) -> JSONResponse:
-    return await handle_bpp_order_action("init", await request.json(), background)
+    return await handle_bpp_order_action(request, "init", await request.json(), background)
 
 
 @router.post("/ondc/confirm")
 async def root_confirm(request: Request, background: BackgroundTasks) -> JSONResponse:
-    return await handle_bpp_order_action("confirm", await request.json(), background)
+    return await handle_bpp_order_action(request, "confirm", await request.json(), background)

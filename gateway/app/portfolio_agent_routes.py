@@ -18,6 +18,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.runtime_config import resolve_runtime_policy
+from app.runtime_outcome import (
+    RuntimeOutcomeError,
+    completed_tool_names,
+    parse_verified_runtime_outcome,
+)
 
 router = APIRouter(tags=["portfolio-agent"])
 
@@ -137,6 +142,12 @@ async def _stream_cursor(
         f"Allowed capabilities: {', '.join(session['allowed_capabilities']) or 'none'}\n"
         "Stay concise. Do not claim payment settlement or network status that the recorded tool result does not prove.\n"
         "AgentGuard authorization must complete before any protected commerce tool reports success.\n"
+        "For background work, completion is fail-closed: actually execute tools, then use a final read-back tool to verify the requested postcondition.\n"
+        "Your final response must be JSON only with this shape: "
+        '{"status":"completed","summary":"customer-facing result",'
+        '"executed_tools":["exact SDK tool name"],'
+        '"postcondition":{"verified":true,"evidence":"what the final read-back proved"}}.\n'
+        "Only list tools that completed in this run. If execution or verification is unavailable, return a failed status and never invent counts or claim completion.\n"
         f"Caller context JSON: {json.dumps(body.context)[:4000]}"
     )
 
@@ -160,7 +171,21 @@ async def _stream_cursor(
         model = runtime.get("model") or os.getenv("CURSOR_AGENT_MODEL") or "composer-2.5"
         resume_id = session.get("sdk_session_id")
 
-        def _run() -> tuple[str, Optional[str]]:
+        def _verified_result(run: Any) -> dict[str, Any]:
+            messages = list(run.messages())
+            result = run.wait()
+            if result.status == "error":
+                raise RuntimeError(f"Cursor agent run failed (run_id={result.id})")
+            text = (result.result or "").strip()
+            if not text:
+                raise RuntimeError("Cursor agent returned empty content.")
+            outcome = parse_verified_runtime_outcome(
+                text,
+                observed_completed_tools=completed_tool_names(messages),
+            )
+            return outcome.as_dict()
+
+        def _run() -> tuple[dict[str, Any], Optional[str]]:
             options = AgentOptions(
                 api_key=api_key,
                 model=model,
@@ -170,25 +195,13 @@ async def _stream_cursor(
             if resume_id:
                 with Agent.resume(resume_id, options) as agent:
                     run = agent.send(compiled)
-                    result = run.wait()
-                    if result.status == "error":
-                        raise RuntimeError(f"Cursor agent run failed (run_id={result.id})")
-                    text = (result.result or "").strip()
-                    if not text:
-                        raise RuntimeError("Cursor agent returned empty content.")
-                    return text, agent.agent_id
+                    return _verified_result(run), agent.agent_id
             with Agent.create(options) as agent:
                 run = agent.send(compiled)
-                result = run.wait()
-                if result.status == "error":
-                    raise RuntimeError(f"Cursor agent run failed (run_id={result.id})")
-                text = (result.result or "").strip()
-                if not text:
-                    raise RuntimeError("Cursor agent returned empty content.")
-                return text, agent.agent_id
+                return _verified_result(run), agent.agent_id
 
         try:
-            final_text, sdk_id = await asyncio.to_thread(_run)
+            outcome, sdk_id = await asyncio.to_thread(_run)
             session["sdk_session_id"] = sdk_id
             session["messages"].append(
                 {
@@ -200,11 +213,14 @@ async def _stream_cursor(
             session["messages"].append(
                 {
                     "role": "assistant",
-                    "content": final_text,
+                    "content": outcome["summary"],
+                    "outcome": outcome,
                     "timestamp": _now_ms(),
                 }
             )
-            yield f"data: {json.dumps({'type': 'result', 'content': final_text, 'sdk_session_id': sdk_id, 'timestamp': _now_ms()})}\n\n"
+            yield f"data: {json.dumps({'type': 'result', 'content': outcome['summary'], 'outcome': outcome, 'sdk_session_id': sdk_id, 'timestamp': _now_ms()})}\n\n"
+        except RuntimeOutcomeError as exc:
+            yield f"data: {json.dumps({'type': 'error', 'error': str(exc), 'timestamp': _now_ms()})}\n\n"
         except Exception as exc:  # noqa: BLE001 — stream error to client
             yield f"data: {json.dumps({'type': 'error', 'error': str(exc) or 'Cursor agent failed.', 'timestamp': _now_ms()})}\n\n"
 

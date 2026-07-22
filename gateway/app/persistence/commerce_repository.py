@@ -459,6 +459,81 @@ class CommerceRepository:
                 (entry_id, ledger_transaction_id, account, side, amount_paise),
             )
 
+    async def get_refundable_order(
+        self, order_id: UUID, seller_id: str, *, lock: bool = False
+    ) -> dict[str, Any]:
+        suffix = " FOR UPDATE OF orders, payment" if lock else ""
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                f"""
+                SELECT
+                    orders.*, payment.payment_attempt_id, payment.status AS payment_status,
+                    payment.amount_paise AS payment_amount_paise
+                FROM commerce_orders AS orders
+                JOIN commerce_payment_attempts AS payment ON payment.order_id = orders.order_id
+                WHERE orders.order_id = %s AND orders.seller_id = %s{suffix}
+                """,
+                (order_id, seller_id),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise LookupError("refundable order not found")
+        return row
+
+    async def create_or_get_refund(
+        self,
+        *,
+        refund_id: UUID,
+        order_id: UUID,
+        payment_attempt_id: UUID,
+        seller_id: str,
+        principal_id: str,
+        amount_paise: int,
+        idempotency_key: str,
+        correlation_id: str,
+    ) -> tuple[dict[str, Any], bool]:
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO commerce_refunds (
+                    refund_id, order_id, payment_attempt_id, seller_id, principal_id,
+                    amount_paise, status, idempotency_key, correlation_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, 'succeeded', %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING *
+                """,
+                (
+                    refund_id,
+                    order_id,
+                    payment_attempt_id,
+                    seller_id,
+                    principal_id,
+                    amount_paise,
+                    idempotency_key,
+                    correlation_id,
+                ),
+            )
+            refund = await cursor.fetchone()
+            created = refund is not None
+            if refund is None:
+                await cursor.execute(
+                    """
+                    SELECT * FROM commerce_refunds
+                    WHERE seller_id = %s AND idempotency_key = %s
+                    """,
+                    (seller_id, idempotency_key),
+                )
+                refund = await cursor.fetchone()
+        if refund is None:
+            raise ValueError("order already has a refund under another idempotency key")
+        if (
+            refund["order_id"] != order_id
+            or refund["amount_paise"] != amount_paise
+            or refund["correlation_id"] != correlation_id
+        ):
+            raise ValueError("idempotent refund replay changed the bound request")
+        return refund, created
+
     async def _dict_row(
         self,
         table: str,

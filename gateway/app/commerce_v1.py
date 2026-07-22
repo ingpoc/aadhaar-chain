@@ -473,6 +473,63 @@ class CommerceV1:
                 raise CommerceNotFound(str(exc)) from exc
         return _jsonable(quote)
 
+    async def issue_refund(
+        self,
+        *,
+        seller_id: str,
+        order_id: str | UUID,
+        amount_paise: int,
+        idempotency_key: str,
+        correlation_id: str,
+    ) -> dict[str, Any]:
+        """Record one simulated refund and its balanced reversal ledger."""
+        if amount_paise <= 0:
+            raise CommerceValidation("refund amount must be positive")
+        if not idempotency_key or not correlation_id:
+            raise CommerceValidation("refund idempotency and correlation are required")
+        order_uuid = UUID(str(order_id))
+        async with UnitOfWork(self.pool) as unit_of_work:
+            repository = CommerceRepository(unit_of_work)
+            try:
+                order = await repository.get_refundable_order(
+                    order_uuid, seller_id, lock=True
+                )
+                if order["payment_status"] not in {"succeeded", "reconciled"}:
+                    raise CommerceConflict("only a verified paid order can be refunded")
+                if amount_paise > order["payment_amount_paise"]:
+                    raise CommerceConflict("refund exceeds the verified paid amount")
+                refund_namespace = f"commerce-refund:{seller_id}:{idempotency_key}"
+                refund, created = await repository.create_or_get_refund(
+                    refund_id=uuid5(NAMESPACE_URL, refund_namespace),
+                    order_id=order_uuid,
+                    payment_attempt_id=order["payment_attempt_id"],
+                    seller_id=seller_id,
+                    principal_id=order["principal_id"],
+                    amount_paise=amount_paise,
+                    idempotency_key=idempotency_key,
+                    correlation_id=correlation_id,
+                )
+                if created:
+                    transaction_id = uuid5(
+                        NAMESPACE_URL, f"{refund_namespace}:ledger"
+                    )
+                    await repository.post_balanced_ledger(
+                        transaction_id,
+                        order_uuid,
+                        order["payment_attempt_id"],
+                        "refund",
+                        amount_paise,
+                        (
+                            (uuid5(transaction_id, "debit"), "seller_payable", "debit"),
+                            (uuid5(transaction_id, "credit"), "payment_clearing", "credit"),
+                        ),
+                    )
+            except LookupError as exc:
+                raise CommerceNotFound(str(exc)) from exc
+            except ValueError as exc:
+                raise CommerceConflict(str(exc)) from exc
+        return _jsonable({"refund": refund, "order": order})
+
     async def _post_payment(
         self,
         repository: CommerceRepository,

@@ -14,6 +14,8 @@ from app.payment_adapter import payment_adapter
 from config import settings
 
 STATE_FILE = "commerce-demo-state.json"
+DEFAULT_DELIVERY_ESTIMATE = "Delivery timing confirmed at checkout"
+DEFAULT_RETURN_POLICY = "Return eligibility confirmed before order placement"
 
 
 def _utcnow() -> str:
@@ -154,16 +156,33 @@ def cleanup_test_artifacts(
         "Shared local commerce item for AgentGuard two-sided proof.",
         "Local Samantha order-lifecycle fixture",
         "Fresh local Samantha checkout fixture",
+        "Fixture for Hermes Dispatch inject proof",
+        "Hermes inject race fix proof",
+        "Owner proof fixture for Accept→Dispatch",
+        "Owner proof Accept→Dispatch",
+        "Owner proof Accept→Dispatch with delivery",
     }
     if include_discovered:
         item_ids = {
             item_id
             for item_id, item in state.items.items()
             if str(item.get("title") or "").startswith(
-                ("Token Nxt proof SKU ", "Matrix ", "Evening Ragi Flour")
+                (
+                    "Token Nxt proof SKU ",
+                    "Matrix ",
+                    "Evening Ragi Flour",
+                    "Dispatch Proof",
+                    "Hermes Fix",
+                    "Diag",
+                    "AadhaarChain Whole Wheat Atta",
+                    "Catalog Marker",
+                    "Upsert ",
+                    "Refresh ",
+                )
             )
             or str(item.get("description") or "") in fixture_descriptions
             or str(item.get("seller_id") or "").startswith("seller-ag-")
+            or str(item.get("seller_id") or "").startswith("principal:demo:marker-")
         }
     else:
         item_ids = {
@@ -327,13 +346,31 @@ def item_matches_search_query(item: dict[str, Any], query: str) -> bool:
 
 def search_items(query: Optional[str] = None) -> dict[str, Any]:
     state = load_state()
-    # Published + in-stock is enough. seller_name is display sugar — fixture /
-    # AgentGuard seeds often set only seller_id; requiring a name hid real SKUs
-    # from Buyer search and made Samantha look empty or invent cached ghosts.
+    # Buyer results require a customer-safe seller identity. Internal principals
+    # are authorization identifiers, not merchant names, and must not leak into
+    # the offer grid. Domain/provider ids remain valid display fallbacks.
+    def customer_visible_seller(item: dict[str, Any]) -> bool:
+        seller_name = str(item.get("seller_name") or "").strip()
+        if seller_name and not seller_name.startswith("principal:"):
+            return True
+        seller_id = str(item.get("seller_id") or "").strip()
+        return bool(
+            seller_id
+            and not seller_id.startswith("principal:")
+            and seller_id not in {"seller", "local-seller"}
+        )
+
     rows = [
-        {**item, "inventory": state.inventory.get(item_id, 0)}
+        {
+            **item,
+            "delivery_estimate": item.get("delivery_estimate") or DEFAULT_DELIVERY_ESTIMATE,
+            "return_policy": item.get("return_policy") or DEFAULT_RETURN_POLICY,
+            "inventory": state.inventory.get(item_id, 0),
+        }
         for item_id, item in state.items.items()
-        if item.get("status") == "published" and state.inventory.get(item_id, 0) > 0
+        if item.get("status") == "published"
+        and state.inventory.get(item_id, 0) > 0
+        and customer_visible_seller(item)
     ]
     if query and str(query).strip():
         rows = [item for item in rows if item_matches_search_query(item, str(query))]

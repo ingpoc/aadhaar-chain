@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from config import settings
 from main import app
 from app import agentguard_routes
+from app.session_auth import SESSION_COOKIE_NAME, create_principal_session_token
 from app.commerce_demo import (
     archive_item_from_payload,
     create_item,
@@ -78,8 +79,16 @@ def test_fixture_mutations_are_hidden_outside_demo_runtime(
     assert load_state().items == {}
 
 
-def _signed_in_client(audience: str) -> tuple[TestClient, str]:
+def _signed_in_client(audience: str, principal_id: str | None = None) -> tuple[TestClient, str]:
     client = TestClient(app)
+    if principal_id:
+        token = create_principal_session_token(
+            principal_id=principal_id,
+            audience=audience,
+            identity_provider="auth0",
+        )
+        client.cookies.set(SESSION_COOKIE_NAME, token)
+        return client, principal_id
     login = client.post("/api/auth/demo-continue", json={"audience": audience})
     assert login.status_code == 200
     return client, str(login.json()["data"]["principal_id"])
@@ -87,9 +96,9 @@ def _signed_in_client(audience: str) -> tuple[TestClient, str]:
 
 def test_commerce_reads_are_session_scoped_by_audience_and_principal() -> None:
     seller, seller_id = _signed_in_client("ondcseller")
-    other_seller, _ = _signed_in_client("ondcseller")
+    other_seller, _ = _signed_in_client("ondcseller", "principal:auth0:other-seller")
     buyer, buyer_id = _signed_in_client("ondcbuyer")
-    other_buyer, _ = _signed_in_client("ondcbuyer")
+    other_buyer, _ = _signed_in_client("ondcbuyer", "principal:auth0:other-buyer")
     fixtures = TestClient(app)
 
     item = fixtures.post(
@@ -228,7 +237,7 @@ def test_publish_search_order_and_idempotency() -> None:
     assert buyer_issues.json()["data"]["issues"][0]["issue_id"] == issue.json()["data"]["issue"]["issue_id"]
 
 
-def test_buyer_search_includes_published_offer_without_seller_display_name() -> None:
+def test_buyer_search_excludes_offer_without_customer_safe_seller_name() -> None:
     created = create_item(
         {
             "title": "Unattributed Atta",
@@ -240,8 +249,24 @@ def test_buyer_search_includes_published_offer_without_seller_display_name() -> 
     publish_item(created["item"]["item_id"])
 
     found = search_items("atta")
-    assert found["count"] >= 1
-    assert any(row.get("title") == "Unattributed Atta" for row in found["items"])
+    assert all(row.get("title") != "Unattributed Atta" for row in found["items"])
+
+
+def test_buyer_search_supplies_safe_fallback_commerce_terms() -> None:
+    created = create_item(
+        {
+            "title": "Sampoorna Atta 1kg",
+            "description": "Stone-ground flour",
+            "price_inr": 90,
+            "inventory": 2,
+            "seller_id": "ondcseller.example",
+        }
+    )
+    publish_item(created["item"]["item_id"])
+
+    row = next(item for item in search_items("atta")["items"] if item["title"] == "Sampoorna Atta 1kg")
+    assert row["delivery_estimate"] == "Delivery timing confirmed at checkout"
+    assert row["return_policy"] == "Return eligibility confirmed before order placement"
 
 
 def test_buyer_search_rice_does_not_match_poha_description() -> None:
@@ -537,6 +562,35 @@ def test_cleanup_exact_order_restores_real_item_inventory() -> None:
     assert cleanup.json()["data"]["restored_inventory"] == 2
     assert load_state().inventory[item["item_id"]] == 3
     assert order["order_id"] not in load_state().orders
+
+
+def test_cleanup_discovers_dispatch_proof_catalog_litter() -> None:
+    client = TestClient(app)
+    fixture = client.post(
+        "/api/demo-commerce/test-fixtures/seller/items",
+        json={
+            "title": "Dispatch Proof Atta 1kg",
+            "description": "Fixture for Hermes Dispatch inject proof",
+            "price_inr": 100,
+            "inventory": 2,
+        },
+    ).json()["data"]["item"]
+    real = client.post(
+        "/api/demo-commerce/test-fixtures/seller/items",
+        json={
+            "title": "Farmhouse Atta 1kg",
+            "description": "Stone-ground whole wheat flour",
+            "price_inr": 120,
+            "inventory": 2,
+        },
+    ).json()["data"]["item"]
+
+    cleanup = client.post("/api/demo-commerce/test-fixtures/cleanup")
+
+    assert cleanup.status_code == 200
+    ids = set(load_state().items)
+    assert fixture["item_id"] not in ids
+    assert real["item_id"] in ids
 
 
 def test_cleanup_exact_item_does_not_remove_another_fixture() -> None:

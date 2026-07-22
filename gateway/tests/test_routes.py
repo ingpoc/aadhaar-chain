@@ -6,7 +6,12 @@ from solders.keypair import Keypair
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from config import get_runtime_mode, settings, validate_runtime_storage_config
+from config import (
+    get_cf1_persistence_backend,
+    get_runtime_mode,
+    settings,
+    validate_runtime_storage_config,
+)
 from main import app
 from cryptography.fernet import Fernet
 from app.models import (
@@ -269,6 +274,18 @@ def test_production_runtime_rejects_local_file_trust_store() -> None:
     finally:
         settings.aadhaar_chain_env = original_env
         settings.trust_store_backend = original_backend
+        settings.database_url = original_database_url
+
+
+def test_cf1_persistence_selection_uses_loaded_settings() -> None:
+    original_database_url = settings.database_url
+    try:
+        settings.database_url = None
+        assert get_cf1_persistence_backend() == "local_file"
+
+        settings.database_url = "postgresql://example/agentguard"
+        assert get_cf1_persistence_backend() == "postgres"
+    finally:
         settings.database_url = original_database_url
 
 

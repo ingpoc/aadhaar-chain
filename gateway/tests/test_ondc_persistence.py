@@ -5,14 +5,19 @@ import os
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import psycopg
 import pytest
 import pytest_asyncio
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
+from app.ondc_routes import router as ondc_router
+from app.ondc_bpp import router as ondc_bpp_router
 from app.persistence import ConnectionPool, MigrationRunner, UnitOfWork
 from app.persistence.ondc_repository import (
     CorrelationMismatch,
@@ -275,6 +280,7 @@ async def test_inbox_survives_pool_restart(postgres_url: str) -> None:
             )
         assert loaded is not None
         assert loaded["event_commitment"] == persisted["event_commitment"]
+        assert loaded["envelope"] == {"context": {"message_id": "message-1"}}
         assert loaded["redacted_payload"] == {"status": "ACK", "item_count": 2}
     finally:
         await second_pool.close()
@@ -323,5 +329,352 @@ async def test_outbox_delivery_is_idempotent_across_restart(
             )
         assert created is False
         assert existing["state"] == "delivered"
+        assert existing["envelope"] == {"context": {"message_id": "message-1"}}
     finally:
         await restarted.close()
+
+
+async def test_live_callback_persists_before_ack_and_deduplicates(
+    postgres_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pool = await _pool(postgres_url)
+    api = FastAPI()
+    api.state.persistence_pool = pool
+    api.include_router(ondc_router)
+    payload = {
+        "context": {
+            "transaction_id": "transaction-live-1",
+            "message_id": "message-live-1",
+            "bpp_id": "seller.example",
+        },
+        "message": {"catalog": {"descriptor": {"name": "Seller"}}},
+    }
+
+    def reject_file_fork(_entry: dict[str, object]) -> None:
+        raise AssertionError("PostgreSQL-selected callback wrote file state")
+
+    monkeypatch.setattr("app.ondc_routes.ondc_store.append_inbox", reject_file_fork)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api), base_url="http://test"
+        ) as client:
+            first = await client.post("/ondc/on_search", json=payload)
+            replay = await client.post("/ondc/on_search", json=payload)
+            mutated = await client.post(
+                "/ondc/on_search",
+                json={**payload, "message": {"catalog": {"id": "changed"}}},
+            )
+
+        assert first.status_code == replay.status_code == 200
+        assert first.json()["message"]["ack"]["status"] == "ACK"
+        assert replay.json()["message"]["ack"]["status"] == "ACK"
+        assert mutated.status_code == 409
+        assert mutated.json()["message"]["ack"]["status"] == "NACK"
+
+        async with pool.connection() as connection:
+            result = await connection.execute(
+                """
+                SELECT COUNT(*), MIN(state), MIN(correlation_id)
+                FROM ondc_inbox
+                WHERE transaction_id = %s AND message_id = %s
+                """,
+                ("transaction-live-1", "message-live-1"),
+            )
+            count, state, correlation_id = await result.fetchone()
+        assert count == 1
+        assert state == "pending"
+        assert correlation_id == "transaction-live-1"
+    finally:
+        await pool.close()
+
+
+async def test_live_callback_nacks_before_persistence_on_invalid_correlation(
+    postgres_url: str,
+) -> None:
+    pool = await _pool(postgres_url)
+    api = FastAPI()
+    api.state.persistence_pool = pool
+    api.include_router(ondc_router)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/ondc/on_search",
+                json={
+                    "context": {
+                        "message_id": "message-without-transaction",
+                        "bpp_id": "seller.example",
+                    }
+                },
+            )
+
+        assert response.status_code == 400
+        assert response.json()["message"]["ack"]["status"] == "NACK"
+        async with pool.connection() as connection:
+            result = await connection.execute("SELECT COUNT(*) FROM ondc_inbox")
+            assert (await result.fetchone())[0] == 0
+    finally:
+        await pool.close()
+
+
+async def test_live_confirm_uses_durable_outbox_and_one_effect_replay(
+    postgres_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pool = await _pool(postgres_url)
+    api = FastAPI()
+    api.state.persistence_pool = pool
+    api.include_router(ondc_router)
+    signed_post = AsyncMock(
+        return_value=(200, {"message": {"ack": {"status": "ACK"}}}, {})
+    )
+    monkeypatch.setattr("app.ondc_routes._ondc_configured", lambda: True)
+    monkeypatch.setattr("app.ondc_routes._signed_post", signed_post)
+
+    def reject_file_fork(_entry: dict[str, object]) -> None:
+        raise AssertionError("PostgreSQL-selected outbox wrote file state")
+
+    monkeypatch.setattr("app.ondc_routes.ondc_store.append_outbox", reject_file_fork)
+    body = {
+        "transaction_id": "transaction-confirm-1",
+        "message_id": "message-confirm-1",
+        "bpp_id": "seller.example",
+        "bpp_uri": "https://seller.example/ondc",
+        "order": {"id": "order-1"},
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api), base_url="http://test"
+        ) as client:
+            first = await client.post("/api/ondc/confirm", json=body)
+            replay = await client.post("/api/ondc/confirm", json=body)
+
+        assert first.status_code == replay.status_code == 200
+        assert first.json()["data"]["dispatched"] is True
+        assert replay.json()["data"]["dispatched"] is False
+        assert replay.json()["data"]["deduplicated"] is True
+        assert first.json()["data"]["outbox_id"] == replay.json()["data"]["outbox_id"]
+        assert signed_post.await_count == 1
+
+        async with pool.connection() as connection:
+            result = await connection.execute(
+                """
+                SELECT state, retry_count, envelope
+                FROM ondc_outbox
+                WHERE transaction_id = %s AND message_id = %s
+                """,
+                ("transaction-confirm-1", "message-confirm-1"),
+            )
+            state, retry_count, envelope = await result.fetchone()
+        assert state == "delivered"
+        assert retry_count == 0
+        assert envelope["message"]["order"] == {"id": "order-1"}
+    finally:
+        await pool.close()
+
+
+async def test_live_confirm_failure_remains_retryable(
+    postgres_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pool = await _pool(postgres_url)
+    api = FastAPI()
+    api.state.persistence_pool = pool
+    api.include_router(ondc_router)
+    monkeypatch.setattr("app.ondc_routes._ondc_configured", lambda: True)
+    monkeypatch.setattr(
+        "app.ondc_routes._signed_post",
+        AsyncMock(side_effect=RuntimeError("network unavailable")),
+    )
+    body = {
+        "transaction_id": "transaction-confirm-retry",
+        "message_id": "message-confirm-retry",
+        "bpp_id": "seller.example",
+        "bpp_uri": "https://seller.example/ondc",
+        "order": {"id": "order-retry"},
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api), base_url="http://test"
+        ) as client:
+            response = await client.post("/api/ondc/confirm", json=body)
+
+        assert response.status_code == 502
+        async with pool.connection() as connection:
+            result = await connection.execute(
+                """
+                SELECT state, retry_count, last_error, envelope
+                FROM ondc_outbox
+                WHERE transaction_id = %s AND message_id = %s
+                """,
+                ("transaction-confirm-retry", "message-confirm-retry"),
+            )
+            state, retry_count, last_error, envelope = await result.fetchone()
+        assert state == "pending"
+        assert retry_count == 1
+        assert last_error == "network unavailable"
+        assert envelope["message"]["order"] == {"id": "order-retry"}
+    finally:
+        await pool.close()
+
+
+async def test_dead_letter_requires_commitment_and_requeues_durably(
+    postgres_url: str,
+) -> None:
+    pool = await _pool(postgres_url)
+    api = FastAPI()
+    api.state.persistence_pool = pool
+    api.include_router(ondc_router)
+    try:
+        _, persisted = await persist_callback_before_ack(pool, **_callback())
+        async with UnitOfWork(pool) as unit_of_work:
+            repository = ONDCRepository(unit_of_work)
+            claimed = (
+                await repository.claim_inbox(worker_id="dead-letter-test")
+            )[0]
+            dead = await repository.schedule_retry(
+                "inbox",
+                claimed["inbox_id"],
+                claimed["lease_token"],
+                error="permanent",
+                max_attempts=1,
+            )
+        async with AsyncClient(
+            transport=ASGITransport(app=api), base_url="http://test"
+        ) as client:
+            mismatch = await client.post(
+                f"/api/ondc/inbox/dead-letter/{dead['inbox_id']}/requeue",
+                headers={
+                    "Idempotency-Key": "recover-dead-letter",
+                    "X-Correlation-ID": "dead-letter-test",
+                },
+                json={"event_commitment": "0" * 64},
+            )
+            recovered = await client.post(
+                f"/api/ondc/inbox/dead-letter/{dead['inbox_id']}/requeue",
+                headers={
+                    "Idempotency-Key": "recover-dead-letter",
+                    "X-Correlation-ID": "dead-letter-test",
+                },
+                json={"event_commitment": persisted["event_commitment"]},
+            )
+            replay = await client.post(
+                f"/api/ondc/inbox/dead-letter/{dead['inbox_id']}/requeue",
+                headers={
+                    "Idempotency-Key": "recover-dead-letter",
+                    "X-Correlation-ID": "dead-letter-test",
+                },
+                json={"event_commitment": persisted["event_commitment"]},
+            )
+        assert mismatch.status_code == 409
+        assert recovered.status_code == replay.status_code == 200
+        assert recovered.json()["data"]["state"] == "pending"
+        assert replay.json()["data"]["state"] == "pending"
+        assert recovered.json()["data"]["retry_count"] == 1
+    finally:
+        await pool.close()
+
+
+async def test_postgres_diagnostics_and_recovery_drain_never_read_files(
+    postgres_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pool = await _pool(postgres_url)
+    api = FastAPI()
+    api.state.persistence_pool = pool
+    api.include_router(ondc_router)
+    outbox = {
+        "subscriber_id": "buyer.example",
+        "transaction_id": "transaction-drain",
+        "message_id": "message-drain",
+        "action": "confirm",
+        "destination": "https://seller.example/confirm",
+        "correlation_id": "transaction-drain",
+        "raw_envelope": {
+            "context": {
+                "transaction_id": "transaction-drain",
+                "message_id": "message-drain",
+            },
+            "message": {"order": {"id": "order-drain"}},
+        },
+        "redacted_payload": {"status": "queued"},
+    }
+    async with UnitOfWork(pool) as unit_of_work:
+        await ONDCRepository(unit_of_work).enqueue_outbox(**outbox)
+
+    def reject_file_read(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("PostgreSQL diagnostics consulted file state")
+
+    monkeypatch.setattr("app.ondc_routes.ondc_store.list_outbox", reject_file_read)
+    monkeypatch.setattr("app.ondc_routes.ondc_store.list_inbox", reject_file_read)
+    monkeypatch.setattr(
+        "app.ondc_routes._signed_post",
+        AsyncMock(return_value=(200, {"message": {"ack": {"status": "ACK"}}}, "")),
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api), base_url="http://test"
+        ) as client:
+            diagnostics = await client.get(
+                "/api/ondc/outbox", params={"transaction_id": "transaction-drain"}
+            )
+            orders = await client.get(
+                "/api/ondc/orders", params={"transaction_id": "transaction-drain"}
+            )
+            drained = await client.post(
+                "/api/ondc/outbox/drain",
+                headers={
+                    "Idempotency-Key": "restart-drain",
+                    "X-Correlation-ID": "restart-test",
+                },
+                json={"worker_id": "restart-worker", "limit": 10},
+            )
+        assert diagnostics.status_code == orders.status_code == drained.status_code == 200
+        assert diagnostics.json()["data"]["items"][0]["state"] == "pending"
+        assert orders.json()["data"]["items"][0]["order"]["id"] == "order-drain"
+        assert drained.json()["data"]["claimed"] == 1
+        assert drained.json()["data"]["items"][0]["state"] == "delivered"
+    finally:
+        await pool.close()
+
+
+async def test_bpp_command_persists_before_ack_and_replay_has_one_effect(
+    postgres_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pool = await _pool(postgres_url)
+    api = FastAPI()
+    api.state.persistence_pool = pool
+    api.include_router(ondc_bpp_router)
+    callback = AsyncMock()
+    monkeypatch.setattr("app.ondc_bpp.settings.ondc_enabled", True)
+    monkeypatch.setattr("app.ondc_bpp._post_on_action", callback)
+    payload = {
+        "context": {
+            "bap_id": "buyer.example",
+            "bap_uri": "https://buyer.example/ondc",
+            "transaction_id": "bpp-transaction",
+            "message_id": "bpp-message",
+        },
+        "message": {"order": {"items": [{"id": "sku-1"}]}},
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api), base_url="http://test"
+        ) as client:
+            first = await client.post("/ondc/select", json=payload)
+            replay = await client.post("/ondc/select", json=payload)
+            mutated = await client.post(
+                "/ondc/select",
+                json={**payload, "message": {"order": {"items": [{"id": "sku-2"}]}}},
+            )
+        assert first.status_code == replay.status_code == 200
+        assert mutated.status_code == 409
+        callback.assert_awaited_once()
+        async with pool.connection() as connection:
+            result = await connection.execute(
+                """
+                SELECT COUNT(*), MIN(action) FROM ondc_inbox
+                WHERE transaction_id = 'bpp-transaction'
+                """
+            )
+            assert await result.fetchone() == (1, "select")
+    finally:
+        await pool.close()

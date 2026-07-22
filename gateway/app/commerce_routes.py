@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app import commerce_demo
+from app.commerce_compat import CommerceCompatibilityAdapter
 from app.models import ApiResponse
 from app.session_auth import SESSION_COOKIE_NAME, parse_session_token
 from config import get_runtime_mode
@@ -29,7 +30,22 @@ def _session_principal(request: Request, audience: str) -> str:
     return str(session["principal_id"])
 
 
-def _owned_order(order_id: str, principal_id: str, owner_field: str) -> dict[str, Any]:
+def _compat(request: Request) -> CommerceCompatibilityAdapter | None:
+    pool = getattr(request.app.state, "persistence_pool", None)
+    return CommerceCompatibilityAdapter(pool) if pool is not None else None
+
+
+async def _owned_order(
+    request: Request, order_id: str, principal_id: str, owner_field: str
+) -> dict[str, Any]:
+    compat = _compat(request)
+    if compat is not None:
+        filters = (
+            {"principal_id": principal_id}
+            if owner_field == "buyer_id"
+            else {"seller_id": principal_id}
+        )
+        return {"order": await compat.get_order(order_id, **filters)}
     try:
         result = commerce_demo.get_order(order_id)
     except Exception as exc:
@@ -40,7 +56,13 @@ def _owned_order(order_id: str, principal_id: str, owner_field: str) -> dict[str
     return result
 
 
-def _owned_item(item_id: str, principal_id: str) -> dict[str, Any]:
+async def _owned_item(
+    request: Request, item_id: str, principal_id: str
+) -> dict[str, Any]:
+    compat = _compat(request)
+    if compat is not None:
+        item = await compat.get_item(item_id, seller_id=principal_id)
+        return {"item": item, "inventory": item["inventory"]}
     try:
         result = commerce_demo.get_item(item_id)
     except Exception as exc:
@@ -112,7 +134,9 @@ def _handle_error(exc: Exception) -> None:
 
 
 @fixture_router.post("/cleanup", response_model=ApiResponse)
-async def cleanup_test_fixtures(body: CommerceBody = CommerceBody()) -> ApiResponse:
+async def cleanup_test_fixtures(
+    request: Request, body: CommerceBody = CommerceBody()
+) -> ApiResponse:
     requested = body.data.get("order_ids") or []
     explicit_order_ids = {
         str(order_id) for order_id in requested if isinstance(order_id, str) and order_id.strip()
@@ -121,23 +145,36 @@ async def cleanup_test_fixtures(body: CommerceBody = CommerceBody()) -> ApiRespo
     explicit_item_ids = {
         str(item_id) for item_id in requested_items if isinstance(item_id, str) and item_id.strip()
     }
-    result = commerce_demo.cleanup_test_artifacts(
-        explicit_order_ids=explicit_order_ids,
-        explicit_item_ids=explicit_item_ids,
-        include_discovered=not (explicit_order_ids or explicit_item_ids),
-    )
+    compat = _compat(request)
+    if compat is not None:
+        result = await compat.cleanup(
+            order_ids=explicit_order_ids, item_ids=explicit_item_ids
+        )
+    else:
+        result = commerce_demo.cleanup_test_artifacts(
+            explicit_order_ids=explicit_order_ids,
+            explicit_item_ids=explicit_item_ids,
+            include_discovered=not (explicit_order_ids or explicit_item_ids),
+        )
     return ApiResponse(success=True, message="Test fixtures removed", data=result)
 
 
 @fixture_router.post("/seller/items", response_model=ApiResponse)
 async def create_seller_item(
+    request: Request,
     body: ItemBody,
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> ApiResponse:
     try:
-        result = commerce_demo.create_item(
-            body.model_dump(exclude_none=True),
-            idempotency_key=_idem(body.idempotency_key, idempotency_key),
+        payload = body.model_dump(exclude_none=True)
+        compat = _compat(request)
+        result = (
+            await compat.create_item(payload)
+            if compat is not None
+            else commerce_demo.create_item(
+                payload,
+                idempotency_key=_idem(body.idempotency_key, idempotency_key),
+            )
         )
     except Exception as exc:
         _handle_error(exc)
@@ -145,9 +182,16 @@ async def create_seller_item(
 
 
 @fixture_router.patch("/seller/items/{item_id}", response_model=ApiResponse)
-async def update_seller_item(item_id: str, body: dict[str, Any]) -> ApiResponse:
+async def update_seller_item(
+    item_id: str, request: Request, body: dict[str, Any]
+) -> ApiResponse:
     try:
-        result = commerce_demo.update_item(item_id, body)
+        compat = _compat(request)
+        result = (
+            await compat.update_item(item_id, body)
+            if compat is not None
+            else commerce_demo.update_item(item_id, body)
+        )
     except Exception as exc:
         _handle_error(exc)
     return ApiResponse(success=True, message="Item updated", data=result)
@@ -156,13 +200,19 @@ async def update_seller_item(item_id: str, body: dict[str, Any]) -> ApiResponse:
 @fixture_router.post("/seller/items/{item_id}/publish", response_model=ApiResponse)
 async def publish_seller_item(
     item_id: str,
+    request: Request,
     body: CommerceBody = CommerceBody(),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> ApiResponse:
     try:
-        result = commerce_demo.publish_item(
-            item_id,
-            idempotency_key=_idem(body.idempotency_key, idempotency_key),
+        compat = _compat(request)
+        result = (
+            await compat.publish_item(item_id)
+            if compat is not None
+            else commerce_demo.publish_item(
+                item_id,
+                idempotency_key=_idem(body.idempotency_key, idempotency_key),
+            )
         )
     except Exception as exc:
         _handle_error(exc)
@@ -170,14 +220,25 @@ async def publish_seller_item(
 
 
 @router.get("/buyer/search", response_model=ApiResponse)
-async def search_items(q: Optional[str] = None) -> ApiResponse:
-    return ApiResponse(success=True, message="Items", data=commerce_demo.search_items(q))
+async def search_items(request: Request, q: Optional[str] = None) -> ApiResponse:
+    compat = _compat(request)
+    data = (
+        await compat.list_items(query=q, published_only=True)
+        if compat is not None
+        else commerce_demo.search_items(q)
+    )
+    return ApiResponse(success=True, message="Items", data=data)
 
 
 @router.get("/buyer/items/{item_id}", response_model=ApiResponse)
-async def get_item(item_id: str) -> ApiResponse:
+async def get_item(item_id: str, request: Request) -> ApiResponse:
     try:
-        result = commerce_demo.get_item(item_id)
+        compat = _compat(request)
+        if compat is not None:
+            item = await compat.get_item(item_id)
+            result = {"item": item, "inventory": item["inventory"]}
+        else:
+            result = commerce_demo.get_item(item_id)
     except Exception as exc:
         _handle_error(exc)
     return ApiResponse(success=True, message="Item", data=result)
@@ -186,24 +247,39 @@ async def get_item(item_id: str) -> ApiResponse:
 @router.get("/seller/items", response_model=ApiResponse)
 async def list_seller_items(request: Request) -> ApiResponse:
     principal_id = _session_principal(request, "ondcseller")
-    return ApiResponse(success=True, message="Items", data=commerce_demo.list_seller_items(principal_id))
+    compat = _compat(request)
+    data = (
+        await compat.list_items(seller_id=principal_id)
+        if compat is not None
+        else commerce_demo.list_seller_items(principal_id)
+    )
+    return ApiResponse(success=True, message="Items", data=data)
 
 
 @router.get("/seller/items/{item_id}", response_model=ApiResponse)
 async def get_seller_item(item_id: str, request: Request) -> ApiResponse:
     principal_id = _session_principal(request, "ondcseller")
-    return ApiResponse(success=True, message="Item", data=_owned_item(item_id, principal_id))
+    return ApiResponse(
+        success=True,
+        message="Item",
+        data=await _owned_item(request, item_id, principal_id),
+    )
 
 
 @fixture_router.post("/buyer/orders", response_model=ApiResponse)
 async def create_buyer_order(
+    request: Request,
     body: OrderBody,
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> ApiResponse:
     try:
-        result = commerce_demo.create_order(
-            body.model_dump(exclude_none=True),
-            idempotency_key=_idem(body.idempotency_key, idempotency_key),
+        payload = body.model_dump(exclude_none=True)
+        effective_key = _idem(body.idempotency_key, idempotency_key)
+        compat = _compat(request)
+        result = (
+            await compat.create_order(payload, idempotency_key=effective_key)
+            if compat is not None
+            else commerce_demo.create_order(payload, idempotency_key=effective_key)
         )
     except Exception as exc:
         _handle_error(exc)
@@ -213,40 +289,58 @@ async def create_buyer_order(
 @router.get("/buyer/orders", response_model=ApiResponse)
 async def list_buyer_orders(request: Request) -> ApiResponse:
     principal_id = _session_principal(request, "ondcbuyer")
-    return ApiResponse(success=True, message="Orders", data=commerce_demo.list_buyer_orders(principal_id))
+    compat = _compat(request)
+    data = (
+        await compat.list_orders(principal_id=principal_id)
+        if compat is not None
+        else commerce_demo.list_buyer_orders(principal_id)
+    )
+    return ApiResponse(success=True, message="Orders", data=data)
 
 
 @router.get("/buyer/orders/{order_id}", response_model=ApiResponse)
 async def get_buyer_order(order_id: str, request: Request) -> ApiResponse:
     principal_id = _session_principal(request, "ondcbuyer")
-    result = _owned_order(order_id, principal_id, "buyer_id")
+    result = await _owned_order(request, order_id, principal_id, "buyer_id")
     return ApiResponse(success=True, message="Order", data=result)
 
 
 @router.get("/seller/orders", response_model=ApiResponse)
 async def list_seller_orders(request: Request) -> ApiResponse:
     principal_id = _session_principal(request, "ondcseller")
-    return ApiResponse(success=True, message="Orders", data=commerce_demo.list_seller_orders(principal_id))
+    compat = _compat(request)
+    data = (
+        await compat.list_orders(seller_id=principal_id)
+        if compat is not None
+        else commerce_demo.list_seller_orders(principal_id)
+    )
+    return ApiResponse(success=True, message="Orders", data=data)
 
 
 @router.get("/seller/orders/{order_id}", response_model=ApiResponse)
 async def get_seller_order(order_id: str, request: Request) -> ApiResponse:
     principal_id = _session_principal(request, "ondcseller")
-    result = _owned_order(order_id, principal_id, "seller_id")
+    result = await _owned_order(request, order_id, principal_id, "seller_id")
     return ApiResponse(success=True, message="Order", data=result)
 
 
 @fixture_router.post("/seller/orders/{order_id}/transition", response_model=ApiResponse)
 async def transition_order(
     order_id: str,
+    request: Request,
     body: TransitionBody,
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> ApiResponse:
     try:
-        result = commerce_demo.transition_order(
-            order_id,
-            body.status,
-            idempotency_key=_idem(body.idempotency_key, idempotency_key),
+        compat = _compat(request)
+        result = (
+            await compat.transition_order(order_id, body.status)
+            if compat is not None
+            else commerce_demo.transition_order(
+                order_id,
+                body.status,
+                idempotency_key=_idem(body.idempotency_key, idempotency_key),
+            )
         )
     except Exception as exc:
         _handle_error(exc)
@@ -256,14 +350,21 @@ async def transition_order(
 @fixture_router.post("/buyer/orders/{order_id}/issues", response_model=ApiResponse)
 async def create_issue(
     order_id: str,
+    request: Request,
     body: IssueBody,
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> ApiResponse:
     try:
-        result = commerce_demo.create_issue(
-            order_id,
-            body.model_dump(exclude_none=True),
-            idempotency_key=_idem(body.idempotency_key, idempotency_key),
+        payload = body.model_dump(exclude_none=True)
+        compat = _compat(request)
+        result = (
+            await compat.create_issue(order_id, payload)
+            if compat is not None
+            else commerce_demo.create_issue(
+                order_id,
+                payload,
+                idempotency_key=_idem(body.idempotency_key, idempotency_key),
+            )
         )
     except Exception as exc:
         _handle_error(exc)
@@ -273,8 +374,16 @@ async def create_issue(
 @router.get("/buyer/issues", response_model=ApiResponse)
 async def list_buyer_issues(request: Request, order_id: Optional[str] = None) -> ApiResponse:
     principal_id = _session_principal(request, "ondcbuyer")
+    compat = _compat(request)
+    if compat is not None:
+        if order_id:
+            await _owned_order(request, order_id, principal_id, "buyer_id")
+        data = await compat.list_issues(
+            principal_id=principal_id, order_id=order_id
+        )
+        return ApiResponse(success=True, message="Issues", data=data)
     if order_id:
-        _owned_order(order_id, principal_id, "buyer_id")
+        await _owned_order(request, order_id, principal_id, "buyer_id")
     rows = commerce_demo.list_buyer_issues(order_id)["issues"]
     if not order_id:
         rows = [
@@ -288,6 +397,13 @@ async def list_buyer_issues(request: Request, order_id: Optional[str] = None) ->
 @router.get("/seller/issues", response_model=ApiResponse)
 async def list_seller_issues(request: Request) -> ApiResponse:
     principal_id = _session_principal(request, "ondcseller")
+    compat = _compat(request)
+    if compat is not None:
+        return ApiResponse(
+            success=True,
+            message="Issues",
+            data=await compat.list_issues(seller_id=principal_id),
+        )
     rows = [
         issue
         for issue in commerce_demo.list_seller_issues()["issues"]
@@ -297,9 +413,16 @@ async def list_seller_issues(request: Request) -> ApiResponse:
 
 
 @fixture_router.post("/seller/issues/{issue_id}/respond", response_model=ApiResponse)
-async def respond_issue(issue_id: str, body: dict[str, Any]) -> ApiResponse:
+async def respond_issue(
+    issue_id: str, request: Request, body: dict[str, Any]
+) -> ApiResponse:
     try:
-        result = commerce_demo.respond_issue(issue_id, body)
+        compat = _compat(request)
+        result = (
+            await compat.respond_issue(issue_id, body)
+            if compat is not None
+            else commerce_demo.respond_issue(issue_id, body)
+        )
     except Exception as exc:
         _handle_error(exc)
     return ApiResponse(success=True, message="Issue responded", data=result)
@@ -308,15 +431,21 @@ async def respond_issue(issue_id: str, body: dict[str, Any]) -> ApiResponse:
 @fixture_router.post("/seller/issues/{issue_id}/remedy", response_model=ApiResponse)
 async def remedy_issue(
     issue_id: str,
+    request: Request,
     body: CommerceBody,
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> ApiResponse:
     payload = {**body.data, "issue_id": issue_id}
     try:
-        result = commerce_demo.propose_remedy(
-            issue_id,
-            payload,
-            idempotency_key=_idem(body.idempotency_key, idempotency_key),
+        compat = _compat(request)
+        result = (
+            await compat.remedy_issue(issue_id, payload)
+            if compat is not None
+            else commerce_demo.propose_remedy(
+                issue_id,
+                payload,
+                idempotency_key=_idem(body.idempotency_key, idempotency_key),
+            )
         )
     except Exception as exc:
         _handle_error(exc)
@@ -324,32 +453,67 @@ async def remedy_issue(
 
 
 @fixture_router.get("/buyer/orders", response_model=ApiResponse)
-async def list_fixture_buyer_orders(buyer_id: Optional[str] = None) -> ApiResponse:
-    return ApiResponse(success=True, message="Orders", data=commerce_demo.list_buyer_orders(buyer_id))
+async def list_fixture_buyer_orders(
+    request: Request, buyer_id: Optional[str] = None
+) -> ApiResponse:
+    compat = _compat(request)
+    data = (
+        await compat.list_orders(principal_id=buyer_id)
+        if compat is not None
+        else commerce_demo.list_buyer_orders(buyer_id)
+    )
+    return ApiResponse(success=True, message="Orders", data=data)
 
 
 @fixture_router.get("/buyer/orders/{order_id}", response_model=ApiResponse)
-async def get_fixture_buyer_order(order_id: str) -> ApiResponse:
+async def get_fixture_buyer_order(order_id: str, request: Request) -> ApiResponse:
     try:
-        result = commerce_demo.get_order(order_id)
+        compat = _compat(request)
+        result = (
+            {"order": await compat.get_order(order_id)}
+            if compat is not None
+            else commerce_demo.get_order(order_id)
+        )
     except Exception as exc:
         _handle_error(exc)
     return ApiResponse(success=True, message="Order", data=result)
 
 
 @fixture_router.get("/seller/orders", response_model=ApiResponse)
-async def list_fixture_seller_orders(seller_id: Optional[str] = None) -> ApiResponse:
-    return ApiResponse(success=True, message="Orders", data=commerce_demo.list_seller_orders(seller_id))
+async def list_fixture_seller_orders(
+    request: Request, seller_id: Optional[str] = None
+) -> ApiResponse:
+    compat = _compat(request)
+    data = (
+        await compat.list_orders(seller_id=seller_id)
+        if compat is not None
+        else commerce_demo.list_seller_orders(seller_id)
+    )
+    return ApiResponse(success=True, message="Orders", data=data)
 
 
 @fixture_router.get("/buyer/issues", response_model=ApiResponse)
-async def list_fixture_buyer_issues(order_id: Optional[str] = None) -> ApiResponse:
-    return ApiResponse(success=True, message="Issues", data=commerce_demo.list_buyer_issues(order_id))
+async def list_fixture_buyer_issues(
+    request: Request, order_id: Optional[str] = None
+) -> ApiResponse:
+    compat = _compat(request)
+    data = (
+        await compat.list_issues(order_id=order_id)
+        if compat is not None
+        else commerce_demo.list_buyer_issues(order_id)
+    )
+    return ApiResponse(success=True, message="Issues", data=data)
 
 
 @fixture_router.get("/seller/issues", response_model=ApiResponse)
-async def list_fixture_seller_issues() -> ApiResponse:
-    return ApiResponse(success=True, message="Issues", data=commerce_demo.list_seller_issues())
+async def list_fixture_seller_issues(request: Request) -> ApiResponse:
+    compat = _compat(request)
+    data = (
+        await compat.list_issues()
+        if compat is not None
+        else commerce_demo.list_seller_issues()
+    )
+    return ApiResponse(success=True, message="Issues", data=data)
 
 
 router.include_router(fixture_router)

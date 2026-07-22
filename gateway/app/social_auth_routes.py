@@ -7,7 +7,6 @@ Optional legacy: direct Google OAuth. Booth: AUTH_DEMO_CONTINUE (local only).
 """
 from __future__ import annotations
 
-import uuid
 from typing import Optional
 from urllib.parse import urlencode
 
@@ -31,6 +30,11 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 _GOOGLE_AUTH = "https://accounts.google.com/o/oauth2/v2/auth"
 _GOOGLE_TOKEN = "https://oauth2.googleapis.com/token"
 _GOOGLE_USERINFO = "https://openidconnect.googleapis.com/v1/userinfo"
+
+_DEMO_PRINCIPALS_BY_AUDIENCE = {
+    "ondcbuyer": "principal:demo:buyer",
+    "ondcseller": "principal:demo:seller",
+}
 
 
 def _auth0_configured() -> bool:
@@ -78,6 +82,15 @@ def _demo_continue_enabled() -> bool:
 class DemoContinueBody(BaseModel):
     audience: str = Field(..., min_length=3, max_length=64)
     display_name: Optional[str] = Field(None, max_length=120)
+
+
+def _demo_principal_for_audience(audience: str) -> str:
+    """Return the stable booth identity for a supported, role-scoped app."""
+    normalized = audience.strip().lower()
+    principal_id = _DEMO_PRINCIPALS_BY_AUDIENCE.get(normalized)
+    if not principal_id:
+        raise HTTPException(status_code=422, detail="Unsupported demo audience.")
+    return principal_id
 
 
 def _issue_session(
@@ -278,10 +291,11 @@ async def google_callback(
 async def demo_continue_post(body: DemoContinueBody) -> JSONResponse:
     if not _demo_continue_enabled():
         raise HTTPException(status_code=403, detail="Demo continue disabled.")
-    principal_id = f"principal:demo:{uuid.uuid4().hex[:16]}"
+    audience = body.audience.strip().lower()
+    principal_id = _demo_principal_for_audience(audience)
     token = _issue_session(
         principal_id=principal_id,
-        audience=body.audience,
+        audience=audience,
         identity_provider="demo",
         display_name=body.display_name or "Demo User",
     )
@@ -294,7 +308,7 @@ async def demo_continue_post(body: DemoContinueBody) -> JSONResponse:
                     "principal_id": principal_id,
                     "identity_provider": "demo",
                     "display_name": body.display_name or "Demo User",
-                    "aud": body.audience,
+                    "aud": audience,
                 }
             ),
         }
@@ -314,10 +328,11 @@ async def demo_continue_get(
         raise HTTPException(status_code=403, detail="Demo continue disabled.")
     if not is_allowed_return_url(return_url):
         raise HTTPException(status_code=400, detail="return URL is not an allowed origin.")
-    principal_id = f"principal:demo:{uuid.uuid4().hex[:16]}"
+    audience = aud.strip().lower()
+    principal_id = _demo_principal_for_audience(audience)
     token = _issue_session(
         principal_id=principal_id,
-        audience=aud,
+        audience=audience,
         identity_provider="demo",
         display_name=display_name,
     )

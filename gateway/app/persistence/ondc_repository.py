@@ -1,7 +1,8 @@
 """Durable ONDC inbox/outbox primitives.
 
-Only commitments and a small redacted diagnostic projection are retained. Raw
-ONDC envelopes remain with the protocol adapter that already owns them.
+The immutable envelope is retained with its commitment so leased workers can
+recover after a process restart. A bounded redacted projection remains available
+for operational inspection without exposing the full protocol payload.
 """
 
 from __future__ import annotations
@@ -135,8 +136,8 @@ class ONDCRepository:
                 INSERT INTO ondc_inbox (
                     event_commitment, subscriber_id, transaction_id, message_id,
                     action, correlation_id, raw_envelope_commitment,
-                    redacted_payload
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    envelope, redacted_payload
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (event_commitment) DO NOTHING
                 RETURNING {columns}
                 """,
@@ -144,6 +145,7 @@ class ONDCRepository:
                     event_commitment,
                     *values,
                     raw_commitment,
+                    Jsonb(raw_envelope),
                     Jsonb(projection),
                 ),
             )
@@ -194,8 +196,8 @@ class ONDCRepository:
                 INSERT INTO ondc_outbox (
                     event_commitment, subscriber_id, transaction_id, message_id,
                     action, correlation_id, destination,
-                    raw_envelope_commitment, redacted_payload
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    raw_envelope_commitment, envelope, redacted_payload
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (event_commitment) DO NOTHING
                 RETURNING {columns}
                 """,
@@ -204,6 +206,7 @@ class ONDCRepository:
                     *values,
                     destination,
                     raw_commitment,
+                    Jsonb(raw_envelope),
                     Jsonb(projection),
                 ),
             )
@@ -231,6 +234,33 @@ class ONDCRepository:
         self, *, worker_id: str, lease_seconds: int = 30, limit: int = 1
     ) -> list[dict[str, Any]]:
         return await self._claim("outbox", worker_id, lease_seconds, limit)
+
+    async def claim_outbox_record(
+        self, record_id: int, *, worker_id: str, lease_seconds: int = 30
+    ) -> dict[str, Any] | None:
+        """Claim one freshly staged or expired outbox record for inline delivery."""
+        if not worker_id.strip() or lease_seconds < 1:
+            raise ValueError("worker_id and positive lease_seconds are required")
+        columns = self._columns("outbox")
+        lease_token = uuid4()
+        async with self._connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                f"""
+                UPDATE ondc_outbox
+                SET state = 'processing', lease_token = %s, lease_owner = %s,
+                    lease_expires_at = NOW() + make_interval(secs => %s),
+                    updated_at = NOW()
+                WHERE outbox_id = %s
+                  AND next_attempt_at <= NOW()
+                  AND (
+                    state = 'pending'
+                    OR (state = 'processing' AND lease_expires_at <= NOW())
+                  )
+                RETURNING {columns}
+                """,
+                (lease_token, worker_id, lease_seconds, record_id),
+            )
+            return await cursor.fetchone()
 
     async def mark_delivered(
         self, queue: Queue, record_id: int, lease_token: UUID
@@ -319,6 +349,112 @@ class ONDCRepository:
             await cursor.execute(
                 f"SELECT {columns} FROM {table} WHERE {id_column} = %s",
                 (record_id,),
+            )
+            return await cursor.fetchone()
+
+    async def list_for_transaction(
+        self,
+        queue: Queue,
+        transaction_id: str,
+        *,
+        action: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Load durable protocol records without consulting the legacy file store."""
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        table, _ = self._table(queue)
+        columns = self._columns(queue)
+        query = f"SELECT {columns} FROM {table} WHERE transaction_id = %s"
+        parameters: list[Any] = [_required(transaction_id, "transaction_id")]
+        if action is not None:
+            query += " AND action = %s"
+            parameters.append(_required(action, "action"))
+        query += " ORDER BY created_at DESC LIMIT %s"
+        parameters.append(limit)
+        async with self._connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(query, parameters)
+            return list(await cursor.fetchall())
+
+    async def list_records(
+        self,
+        queue: Queue,
+        *,
+        state: str | None = None,
+        action: str | None = None,
+        transaction_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Inspect durable queue state without falling back to local files."""
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        if state is not None and state not in {
+            "pending",
+            "processing",
+            "delivered",
+            "dead_letter",
+        }:
+            raise ValueError("unsupported queue state")
+        table, _ = self._table(queue)
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if state is not None:
+            clauses.append("state = %s")
+            parameters.append(state)
+        if action is not None:
+            clauses.append("action = %s")
+            parameters.append(_required(action, "action"))
+        if transaction_id is not None:
+            clauses.append("transaction_id = %s")
+            parameters.append(_required(transaction_id, "transaction_id"))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.append(limit)
+        columns = self._columns(queue)
+        async with self._connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                f"SELECT {columns} FROM {table} {where} "
+                "ORDER BY created_at DESC LIMIT %s",
+                parameters,
+            )
+            return list(await cursor.fetchall())
+
+    async def requeue_dead_letter(
+        self,
+        queue: Queue,
+        record_id: int,
+        *,
+        event_commitment: str,
+    ) -> dict[str, Any] | None:
+        """Safely return one identified dead letter to the pending queue."""
+        if not _is_sha256(event_commitment):
+            raise ValueError("event_commitment must be a SHA-256 hex digest")
+        table, id_column = self._table(queue)
+        columns = self._columns(queue)
+        async with self._connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                f"""
+                UPDATE {table}
+                SET state = 'pending', next_attempt_at = NOW(),
+                    lease_token = NULL, lease_owner = NULL,
+                    lease_expires_at = NULL, last_error = NULL,
+                    updated_at = NOW()
+                WHERE {id_column} = %s
+                  AND event_commitment = %s
+                  AND state = 'dead_letter'
+                RETURNING {columns}
+                """,
+                (record_id, event_commitment),
+            )
+            updated = await cursor.fetchone()
+            if updated is not None:
+                return updated
+            await cursor.execute(
+                f"""
+                SELECT {columns} FROM {table}
+                WHERE {id_column} = %s AND event_commitment = %s
+                  AND state = 'pending'
+                """,
+                (record_id, event_commitment),
             )
             return await cursor.fetchone()
 
@@ -426,8 +562,9 @@ class ONDCRepository:
             names.append("destination")
         names.extend(
             [
-                "raw_envelope_commitment",
-                "redacted_payload",
+            "raw_envelope_commitment",
+            "envelope",
+            "redacted_payload",
                 "state",
                 "retry_count",
                 "next_attempt_at",

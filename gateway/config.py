@@ -169,6 +169,16 @@ def get_runtime_mode() -> str:
     return "unknown"
 
 
+def get_cf1_persistence_backend() -> str:
+    """Select one CF1 state owner for the lifetime of this gateway process.
+
+    ``Settings`` is the configuration owner because it includes values loaded
+    from the gateway ``.env`` file. Reading ``os.environ`` again at startup can
+    otherwise select file state even though ``DATABASE_URL`` was validated.
+    """
+    return "postgres" if settings.database_url else "local_file"
+
+
 def validate_runtime_storage_config() -> None:
     """Fail loud when production would use non-production trust storage."""
     backend = (settings.trust_store_backend or "local_file").strip().lower()

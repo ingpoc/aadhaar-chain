@@ -18,6 +18,7 @@ from app.persistence.agentguard_repository import (
     AgentGuardNotFound,
     AgentGuardPermissionDenied,
 )
+from app.seller_agentguard_orchestrator import SellerAgentGuardOrchestrator
 from app.session_auth import SESSION_COOKIE_NAME, parse_session_token
 
 router = APIRouter(prefix="/api/agentguard", tags=["agentguard"])
@@ -152,6 +153,20 @@ async def ensure_agent(request: Request, body: EnsureAgentRequest) -> ApiRespons
     principal_id, wallet_address = _principal(
         request, wallet_address=body.wallet_address, role=body.role
     )
+    pool = _persistence_pool(request)
+    if pool is not None:
+        try:
+            orchestrator = (
+                CheckoutOrchestrator(pool)
+                if body.role == "buyer"
+                else SellerAgentGuardOrchestrator(pool)
+            )
+            result = await orchestrator.ensure_agent(principal_id=principal_id)
+        except Exception as error:
+            _raise_persistent_error(error)
+        return ApiResponse(
+            success=True, message="AgentGuard agent ready", data=result
+        )
     if body.role == "seller" and wallet_address:
         agent, policy = agentguard.ensure_seller_ops_agent(wallet_address)
         mandate = agentguard.get_mandate(agent.mandate_id or "")
@@ -177,6 +192,17 @@ async def create_agent(request: Request, body: AgentCreateRequest) -> ApiRespons
     principal_id, wallet_address = _principal(
         request, wallet_address=body.wallet_address, role=body.role
     )
+    pool = _persistence_pool(request)
+    if pool is not None:
+        orchestrator = (
+            CheckoutOrchestrator(pool)
+            if body.role == "buyer"
+            else SellerAgentGuardOrchestrator(pool)
+        )
+        result = await orchestrator.ensure_agent(principal_id=principal_id)
+        return ApiResponse(
+            success=True, message="AgentGuard agent ready", data=result
+        )
     agent, mandate, policy = agentguard.ensure_agent(
         principal_id=principal_id,
         role=body.role,
@@ -199,6 +225,20 @@ async def get_current_agent(
     request: Request, role: Role, wallet_address: Optional[str] = None
 ) -> ApiResponse:
     principal_id, wallet = _principal(request, wallet_address=wallet_address, role=role)
+    pool = _persistence_pool(request)
+    if pool is not None:
+        try:
+            orchestrator = (
+                CheckoutOrchestrator(pool)
+                if role == "buyer"
+                else SellerAgentGuardOrchestrator(pool)
+            )
+            result = await orchestrator.ensure_agent(principal_id=principal_id)
+        except Exception as error:
+            _raise_persistent_error(error)
+        return ApiResponse(
+            success=True, message="Current AgentGuard agent", data=result
+        )
     agent = agentguard.get_current_agent(principal_id, role)
     if not agent:
         agent, mandate, policy = agentguard.ensure_agent(
@@ -226,7 +266,12 @@ async def get_current_agent(
 
 
 @router.get("/wallets/{wallet_address}", response_model=ApiResponse)
-async def get_wallet_agentguard(wallet_address: str) -> ApiResponse:
+async def get_wallet_agentguard(wallet_address: str, request: Request) -> ApiResponse:
+    if _persistence_pool(request) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Wallet AgentGuard compatibility is unavailable in PostgreSQL mode.",
+        )
     agent = agentguard.get_agent_for_wallet(wallet_address)
     if not agent:
         agent, policy = agentguard.ensure_seller_ops_agent(wallet_address)
@@ -252,11 +297,18 @@ async def compile_mandate(request: Request, body: CompileMandateRequest) -> ApiR
         request, wallet_address=body.wallet_address, role=body.role
     )
     pool = _persistence_pool(request)
-    if pool is not None and body.role == "buyer" and "max_order_paise" in body.limits:
+    if pool is not None:
         try:
-            result = await CheckoutOrchestrator(pool).compile_mandate(
-                principal_id=principal_id, limits=body.limits
-            )
+            if body.role == "buyer":
+                result = await CheckoutOrchestrator(pool).compile_mandate(
+                    principal_id=principal_id, limits=body.limits
+                )
+            else:
+                result = await SellerAgentGuardOrchestrator(pool).compile_mandate(
+                    principal_id=principal_id,
+                    limits=body.limits,
+                    allowed_actions=body.allowed_actions,
+                )
         except Exception as error:
             _raise_persistent_error(error)
         return ApiResponse(
@@ -287,9 +339,14 @@ async def confirm_mandate(
 ) -> ApiResponse:
     principal_id, _wallet = _principal(request, wallet_address=body.wallet_address)
     pool = _persistence_pool(request)
-    if pool is not None and mandate_id == CheckoutOrchestrator.mandate_id(principal_id):
+    if pool is not None:
         try:
-            result = await CheckoutOrchestrator(pool).confirm_mandate(
+            orchestrator = (
+                SellerAgentGuardOrchestrator(pool)
+                if mandate_id.startswith("mandate_seller_")
+                else CheckoutOrchestrator(pool)
+            )
+            result = await orchestrator.confirm_mandate(
                 principal_id=principal_id, mandate_id=mandate_id
             )
             mandate = result["mandate"]
@@ -314,7 +371,25 @@ async def confirm_mandate(
 
 
 @router.get("/mandates/{mandate_id}", response_model=ApiResponse)
-async def get_mandate(mandate_id: str) -> ApiResponse:
+async def get_mandate(mandate_id: str, request: Request) -> ApiResponse:
+    pool = _persistence_pool(request)
+    if pool is not None:
+        principal_id, _wallet = _principal(request, wallet_address=None)
+        try:
+            orchestrator = (
+                SellerAgentGuardOrchestrator(pool)
+                if mandate_id.startswith("mandate_seller_")
+                else CheckoutOrchestrator(pool)
+            )
+            result = await orchestrator.ensure_agent(principal_id=principal_id)
+        except Exception as error:
+            _raise_persistent_error(error)
+        mandate = result["mandate"]
+        if mandate is None or mandate["mandate_id"] != mandate_id:
+            raise HTTPException(status_code=404, detail="Unknown mandate")
+        return ApiResponse(
+            success=True, message="Mandate", data={"mandate": mandate}
+        )
     mandate = agentguard.get_mandate(mandate_id)
     if not mandate:
         raise HTTPException(status_code=404, detail="Unknown mandate")
@@ -324,11 +399,18 @@ async def get_mandate(mandate_id: str) -> ApiResponse:
 
 
 @router.post("/actions/evaluate", response_model=ApiResponse)
-async def evaluate_action(request: Request, body: EvaluateRequest) -> ApiResponse:
+async def evaluate_action(
+    request: Request,
+    response: Response,
+    body: EvaluateRequest,
+    correlation_id: Optional[str] = Header(default=None, alias="X-Correlation-ID"),
+) -> ApiResponse:
     principal_id, wallet_address = _principal(
         request, wallet_address=body.wallet_address
     )
     pool = _persistence_pool(request)
+    effective_correlation_id = correlation_id or f"correlation_{uuid4().hex}"
+    response.headers["X-Correlation-ID"] = effective_correlation_id
     if (
         pool is not None
         and agentguard.normalize_action(body.action) == "buyer.checkout.commit"
@@ -338,6 +420,26 @@ async def evaluate_action(request: Request, body: EvaluateRequest) -> ApiRespons
         try:
             result = await CheckoutOrchestrator(pool).evaluate_checkout(
                 principal_id=principal_id, quote_id=quote_id
+            )
+        except Exception as error:
+            _raise_persistent_error(error)
+        return ApiResponse(success=True, message=result["human_reason"], data=result)
+    if pool is not None:
+        normalized = agentguard.normalize_action(body.action)
+        if normalized is None or not normalized.startswith("seller."):
+            raise HTTPException(
+                status_code=422,
+                detail="PostgreSQL AgentGuard requires a durable checkout quote_id.",
+            )
+        try:
+            result = await SellerAgentGuardOrchestrator(pool).evaluate(
+                principal_id=principal_id,
+                action=normalized,
+                amount_inr=body.amount_inr,
+                resource_id=body.resource_id,
+                counterparty_id=body.counterparty_id,
+                payload=body.payload,
+                correlation_id=effective_correlation_id,
             )
         except Exception as error:
             _raise_persistent_error(error)
@@ -372,6 +474,11 @@ async def consume_approval(
     principal_id, wallet_address = _principal(
         request, wallet_address=body.wallet_address
     )
+    if _persistence_pool(request) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Approval is consumed atomically by the protected execute call.",
+        )
     return _consume_response(
         approval_id=approval_id,
         principal_id=principal_id,
@@ -388,6 +495,11 @@ async def approve_approval(
     principal_id, wallet_address = _principal(
         request, wallet_address=body.wallet_address
     )
+    if _persistence_pool(request) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Approval is consumed atomically by the protected execute call.",
+        )
     return _consume_response(
         approval_id=approval_id,
         principal_id=principal_id,
@@ -432,6 +544,12 @@ async def execute_action(
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     correlation_id: Optional[str] = Header(default=None, alias="X-Correlation-ID"),
 ) -> ApiResponse:
+    """Execute the tool-runner protected-write contract.
+
+    Mandate and agent lifecycle routes are control-plane commands. Commerce
+    mutations are protected writes and, in PostgreSQL mode, must carry both a
+    stable idempotency key and a caller-owned correlation identifier.
+    """
     if (
         idempotency_key
         and body.idempotency_key
@@ -440,15 +558,20 @@ async def execute_action(
         raise HTTPException(
             status_code=422, detail="Idempotency key header and body disagree."
         )
-    effective_idempotency_key = idempotency_key or body.idempotency_key
+    effective_idempotency_key = (idempotency_key or body.idempotency_key or "").strip()
     if not effective_idempotency_key:
         raise HTTPException(status_code=422, detail="Idempotency-Key is required.")
-    effective_correlation_id = correlation_id or f"correlation_{uuid4().hex}"
-    response.headers["X-Correlation-ID"] = effective_correlation_id
     principal_id, wallet_address = _principal(
         request, wallet_address=body.wallet_address
     )
     pool = _persistence_pool(request)
+    if pool is not None and not (correlation_id or "").strip():
+        raise HTTPException(
+            status_code=422,
+            detail="X-Correlation-ID is required for protected writes.",
+        )
+    effective_correlation_id = (correlation_id or f"correlation_{uuid4().hex}").strip()
+    response.headers["X-Correlation-ID"] = effective_correlation_id
     if (
         pool is not None
         and agentguard.normalize_action(body.action) == "buyer.checkout.commit"
@@ -471,6 +594,35 @@ async def execute_action(
             _raise_persistent_error(error)
         if result["reason_code"] == "PAYMENT_STATUS_UNKNOWN":
             response.status_code = 202
+        return ApiResponse(
+            success=True,
+            message=result["human_reason"],
+            data={**result, "correlation_id": effective_correlation_id},
+        )
+    if pool is not None:
+        normalized = agentguard.normalize_action(body.action)
+        if normalized is None or not normalized.startswith("seller."):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "PostgreSQL AgentGuard requires quote_id and decision_id for "
+                    "buyer.checkout.commit."
+                ),
+            )
+        try:
+            result = await SellerAgentGuardOrchestrator(pool).execute(
+                principal_id=principal_id,
+                decision_id=body.decision_id,
+                approval_id=body.approval_id,
+                action=normalized,
+                amount_inr=body.amount_inr,
+                resource_id=body.resource_id,
+                idempotency_key=effective_idempotency_key,
+                correlation_id=effective_correlation_id,
+                payload=body.payload,
+            )
+        except Exception as error:
+            _raise_persistent_error(error)
         return ApiResponse(
             success=True,
             message=result["human_reason"],
@@ -509,7 +661,7 @@ async def pause_agent(
 ) -> ApiResponse:
     principal_id, _wallet = _principal(request, wallet_address=body.wallet_address)
     pool = _persistence_pool(request)
-    if pool is not None and agent_id == CheckoutOrchestrator.agent_id(principal_id):
+    if pool is not None:
         try:
             paused = await CheckoutOrchestrator(pool).set_agent_status(
                 principal_id=principal_id, agent_id=agent_id, status="paused"
@@ -530,7 +682,7 @@ async def resume_agent(
 ) -> ApiResponse:
     principal_id, _wallet = _principal(request, wallet_address=body.wallet_address)
     pool = _persistence_pool(request)
-    if pool is not None and agent_id == CheckoutOrchestrator.agent_id(principal_id):
+    if pool is not None:
         try:
             resumed = await CheckoutOrchestrator(pool).set_agent_status(
                 principal_id=principal_id, agent_id=agent_id, status="active"
@@ -553,7 +705,7 @@ async def revoke_agent(
 ) -> ApiResponse:
     principal_id, _wallet = _principal(request, wallet_address=body.wallet_address)
     pool = _persistence_pool(request)
-    if pool is not None and agent_id == CheckoutOrchestrator.agent_id(principal_id):
+    if pool is not None:
         try:
             revoked = await CheckoutOrchestrator(pool).set_agent_status(
                 principal_id=principal_id, agent_id=agent_id, status="revoked"
