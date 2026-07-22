@@ -64,14 +64,15 @@ async def test_migrations_apply_once_and_rerun_cleanly(postgres_url: str) -> Non
     await pool.open()
     try:
         runner = MigrationRunner(pool, MIGRATIONS)
-        assert await runner.apply() == [1, 2, 3]
+        expected = [migration.number for migration in runner.discover_migrations()]
+        assert await runner.apply() == expected
         assert await runner.apply() == []
 
         async with pool.connection() as connection:
             result = await connection.execute(
                 "SELECT migration_number FROM schema_migrations ORDER BY migration_number"
             )
-            assert [row[0] for row in await result.fetchall()] == [1, 2, 3]
+            assert [row[0] for row in await result.fetchall()] == expected
     finally:
         await pool.close()
 
