@@ -84,14 +84,53 @@ class CommerceV1:
                 raise CommerceValidation(str(exc)) from exc
         return _jsonable(row)
 
-    async def create_cart(self, *, principal_id: str, seller_id: str) -> dict[str, Any]:
+    async def create_cart(
+        self,
+        *,
+        principal_id: str,
+        seller_id: str,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
         if not principal_id or not seller_id:
             raise CommerceValidation("principal_id and seller_id are required")
         async with UnitOfWork(self.pool) as unit_of_work:
-            row = await CommerceRepository(unit_of_work).create_cart(
-                uuid4(), principal_id, seller_id
-            )
-        return _jsonable({**row, "lines": []})
+            repository = CommerceRepository(unit_of_work)
+            idempotency = IdempotencyRepository(unit_of_work)
+            if idempotency_key:
+                created, record = await idempotency.create_or_get(
+                    principal_id,
+                    "commerce.cart.create.v1",
+                    idempotency_key,
+                    _request_hash({"seller_id": seller_id}),
+                    resource=f"seller:{seller_id}",
+                )
+                if not created:
+                    if record["status"] != "success" or record["response"] is None:
+                        raise CommerceConflict("cart creation is incomplete")
+                    return record["response"]
+            row = await repository.create_cart(uuid4(), principal_id, seller_id)
+            response = _jsonable({**row, "lines": []})
+            if idempotency_key:
+                await idempotency.update_response(
+                    principal_id,
+                    "commerce.cart.create.v1",
+                    idempotency_key,
+                    "success",
+                    response,
+                )
+        return response
+
+    async def get_cart(
+        self, *, principal_id: str, cart_id: str | UUID
+    ) -> dict[str, Any]:
+        async with UnitOfWork(self.pool) as unit_of_work:
+            try:
+                row = await CommerceRepository(unit_of_work).get_cart_with_lines(
+                    UUID(str(cart_id)), principal_id
+                )
+            except LookupError as exc:
+                raise CommerceNotFound(str(exc)) from exc
+        return _jsonable(row)
 
     async def set_cart_line(
         self,
@@ -101,21 +140,51 @@ class CommerceV1:
         sku: str,
         quantity: int,
         expected_version: int,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         if quantity < 0:
             raise CommerceValidation("quantity must be non-negative")
         async with UnitOfWork(self.pool) as unit_of_work:
+            idempotency = IdempotencyRepository(unit_of_work)
             try:
+                if idempotency_key:
+                    created, record = await idempotency.create_or_get(
+                        principal_id,
+                        "commerce.cart.line.set.v1",
+                        idempotency_key,
+                        _request_hash(
+                            {
+                                "cart_id": str(cart_id),
+                                "sku": sku,
+                                "quantity": quantity,
+                                "expected_version": expected_version,
+                            }
+                        ),
+                        resource=f"cart:{cart_id}",
+                    )
+                    if not created:
+                        if record["status"] != "success" or record["response"] is None:
+                            raise CommerceConflict("cart update is incomplete")
+                        return record["response"]
                 row = await CommerceRepository(unit_of_work).set_cart_line(
                     UUID(str(cart_id)), principal_id, sku, quantity, expected_version
                 )
+                response = _jsonable(row)
+                if idempotency_key:
+                    await idempotency.update_response(
+                        principal_id,
+                        "commerce.cart.line.set.v1",
+                        idempotency_key,
+                        "success",
+                        response,
+                    )
             except LookupError as exc:
                 raise CommerceNotFound(str(exc)) from exc
             except RuntimeError as exc:
                 raise CommerceConflict(str(exc)) from exc
             except ValueError as exc:
                 raise CommerceValidation(str(exc)) from exc
-        return _jsonable(row)
+        return response
 
     async def preview_checkout(
         self,
@@ -125,12 +194,33 @@ class CommerceV1:
         expected_version: int,
         landed_total_paise: int | None = None,
         ttl_seconds: int = 300,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         if ttl_seconds <= 0:
             raise CommerceValidation("quote ttl must be positive")
         async with UnitOfWork(self.pool) as unit_of_work:
             repository = CommerceRepository(unit_of_work)
+            idempotency = IdempotencyRepository(unit_of_work)
             try:
+                if idempotency_key:
+                    created, record = await idempotency.create_or_get(
+                        principal_id,
+                        "commerce.checkout.preview.v1",
+                        idempotency_key,
+                        _request_hash(
+                            {
+                                "cart_id": str(cart_id),
+                                "expected_version": expected_version,
+                                "landed_total_paise": landed_total_paise,
+                                "ttl_seconds": ttl_seconds,
+                            }
+                        ),
+                        resource=f"cart:{cart_id}",
+                    )
+                    if not created:
+                        if record["status"] != "success" or record["response"] is None:
+                            raise CommerceConflict("checkout preview is incomplete")
+                        return record["response"]
                 cart = await repository.get_cart_with_lines(
                     UUID(str(cart_id)), principal_id, lock=True
                 )
@@ -146,13 +236,36 @@ class CommerceV1:
                 quote = await repository.create_quote(
                     uuid4(), cart, total, self.clock() + timedelta(seconds=ttl_seconds)
                 )
+                response = _jsonable(quote)
+                if idempotency_key:
+                    await idempotency.update_response(
+                        principal_id,
+                        "commerce.checkout.preview.v1",
+                        idempotency_key,
+                        "success",
+                        response,
+                    )
             except LookupError as exc:
                 raise CommerceNotFound(str(exc)) from exc
             except CommerceConflict:
                 raise
             except ValueError as exc:
                 raise CommerceValidation(str(exc)) from exc
-        return _jsonable(quote)
+        return response
+
+    async def get_order(
+        self, *, principal_id: str, order_id: str | UUID
+    ) -> dict[str, Any]:
+        async with UnitOfWork(self.pool) as unit_of_work:
+            try:
+                row = await CommerceRepository(unit_of_work).get_order(
+                    UUID(str(order_id))
+                )
+            except LookupError as exc:
+                raise CommerceNotFound(str(exc)) from exc
+            if row["principal_id"] != principal_id:
+                raise CommerceNotFound("order not found")
+        return _jsonable(row)
 
     async def prepare_checkout(
         self,

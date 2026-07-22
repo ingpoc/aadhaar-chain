@@ -10,11 +10,15 @@ from uuid import uuid4
 import psycopg
 import pytest
 import pytest_asyncio
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
 from app.commerce_v1 import CommerceConflict, CommerceV1, IdempotencyConflict
+from app.commerce_v1_routes import router as commerce_v1_router
 from app.persistence import ConnectionPool, MigrationRunner
+from app.session_auth import SESSION_COOKIE_NAME, create_principal_session_token
 
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -117,6 +121,84 @@ async def test_migration_applies_once_and_reruns(postgres_url: str) -> None:
         assert await runner.apply() == []
     finally:
         await pool.close()
+
+
+async def test_commerce_v1_http_cart_preview_replay_and_tenant_isolation(
+    commerce: tuple[CommerceV1, ConnectionPool, Clock],
+) -> None:
+    service, pool, _clock = commerce
+    await service.upsert_inventory(
+        seller_id="seller-http",
+        sku="atta-http",
+        title="Atta HTTP",
+        unit_price_paise=10_000,
+        available_quantity=4,
+    )
+    api = FastAPI()
+    api.state.persistence_pool = pool
+    api.include_router(commerce_v1_router)
+    token = create_principal_session_token(
+        principal_id="principal:http-buyer",
+        audience="ondcbuyer",
+        identity_provider="demo",
+    )
+    other_token = create_principal_session_token(
+        principal_id="principal:other-buyer",
+        audience="ondcbuyer",
+        identity_provider="demo",
+    )
+    transport = ASGITransport(app=api)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        missing_key = await client.post(
+            "/api/commerce/v1/carts",
+            cookies={SESSION_COOKIE_NAME: token},
+            json={"seller_id": "seller-http"},
+        )
+        assert missing_key.status_code == 422
+
+        headers = {
+            "Idempotency-Key": "cart-http-1",
+            "X-Correlation-ID": "correlation-http-1",
+        }
+        first = await client.post(
+            "/api/commerce/v1/carts",
+            headers=headers,
+            cookies={SESSION_COOKIE_NAME: token},
+            json={"seller_id": "seller-http"},
+        )
+        replay = await client.post(
+            "/api/commerce/v1/carts",
+            headers=headers,
+            cookies={SESSION_COOKIE_NAME: token},
+            json={"seller_id": "seller-http"},
+        )
+        assert first.status_code == replay.status_code == 201
+        assert first.headers["X-Correlation-ID"] == "correlation-http-1"
+        cart = first.json()["data"]["cart"]
+        assert replay.json()["data"]["cart"]["cart_id"] == cart["cart_id"]
+
+        updated = await client.put(
+            f"/api/commerce/v1/carts/{cart['cart_id']}/lines/atta-http",
+            headers={"Idempotency-Key": "line-http-1"},
+            cookies={SESSION_COOKIE_NAME: token},
+            json={"quantity": 2, "expected_version": cart["version"]},
+        )
+        assert updated.status_code == 200
+        updated_cart = updated.json()["data"]["cart"]
+        preview = await client.post(
+            f"/api/commerce/v1/carts/{cart['cart_id']}/checkout-preview",
+            headers={"Idempotency-Key": "preview-http-1"},
+            cookies={SESSION_COOKIE_NAME: token},
+            json={"expected_version": updated_cart["version"]},
+        )
+        assert preview.status_code == 200
+        assert preview.json()["data"]["quote"]["landed_total_paise"] == 20_000
+
+        crossed = await client.get(
+            f"/api/commerce/v1/carts/{cart['cart_id']}",
+            cookies={SESSION_COOKIE_NAME: other_token},
+        )
+        assert crossed.status_code == 404
 
 
 async def test_successful_purchase_is_durable_and_ledger_balanced(commerce) -> None:

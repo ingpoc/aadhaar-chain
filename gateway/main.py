@@ -1,5 +1,8 @@
 """FastAPI gateway for aadhaar-chain identity platform."""
+
 from contextlib import asynccontextmanager
+import os
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,18 +10,11 @@ from fastapi.responses import JSONResponse
 import uvicorn
 
 from config import apply_runtime_environment, settings, validate_runtime_storage_config
-from app.models import (
-    AadhaarVerificationData,
-    PanVerificationData,
-    VerificationStatus,
-    IdentityData,
-    VerificationStep,
-    ApiResponse,
-)
-from app.routes import router as identity_router, identities, _build_did
+from app.routes import router as identity_router, identities
 from app.agentguard_routes import router as agentguard_router
 from app.portfolio_agent_routes import router as portfolio_agent_router
 from app.commerce_routes import router as commerce_router
+from app.commerce_v1_routes import router as commerce_v1_router
 from app.realtime_routes import router as realtime_router
 from app.agent_manager import agent_manager
 from app.runtime_config import resolve_runtime_policy
@@ -33,6 +29,7 @@ from app.ondc_routes import router as ondc_router
 from app.ondc_onboard_routes import router as ondc_onboard_router
 from app.ondc_bpp import router as ondc_bpp_router
 from app.state_store import load_gateway_state
+from app.persistence import ConnectionPool, MigrationRunner
 
 
 @asynccontextmanager
@@ -40,6 +37,14 @@ async def lifespan(_app: FastAPI):
     """Initialize agents and load persisted state on startup."""
     apply_runtime_environment()
     validate_runtime_storage_config()
+    persistence_pool = None
+    if os.getenv("DATABASE_URL"):
+        persistence_pool = ConnectionPool()
+        await persistence_pool.open()
+        await MigrationRunner(
+            persistence_pool, Path(__file__).parent / "migrations"
+        ).apply()
+    _app.state.persistence_pool = persistence_pool
     persisted_identities, persisted_verifications = load_gateway_state()
     identities.clear()
     identities.update(persisted_identities)
@@ -61,8 +66,7 @@ async def lifespan(_app: FastAPI):
         )
     else:
         print(
-            "⚠ AadhaarChain agent runtime unavailable: "
-            f"{runtime_policy.blocked_reason}"
+            f"⚠ AadhaarChain agent runtime unavailable: {runtime_policy.blocked_reason}"
         )
     # Free /tmp catalog is empty after spin-down; restore the canonical item when ONDC is on.
     if getattr(settings, "ondc_enabled", False):
@@ -72,13 +76,14 @@ async def lifespan(_app: FastAPI):
             ensured = ensure_catalog_marker_item()
             title = (ensured.get("item") or {}).get("title") or "marker"
             created = ensured.get("created")
-            print(
-                f"✓ ONDC catalog ensure "
-                f"(created={created}, title={title})"
-            )
+            print(f"✓ ONDC catalog ensure (created={created}, title={title})")
         except Exception as exc:  # noqa: BLE001 — boot must not die on catalog restore
             print(f"⚠ ONDC catalog ensure skipped: {exc}")
-    yield
+    try:
+        yield
+    finally:
+        if persistence_pool is not None:
+            await persistence_pool.close()
 
 
 # Create FastAPI app
@@ -112,6 +117,7 @@ app.include_router(ondc_router)
 app.include_router(agentguard_router)
 app.include_router(portfolio_agent_router)
 app.include_router(commerce_router)
+app.include_router(commerce_v1_router)
 app.include_router(realtime_router)
 
 
