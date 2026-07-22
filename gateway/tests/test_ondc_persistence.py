@@ -75,7 +75,8 @@ async def test_migration_applies_once_and_reruns(postgres_url: str) -> None:
     await pool.open()
     try:
         runner = MigrationRunner(pool, MIGRATIONS)
-        assert await runner.apply() == [1, 2, 3, 30]
+        expected = [migration.number for migration in runner.discover_migrations()]
+        assert await runner.apply() == expected
         assert await runner.apply() == []
         async with pool.connection() as connection:
             result = await connection.execute(
@@ -84,7 +85,7 @@ async def test_migration_applies_once_and_reruns(postgres_url: str) -> None:
                 ORDER BY migration_number
                 """
             )
-            assert [row[0] for row in await result.fetchall()] == [1, 2, 3, 30]
+            assert [row[0] for row in await result.fetchall()] == expected
             result = await connection.execute(
                 """
                 SELECT column_name FROM information_schema.columns

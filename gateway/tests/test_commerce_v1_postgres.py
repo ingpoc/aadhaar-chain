@@ -112,7 +112,8 @@ async def test_migration_applies_once_and_reruns(postgres_url: str) -> None:
     await pool.open()
     try:
         runner = MigrationRunner(pool, MIGRATIONS)
-        assert await runner.apply() == [1, 2, 3, 20]
+        expected = [migration.number for migration in runner.discover_migrations()]
+        assert await runner.apply() == expected
         assert await runner.apply() == []
     finally:
         await pool.close()
