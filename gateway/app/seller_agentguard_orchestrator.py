@@ -100,6 +100,10 @@ class SellerAgentGuardOrchestrator:
                     role="seller",
                     payload={"name": "Seller commerce agent"},
                 )
+            mandate = await repository.get_latest_mandate_for_agent(
+                principal_id=principal_id, agent_id=agent_id
+            )
+            if mandate is None:
                 await repository.create_mandate_version(
                     mandate_id=mandate_id,
                     version=1,
@@ -114,15 +118,9 @@ class SellerAgentGuardOrchestrator:
                 agent = await repository.get_agent(
                     principal_id=principal_id, agent_id=agent_id
                 )
-            mandate = (
-                await repository.get_mandate_version(
-                    principal_id=principal_id,
-                    mandate_id=agent["current_mandate_id"],
-                    version=agent["current_mandate_version"],
+                mandate = await repository.get_latest_mandate_for_agent(
+                    principal_id=principal_id, agent_id=agent_id
                 )
-                if agent.get("current_mandate_id") is not None
-                else None
-            )
             receipts = await repository.list_receipts(
                 principal_id=principal_id, limit=20
             )
@@ -148,7 +146,8 @@ class SellerAgentGuardOrchestrator:
         invalid = [
             action
             for action in actions
-            if agentguard.normalize_action(action) != action or not action.startswith("seller.")
+            if agentguard.normalize_action(action) != action
+            or not action.startswith("seller.")
         ]
         if invalid:
             raise ValueError(f"unsupported Seller actions: {', '.join(invalid)}")

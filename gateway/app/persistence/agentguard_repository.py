@@ -74,6 +74,9 @@ class AgentGuardRepository:
             INSERT INTO agentguard_agents (
                 agent_id, principal_id, role, status, payload
             ) VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (agent_id) DO UPDATE
+            SET agent_id = EXCLUDED.agent_id
+            WHERE agentguard_agents.principal_id = EXCLUDED.principal_id
             RETURNING *
             """,
             (agent_id, principal_id, role, status, Jsonb(payload or {})),

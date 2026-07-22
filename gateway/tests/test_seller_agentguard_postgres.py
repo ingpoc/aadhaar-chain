@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -51,6 +52,24 @@ async def pool() -> AsyncIterator[ConnectionPool]:
             sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema))
         )
         await admin.close()
+
+
+async def test_concurrent_seller_ensure_returns_one_durable_agent(
+    pool: ConnectionPool,
+) -> None:
+    principal_id = "principal:seller:concurrent-bootstrap"
+    first, second = await asyncio.gather(
+        SellerAgentGuardOrchestrator(pool).ensure_agent(principal_id=principal_id),
+        SellerAgentGuardOrchestrator(pool).ensure_agent(principal_id=principal_id),
+    )
+
+    assert first["agent"]["agent_id"] == second["agent"]["agent_id"]
+    async with pool.connection() as connection:
+        result = await connection.execute(
+            "SELECT COUNT(*) FROM agentguard_agents WHERE principal_id = %s",
+            (principal_id,),
+        )
+        assert await result.fetchone() == (1,)
 
 
 async def test_seller_catalog_publish_is_durable_exact_and_one_effect(
