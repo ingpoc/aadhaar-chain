@@ -320,25 +320,24 @@ class CheckoutOrchestrator:
                 raise AgentGuardConflict(
                     (intent.get("result") or {}).get("error", "checkout failed")
                 )
-            if not created:
-                raise AgentGuardConflict("checkout execution is already in progress")
-            if _quote["status"] != "open" or _quote["expires_at"] <= _utcnow():
-                raise AgentGuardConflict("quote is not open")
-            if decision["status"] == "need_approval":
-                if not approval_id:
-                    raise AgentGuardConflict("exact approval is required")
-                await agentguard.consume_approval(
+            if created:
+                if _quote["status"] != "open" or _quote["expires_at"] <= _utcnow():
+                    raise AgentGuardConflict("quote is not open")
+                if decision["status"] == "need_approval":
+                    if not approval_id:
+                        raise AgentGuardConflict("exact approval is required")
+                    await agentguard.consume_approval(
+                        principal_id=principal_id,
+                        approval_id=approval_id,
+                        request_hash=request_hash,
+                    )
+                elif decision["status"] != "allow":
+                    raise AgentGuardConflict("decision does not authorize checkout")
+                intent = await agentguard.set_execution_intent_status(
                     principal_id=principal_id,
-                    approval_id=approval_id,
-                    request_hash=request_hash,
+                    intent_id=intent["intent_id"],
+                    status="executing",
                 )
-            elif decision["status"] != "allow":
-                raise AgentGuardConflict("decision does not authorize checkout")
-            intent = await agentguard.set_execution_intent_status(
-                principal_id=principal_id,
-                intent_id=intent["intent_id"],
-                status="executing",
-            )
 
         try:
             commerce_result = await self.commerce.prepare_checkout(
@@ -347,15 +346,32 @@ class CheckoutOrchestrator:
                 idempotency_key=idempotency_key,
                 request=bound,
             )
-            payment_result = await self.commerce.record_payment_result(
+            payment_state = await self.commerce.get_payment_state(
                 principal_id=principal_id,
                 payment_attempt_id=commerce_result["payment_attempt"][
                     "payment_attempt_id"
                 ],
-                status=payment_outcome,
-                provider_reference=f"sandbox:{idempotency_key}",
-                detail={"simulated": True},
             )
+            current_status = payment_state["payment_attempt"]["status"]
+            if current_status == "pending":
+                payment_result = await self.commerce.record_payment_result(
+                    principal_id=principal_id,
+                    payment_attempt_id=commerce_result["payment_attempt"][
+                        "payment_attempt_id"
+                    ],
+                    status=payment_outcome,
+                    provider_reference=f"sandbox:{idempotency_key}",
+                    detail={"simulated": True},
+                )
+            elif (
+                payment_outcome == "succeeded"
+                and current_status in {"succeeded", "reconciled"}
+            ) or current_status == payment_outcome:
+                payment_result = payment_state
+            else:
+                raise AgentGuardConflict(
+                    f"payment is already {current_status}, not {payment_outcome}"
+                )
             verified_result = {**commerce_result, **payment_result}
         except Exception as error:
             async with UnitOfWork(self.pool) as unit_of_work:

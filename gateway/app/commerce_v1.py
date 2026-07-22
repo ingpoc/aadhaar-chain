@@ -267,6 +267,20 @@ class CommerceV1:
                 raise CommerceNotFound("order not found")
         return _jsonable(row)
 
+    async def get_payment_state(
+        self, *, principal_id: str, payment_attempt_id: str | UUID
+    ) -> dict[str, Any]:
+        async with UnitOfWork(self.pool) as unit_of_work:
+            repository = CommerceRepository(unit_of_work)
+            try:
+                payment = await repository.get_payment(UUID(str(payment_attempt_id)))
+                if payment["principal_id"] != principal_id:
+                    raise CommerceNotFound("payment attempt not found")
+                order = await repository.get_order(payment["order_id"])
+            except LookupError as exc:
+                raise CommerceNotFound(str(exc)) from exc
+        return _jsonable({"order": order, "payment_attempt": payment})
+
     async def prepare_checkout(
         self,
         *,

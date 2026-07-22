@@ -18,7 +18,10 @@ from app.commerce_v1 import CommerceV1
 from app.agentguard_routes import router as agentguard_router
 from app.commerce_v1_routes import router as commerce_v1_router
 from app.persistence import ConnectionPool, MigrationRunner
-from app.persistence.agentguard_repository import AgentGuardConflict
+from app.persistence.agentguard_repository import (
+    AgentGuardConflict,
+    AgentGuardRepository,
+)
 from app.receipt_signing import verify_receipt
 from app.session_auth import SESSION_COOKIE_NAME, create_principal_session_token
 
@@ -56,6 +59,7 @@ async def pool() -> AsyncIterator[ConnectionPool]:
 
 async def test_over_limit_exact_approval_checkout_replays_one_paid_order(
     pool: ConnectionPool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     principal_id = "principal:checkout-e2e"
     commerce = CommerceV1(pool)
@@ -104,6 +108,21 @@ async def test_over_limit_exact_approval_checkout_replays_one_paid_order(
             idempotency_key="checkout-e2e",
             correlation_id="correlation-e2e",
         )
+
+    async def crash_before_receipt(*_args, **_kwargs):
+        raise RuntimeError("simulated crash before receipt commit")
+
+    with monkeypatch.context() as crash:
+        crash.setattr(AgentGuardRepository, "record_receipt", crash_before_receipt)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            await orchestrator.execute_checkout(
+                principal_id=principal_id,
+                quote_id=quote["quote_id"],
+                decision_id=decision["decision_id"],
+                approval_id=decision["approval"]["approval_id"],
+                idempotency_key="checkout-e2e",
+                correlation_id="correlation-e2e",
+            )
 
     first = await orchestrator.execute_checkout(
         principal_id=principal_id,
