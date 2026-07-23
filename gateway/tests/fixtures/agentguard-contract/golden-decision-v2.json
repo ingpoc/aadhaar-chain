@@ -1,0 +1,13 @@
+{
+  "schema_version": "2",
+  "decision_id": "decision_golden_001",
+  "policy_id": "policy_seller_refunds",
+  "decision": "need_approval",
+  "reason_code": "approval_required_amount",
+  "human_reason": "The refund amount requires review.",
+  "required_action": "review",
+  "risk_level": "medium",
+  "policy_version": 3,
+  "expires_at": "2026-07-22T14:00:00.000Z",
+  "request_hash": "4f9e7783cf1e87ec3b1e30f6cc9fdcf447c967e331ca8ee3681b7eae92f340a2"
+}

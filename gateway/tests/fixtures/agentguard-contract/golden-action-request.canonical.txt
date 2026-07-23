@@ -1,0 +1,1 @@
+{"action":"seller.refund.issue","agent_id":"agent_demo_seller","amount_inr":7500,"expires_at":"2026-07-11T14:00:00+00:00","nonce":"golden-nonce-1","principal":{"principal_id":"wallet:AgentGuardTestWallet1111111111111111111","role":"seller","schema_version":"1","wallet_address":"AgentGuardTestWallet1111111111111111111"},"resource_id":"order-demo-1","schema_version":"1"}

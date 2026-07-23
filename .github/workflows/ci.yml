@@ -49,7 +49,7 @@ jobs:
       - name: Run gateway tests
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
-        run: pytest -q
+        run: pytest -q -p asyncio
 
   frontend:
     runs-on: ubuntu-latest

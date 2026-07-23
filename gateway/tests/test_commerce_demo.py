@@ -24,6 +24,8 @@ from app.commerce_demo import (
 @pytest.fixture(autouse=True)
 def _isolate_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(settings, "data_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "aadhaar_chain_env", "demo")
+    monkeypatch.setattr(settings, "auth_demo_continue", True)
     yield
 
 

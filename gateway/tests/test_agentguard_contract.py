@@ -7,7 +7,11 @@ from pathlib import Path
 from app.agentguard_contract import DecisionV2, canonicalize, sha256_hex
 
 
-FIXTURES = Path(__file__).resolve().parents[3] / "shared" / "agentguard-contract" / "fixtures"
+WORKSPACE_FIXTURES = (
+    Path(__file__).resolve().parents[3] / "shared" / "agentguard-contract" / "fixtures"
+)
+LOCAL_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "agentguard-contract"
+FIXTURES = WORKSPACE_FIXTURES if WORKSPACE_FIXTURES.is_dir() else LOCAL_FIXTURES
 
 
 def test_python_canonicalizes_and_hashes_shared_golden_action_request() -> None:

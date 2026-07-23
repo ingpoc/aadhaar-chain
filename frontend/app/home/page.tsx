@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useSyncExternalStore } from 'react';
 import Link from 'next/link';
 import { useWallet } from '@solana/wallet-adapter-react';
 
@@ -54,16 +54,22 @@ function resolveHomeTrustState(surface: TrustReadSurface | null) {
   return 'unverified' as const;
 }
 
+const subscribeToClientMount = () => () => {};
+const getClientMountSnapshot = () => true;
+const getServerMountSnapshot = () => false;
+
 export default function HomePage() {
   const { connected, publicKey } = useWallet();
   const walletAddress = publicKey?.toBase58() ?? null;
   const [trust, setTrust] = useState<TrustReadSurface | null>(null);
   const [fetchedForWallet, setFetchedForWallet] = useState<string | null>(null);
-  // SSR + first client paint must match; autoConnect/localStorage can flip `connected` before hydrate.
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => {
-    setMounted(true);
-  }, []);
+  // SSR + first client paint must match; autoConnect/localStorage can flip
+  // `connected` before hydration.
+  const mounted = useSyncExternalStore(
+    subscribeToClientMount,
+    getClientMountSnapshot,
+    getServerMountSnapshot,
+  );
   const walletReady = mounted && connected;
 
   useEffect(() => {
