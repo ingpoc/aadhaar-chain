@@ -70,6 +70,8 @@ class CommerceCompatibilityAdapter:
             "quantity": line.get("quantity") or 0,
             "amount_inr": row["landed_total_paise"] / 100,
             "status": row["status"],
+            "version": row["version"],
+            "fulfilment": row.get("fulfilment") or {"history": []},
             "payment": {
                 "status": payment_status,
                 "amount_inr": row["payment_amount_paise"] / 100,
@@ -106,6 +108,22 @@ class CommerceCompatibilityAdapter:
             "description": row["description"],
             "response": row.get("response"),
             "remedy": row.get("remedy"),
+            "outcome_receipt": row.get("outcome_receipt"),
+            "created_at": _iso(row["created_at"]),
+            "updated_at": _iso(row["updated_at"]),
+        }
+
+    @staticmethod
+    def _return(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "return_id": str(row["return_id"]),
+            "order_id": str(row["order_id"]),
+            "principal_id": row["principal_id"],
+            "seller_id": row["seller_id"],
+            "status": row["status"],
+            "version": row["version"],
+            "reason": row["reason"],
+            "resolution": row.get("resolution"),
             "created_at": _iso(row["created_at"]),
             "updated_at": _iso(row["updated_at"]),
         }
@@ -149,7 +167,9 @@ class CommerceCompatibilityAdapter:
         item = await self.get_item(item_id)
         return {"item": item, "inventory": item["inventory"]}
 
-    async def publish_item(self, item_id: str, status: str = "published") -> dict[str, Any]:
+    async def publish_item(
+        self, item_id: str, status: str = "published"
+    ) -> dict[str, Any]:
         if status not in {"draft", "published", "archived"}:
             raise ValueError("unsupported catalog status")
         async with UnitOfWork(self.pool) as unit_of_work:
@@ -303,35 +323,60 @@ class CommerceCompatibilityAdapter:
         status: str,
         *,
         expected_version: int | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        payload = payload or {}
         async with UnitOfWork(self.pool) as unit_of_work:
-            current_result = await unit_of_work.connection.execute(
-                """
-                SELECT status, version FROM commerce_orders
-                WHERE order_id = %s FOR UPDATE
-                """,
-                (UUID(order_id),),
-            )
-            current = await current_result.fetchone()
-            if current is None:
-                raise KeyError("order not found")
-            next_version = require_transition(
-                "order",
-                current[0],
-                status,
-                current_version=current[1],
-                expected_version=expected_version,
-            )
-            result = await unit_of_work.connection.execute(
-                """
-                UPDATE commerce_orders SET status = %s, version = %s,
-                    updated_at = NOW()
-                WHERE order_id = %s AND version = %s RETURNING order_id
-                """,
-                (status, next_version, UUID(order_id), current[1]),
-            )
-            if await result.fetchone() is None:
-                raise RuntimeError("stale order transition")
+            async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    """
+                    SELECT status, version, fulfilment FROM commerce_orders
+                    WHERE order_id = %s FOR UPDATE
+                    """,
+                    (UUID(order_id),),
+                )
+                current = await cursor.fetchone()
+                if current is None:
+                    raise KeyError("order not found")
+                next_version = require_transition(
+                    "order",
+                    current["status"],
+                    status,
+                    current_version=current["version"],
+                    expected_version=expected_version,
+                )
+                fulfilment = dict(current.get("fulfilment") or {})
+                history = list(fulfilment.get("history") or [])
+                event = {
+                    "status": status,
+                    "recorded_at": datetime.now().astimezone().isoformat(),
+                }
+                if payload.get("tracking_id"):
+                    fulfilment["tracking_id"] = str(payload["tracking_id"])
+                    event["tracking_id"] = str(payload["tracking_id"])
+                if payload.get("provider_name"):
+                    fulfilment["provider_name"] = str(payload["provider_name"])
+                if payload.get("status_message"):
+                    fulfilment["status_message"] = str(payload["status_message"])
+                    event["status_message"] = str(payload["status_message"])
+                fulfilment["status"] = status
+                fulfilment["history"] = [*history, event]
+                await cursor.execute(
+                    """
+                    UPDATE commerce_orders
+                    SET status = %s, version = %s, fulfilment = %s, updated_at = NOW()
+                    WHERE order_id = %s AND version = %s RETURNING order_id
+                    """,
+                    (
+                        status,
+                        next_version,
+                        Jsonb(fulfilment),
+                        UUID(order_id),
+                        current["version"],
+                    ),
+                )
+                if await cursor.fetchone() is None:
+                    raise RuntimeError("stale order transition")
         return {"order": await self.get_order(order_id)}
 
     async def create_issue(self, order_id: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -355,6 +400,69 @@ class CommerceCompatibilityAdapter:
             )
         return {"issue": (await self.list_issues(order_id=order_id))["issues"][0]}
 
+    async def create_return(
+        self, order_id: str, *, principal_id: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        order = await self.get_order(order_id, principal_id=principal_id)
+        if order["status"] not in {"delivered", "closed", "fulfilled"}:
+            raise ValueError("return requires a completed delivery")
+        return_id = uuid4()
+        async with UnitOfWork(self.pool) as unit_of_work:
+            try:
+                await unit_of_work.connection.execute(
+                    """
+                    INSERT INTO commerce_returns (
+                        return_id, order_id, principal_id, seller_id, reason
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        return_id,
+                        UUID(order_id),
+                        principal_id,
+                        order["seller_id"],
+                        str(body.get("reason") or "Buyer requested return"),
+                    ),
+                )
+            except Exception as error:
+                if "commerce_returns_one_per_order_idx" in str(error):
+                    raise ValueError(
+                        "return already requested for this order"
+                    ) from None
+                raise
+        return {
+            "return": (
+                await self.list_returns(principal_id=principal_id, order_id=order_id)
+            )["returns"][0]
+        }
+
+    async def list_returns(
+        self,
+        *,
+        principal_id: str | None = None,
+        seller_id: str | None = None,
+        order_id: str | None = None,
+    ) -> dict[str, Any]:
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        for column, value in (
+            ("principal_id", principal_id),
+            ("seller_id", seller_id),
+            ("order_id", UUID(order_id) if order_id else None),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = %s")
+                parameters.append(value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        async with UnitOfWork(self.pool) as unit_of_work:
+            async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    f"SELECT * FROM commerce_returns {where} ORDER BY created_at DESC",
+                    parameters,
+                )
+                rows = list(await cursor.fetchall())
+        returns = [self._return(row) for row in rows]
+        return {"returns": returns, "count": len(returns)}
+
     async def list_issues(
         self,
         *,
@@ -376,14 +484,32 @@ class CommerceCompatibilityAdapter:
         async with UnitOfWork(self.pool) as unit_of_work:
             async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(
-                    f"SELECT * FROM commerce_issues {where} ORDER BY created_at DESC",
+                    f"""
+                    SELECT issue.*,
+                           outcome.payload AS outcome_receipt
+                    FROM commerce_issues AS issue
+                    LEFT JOIN LATERAL (
+                        SELECT receipt.payload
+                        FROM agentguard_receipts AS receipt
+                        WHERE receipt.principal_id = issue.principal_id
+                          AND receipt.payload->>'action' = 'buyer.remedy.accept'
+                          AND receipt.payload->'bound_action'->>'resource_id'
+                              = issue.issue_id::text
+                        ORDER BY receipt.created_at DESC
+                        LIMIT 1
+                    ) AS outcome ON TRUE
+                    {where}
+                    ORDER BY issue.created_at DESC
+                    """,
                     parameters,
                 )
                 rows = list(await cursor.fetchall())
         issues = [self._issue(row) for row in rows]
         return {"issues": issues, "count": len(issues)}
 
-    async def respond_issue(self, issue_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    async def respond_issue(
+        self, issue_id: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
         return await self._update_issue(
             issue_id,
             response=str(body.get("response") or body.get("message") or ""),
@@ -396,6 +522,42 @@ class CommerceCompatibilityAdapter:
             remedy=body,
             status=str(body.get("status") or "resolution_proposed"),
         )
+
+    async def accept_remedy(self, issue_id: str) -> dict[str, Any]:
+        async with UnitOfWork(self.pool) as unit_of_work:
+            async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    "SELECT * FROM commerce_issues WHERE issue_id = %s FOR UPDATE",
+                    (UUID(issue_id),),
+                )
+                current = await cursor.fetchone()
+                if current is None:
+                    raise KeyError("issue not found")
+                accepted_version = require_transition(
+                    "issue",
+                    current["status"],
+                    "accepted",
+                    current_version=current["version"],
+                )
+                closed_version = require_transition(
+                    "issue",
+                    "accepted",
+                    "closed",
+                    current_version=accepted_version,
+                )
+                await cursor.execute(
+                    """
+                    UPDATE commerce_issues
+                    SET status = 'closed', version = %s, updated_at = NOW()
+                    WHERE issue_id = %s AND version = %s
+                    RETURNING *
+                    """,
+                    (closed_version, UUID(issue_id), current["version"]),
+                )
+                row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError("stale issue transition")
+        return {"issue": self._issue(row)}
 
     async def cleanup(
         self, *, order_ids: set[str], item_ids: set[str]
@@ -469,7 +631,7 @@ class CommerceCompatibilityAdapter:
         async with UnitOfWork(self.pool) as unit_of_work:
             await unit_of_work.connection.execute(
                 f"""
-                UPDATE commerce_inventory SET {', '.join(assignments)}, updated_at = NOW()
+                UPDATE commerce_inventory SET {", ".join(assignments)}, updated_at = NOW()
                 WHERE seller_id = %s AND sku = %s
                 """,
                 (*values, seller_id, sku),

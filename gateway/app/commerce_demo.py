@@ -1,4 +1,5 @@
 """File-backed local commerce exchange for the AgentGuard demo."""
+
 from __future__ import annotations
 
 import json
@@ -33,6 +34,7 @@ class CommerceState(BaseModel):
     inventory: dict[str, int] = Field(default_factory=dict)
     orders: dict[str, dict[str, Any]] = Field(default_factory=dict)
     reservations: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    returns: dict[str, dict[str, Any]] = Field(default_factory=dict)
     issues: dict[str, dict[str, Any]] = Field(default_factory=dict)
     remedies: dict[str, dict[str, Any]] = Field(default_factory=dict)
     idempotency: dict[str, dict[str, Any]] = Field(default_factory=dict)
@@ -46,14 +48,18 @@ def load_state() -> CommerceState:
     path = _state_path()
     if not path.is_file():
         return CommerceState()
-    return CommerceState.model_validate(json.loads(path.read_text(encoding="utf-8") or "{}"))
+    return CommerceState.model_validate(
+        json.loads(path.read_text(encoding="utf-8") or "{}")
+    )
 
 
 def save_state(state: CommerceState) -> None:
     path = _state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state.model_dump(mode="json"), indent=2), encoding="utf-8")
+    tmp.write_text(
+        json.dumps(state.model_dump(mode="json"), indent=2), encoding="utf-8"
+    )
     tmp.replace(path)
 
 
@@ -61,7 +67,9 @@ def _idempotency_key(scope: str, key: Optional[str]) -> Optional[str]:
     return f"{scope}:{key}" if key else None
 
 
-def _remember(state: CommerceState, key: Optional[str], response: dict[str, Any]) -> dict[str, Any]:
+def _remember(
+    state: CommerceState, key: Optional[str], response: dict[str, Any]
+) -> dict[str, Any]:
     if key:
         state.idempotency[key] = response
     return response
@@ -77,7 +85,9 @@ def _default_category_id(title: str) -> str:
     return "Grocery"
 
 
-def create_item(payload: dict[str, Any], *, idempotency_key: Optional[str] = None) -> dict[str, Any]:
+def create_item(
+    payload: dict[str, Any], *, idempotency_key: Optional[str] = None
+) -> dict[str, Any]:
     state = load_state()
     idem = _idempotency_key("seller.items.create", idempotency_key)
     if idem and idem in state.idempotency:
@@ -90,10 +100,13 @@ def create_item(payload: dict[str, Any], *, idempotency_key: Optional[str] = Non
         "item_id": item_id,
         "version": 1,
         "status": "draft",
-        "seller_id": payload.get("seller_id") or payload.get("wallet_address") or "seller",
+        "seller_id": payload.get("seller_id")
+        or payload.get("wallet_address")
+        or "seller",
         "seller_name": payload.get("seller_name") or payload.get("provider_name"),
         "title": title,
-        "description": payload.get("description") or "Product details provided by seller.",
+        "description": payload.get("description")
+        or "Product details provided by seller.",
         "price_inr": int(payload.get("price_inr") or payload.get("amount_inr") or 0),
         "category_id": payload.get("category_id") or _default_category_id(title),
         "delivery_estimate": payload.get("delivery_estimate"),
@@ -122,7 +135,8 @@ def update_item(item_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         **{
             key: value
             for key, value in payload.items()
-            if key in {
+            if key
+            in {
                 "title",
                 "description",
                 "price_inr",
@@ -142,7 +156,11 @@ def update_item(item_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         state.inventory[item_id] = int(payload["inventory"])
     state.items[item_id] = updated
     save_state(state)
-    return {"item": updated, "inventory": state.inventory.get(item_id, 0), "message_id": _new_id("msg")}
+    return {
+        "item": updated,
+        "inventory": state.inventory.get(item_id, 0),
+        "message_id": _new_id("msg"),
+    }
 
 
 def cleanup_test_artifacts(
@@ -187,7 +205,9 @@ def cleanup_test_artifacts(
         }
     else:
         item_ids = {
-            item_id for item_id in (explicit_item_ids or set()) if item_id in state.items
+            item_id
+            for item_id in (explicit_item_ids or set())
+            if item_id in state.items
         }
     order_ids = {
         order_id
@@ -216,7 +236,8 @@ def cleanup_test_artifacts(
     reservation_ids = {
         reservation_id
         for reservation_id, reservation in state.reservations.items()
-        if reservation.get("order_id") in order_ids or reservation.get("item_id") in item_ids
+        if reservation.get("order_id") in order_ids
+        or reservation.get("item_id") in item_ids
     }
 
     for item_id in item_ids:
@@ -255,7 +276,9 @@ def cleanup_test_artifacts(
     }
 
 
-def publish_item(item_id: str, *, idempotency_key: Optional[str] = None) -> dict[str, Any]:
+def publish_item(
+    item_id: str, *, idempotency_key: Optional[str] = None
+) -> dict[str, Any]:
     state = load_state()
     idem = _idempotency_key(f"seller.items.publish.{item_id}", idempotency_key)
     if idem and idem in state.idempotency:
@@ -263,15 +286,26 @@ def publish_item(item_id: str, *, idempotency_key: Optional[str] = None) -> dict
     item = state.items.get(item_id)
     if not item:
         raise KeyError(f"Unknown item: {item_id}")
-    published = {**item, "status": "published", "version": int(item["version"]) + 1, "updated_at": _utcnow()}
+    published = {
+        **item,
+        "status": "published",
+        "version": int(item["version"]) + 1,
+        "updated_at": _utcnow(),
+    }
     state.items[item_id] = published
-    response = {"item": published, "inventory": state.inventory.get(item_id, 0), "message_id": _new_id("msg")}
+    response = {
+        "item": published,
+        "inventory": state.inventory.get(item_id, 0),
+        "message_id": _new_id("msg"),
+    }
     _remember(state, idem, response)
     save_state(state)
     return response
 
 
-def archive_item(item_id: str, *, idempotency_key: Optional[str] = None) -> dict[str, Any]:
+def archive_item(
+    item_id: str, *, idempotency_key: Optional[str] = None
+) -> dict[str, Any]:
     state = load_state()
     idem = _idempotency_key(f"seller.items.archive.{item_id}", idempotency_key)
     if idem and idem in state.idempotency:
@@ -279,15 +313,26 @@ def archive_item(item_id: str, *, idempotency_key: Optional[str] = None) -> dict
     item = state.items.get(item_id)
     if not item:
         raise KeyError(f"Unknown item: {item_id}")
-    archived = {**item, "status": "archived", "version": int(item["version"]) + 1, "updated_at": _utcnow()}
+    archived = {
+        **item,
+        "status": "archived",
+        "version": int(item["version"]) + 1,
+        "updated_at": _utcnow(),
+    }
     state.items[item_id] = archived
-    response = {"item": archived, "inventory": state.inventory.get(item_id, 0), "message_id": _new_id("msg")}
+    response = {
+        "item": archived,
+        "inventory": state.inventory.get(item_id, 0),
+        "message_id": _new_id("msg"),
+    }
     _remember(state, idem, response)
     save_state(state)
     return response
 
 
-_BROWSE_SEARCH_TERMS = frozenset({"all", "food", "foods", "groceries", "grocery", "products"})
+_BROWSE_SEARCH_TERMS = frozenset(
+    {"all", "food", "foods", "groceries", "grocery", "products"}
+)
 _SEARCH_STOP = frozenset(
     {
         "the",
@@ -347,6 +392,7 @@ def item_matches_search_query(item: dict[str, Any], query: str) -> bool:
 
 def search_items(query: Optional[str] = None) -> dict[str, Any]:
     state = load_state()
+
     # Buyer results require a customer-safe seller identity. Internal principals
     # are authorization identifiers, not merchant names, and must not leak into
     # the offer grid. Domain/provider ids remain valid display fallbacks.
@@ -364,7 +410,8 @@ def search_items(query: Optional[str] = None) -> dict[str, Any]:
     rows = [
         {
             **item,
-            "delivery_estimate": item.get("delivery_estimate") or DEFAULT_DELIVERY_ESTIMATE,
+            "delivery_estimate": item.get("delivery_estimate")
+            or DEFAULT_DELIVERY_ESTIMATE,
             "return_policy": item.get("return_policy") or DEFAULT_RETURN_POLICY,
             "inventory": state.inventory.get(item_id, 0),
         }
@@ -396,7 +443,9 @@ def list_seller_items(seller_id: str) -> dict[str, Any]:
     return {"items": rows, "count": len(rows)}
 
 
-def create_order(payload: dict[str, Any], *, idempotency_key: Optional[str] = None) -> dict[str, Any]:
+def create_order(
+    payload: dict[str, Any], *, idempotency_key: Optional[str] = None
+) -> dict[str, Any]:
     state = load_state()
     idem = _idempotency_key("buyer.orders.create", idempotency_key)
     if idem and idem in state.idempotency:
@@ -423,7 +472,9 @@ def create_order(payload: dict[str, Any], *, idempotency_key: Optional[str] = No
             "order_id": order_id,
             "transaction_id": transaction_id,
             "message_id": _new_id("msg"),
-            "buyer_id": payload.get("buyer_id") or payload.get("wallet_address") or "buyer",
+            "buyer_id": payload.get("buyer_id")
+            or payload.get("wallet_address")
+            or "buyer",
             "seller_id": payload.get("seller_id") or "seller",
             "seller_name": payload.get("seller_name") or payload.get("provider_name"),
             "item_id": item_id or "local-cart",
@@ -439,7 +490,11 @@ def create_order(payload: dict[str, Any], *, idempotency_key: Optional[str] = No
             "updated_at": _utcnow(),
         }
         state.orders[order_id] = order
-        response = {"order": order, "transaction_id": transaction_id, "message_id": order["message_id"]}
+        response = {
+            "order": order,
+            "transaction_id": transaction_id,
+            "message_id": order["message_id"],
+        }
         _remember(state, idem, response)
         save_state(state)
         return response
@@ -488,13 +543,19 @@ def create_order(payload: dict[str, Any], *, idempotency_key: Optional[str] = No
         "updated_at": _utcnow(),
     }
     state.orders[order_id] = order
-    response = {"order": order, "transaction_id": transaction_id, "message_id": order["message_id"]}
+    response = {
+        "order": order,
+        "transaction_id": transaction_id,
+        "message_id": order["message_id"],
+    }
     _remember(state, idem, response)
     save_state(state)
     return response
 
 
-def record_order_authorization(order_id: str, authorization: dict[str, Any]) -> dict[str, Any]:
+def record_order_authorization(
+    order_id: str, authorization: dict[str, Any]
+) -> dict[str, Any]:
     """Attach the completed AgentGuard decision to the durable commerce order."""
     state = load_state()
     order = state.orders.get(order_id)
@@ -512,7 +573,10 @@ def record_order_authorization(order_id: str, authorization: dict[str, Any]) -> 
     # pre-authorization snapshot retained when inventory was first reserved.
     for response in state.idempotency.values():
         response_order = response.get("order") if isinstance(response, dict) else None
-        if isinstance(response_order, dict) and response_order.get("order_id") == order_id:
+        if (
+            isinstance(response_order, dict)
+            and response_order.get("order_id") == order_id
+        ):
             response["order"] = updated
 
     save_state(state)
@@ -543,31 +607,60 @@ def list_buyer_orders(buyer_id: Optional[str] = None) -> dict[str, Any]:
     return {"orders": orders, "count": len(orders)}
 
 
-def transition_order(order_id: str, status: str, *, idempotency_key: Optional[str] = None) -> dict[str, Any]:
+def transition_order(
+    order_id: str,
+    status: str,
+    *,
+    idempotency_key: Optional[str] = None,
+    payload: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     state = load_state()
-    idem = _idempotency_key(f"seller.orders.transition.{order_id}.{status}", idempotency_key)
+    idem = _idempotency_key(
+        f"seller.orders.transition.{order_id}.{status}", idempotency_key
+    )
     if idem and idem in state.idempotency:
         return state.idempotency[idem]
     order = state.orders.get(order_id)
     if not order:
         raise KeyError(f"Unknown order: {order_id}")
-    if status == "accepted":
+    if status in {"accepted", "confirmed"}:
         address = order.get("delivery_address") or {}
         required = ("name", "phone", "line1", "city", "state", "postalCode", "country")
-        missing = [field for field in required if not str(address.get(field) or "").strip()]
+        missing = [
+            field for field in required if not str(address.get(field) or "").strip()
+        ]
         if missing:
-            raise ValueError("Delivery details are incomplete; the order cannot be accepted.")
-    current_status = "payment_unknown" if order["status"] == "unknown" else order["status"]
+            raise ValueError(
+                "Delivery details are incomplete; the order cannot be accepted."
+            )
+    current_status = (
+        "payment_unknown" if order["status"] == "unknown" else order["status"]
+    )
     next_version = require_transition(
         "order",
         current_status,
         status,
         current_version=int(order.get("version") or 1),
     )
+    fulfilment = dict(order.get("fulfilment") or {})
+    if payload:
+        history = list(fulfilment.get("history") or [])
+        event = {"status": status, "recorded_at": _utcnow()}
+        if payload.get("tracking_id"):
+            fulfilment["tracking_id"] = str(payload["tracking_id"])
+            event["tracking_id"] = str(payload["tracking_id"])
+        if payload.get("provider_name"):
+            fulfilment["provider_name"] = str(payload["provider_name"])
+        if payload.get("status_message"):
+            fulfilment["status_message"] = str(payload["status_message"])
+            event["status_message"] = str(payload["status_message"])
+        fulfilment["status"] = status
+        fulfilment["history"] = [*history, event]
     updated = {
         **order,
         "status": status,
         "version": next_version,
+        "fulfilment": fulfilment,
         "updated_at": _utcnow(),
     }
     state.orders[order_id] = updated
@@ -577,7 +670,62 @@ def transition_order(order_id: str, status: str, *, idempotency_key: Optional[st
     return response
 
 
-def create_issue(order_id: str, payload: dict[str, Any], *, idempotency_key: Optional[str] = None) -> dict[str, Any]:
+def create_return(
+    order_id: str,
+    payload: dict[str, Any],
+    *,
+    idempotency_key: Optional[str] = None,
+) -> dict[str, Any]:
+    state = load_state()
+    idem = _idempotency_key(f"buyer.returns.create.{order_id}", idempotency_key)
+    if idem and idem in state.idempotency:
+        return state.idempotency[idem]
+    order = state.orders.get(order_id)
+    if not order:
+        raise KeyError(f"Unknown order: {order_id}")
+    if order["status"] not in {"delivered", "closed", "fulfilled"}:
+        raise ValueError("return requires a completed delivery")
+    if any(item.get("order_id") == order_id for item in state.returns.values()):
+        raise ValueError("return already requested for this order")
+    return_id = _new_id("return")
+    record = {
+        "return_id": return_id,
+        "order_id": order_id,
+        "principal_id": order["buyer_id"],
+        "seller_id": order["seller_id"],
+        "status": "requested",
+        "version": 1,
+        "reason": payload.get("reason") or "Buyer requested return",
+        "resolution": None,
+        "created_at": _utcnow(),
+        "updated_at": _utcnow(),
+    }
+    state.returns[return_id] = record
+    response = {"return": record}
+    _remember(state, idem, response)
+    save_state(state)
+    return response
+
+
+def list_returns(
+    *,
+    principal_id: Optional[str] = None,
+    seller_id: Optional[str] = None,
+    order_id: Optional[str] = None,
+) -> dict[str, Any]:
+    rows = list(load_state().returns.values())
+    if principal_id:
+        rows = [row for row in rows if row.get("principal_id") == principal_id]
+    if seller_id:
+        rows = [row for row in rows if row.get("seller_id") == seller_id]
+    if order_id:
+        rows = [row for row in rows if row.get("order_id") == order_id]
+    return {"returns": rows, "count": len(rows)}
+
+
+def create_issue(
+    order_id: str, payload: dict[str, Any], *, idempotency_key: Optional[str] = None
+) -> dict[str, Any]:
     state = load_state()
     idem = _idempotency_key(f"buyer.issues.create.{order_id}", idempotency_key)
     if idem and idem in state.idempotency:
@@ -639,7 +787,9 @@ def respond_issue(issue_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {"issue": updated, "message_id": _new_id("msg")}
 
 
-def propose_remedy(issue_id: str, payload: dict[str, Any], *, idempotency_key: Optional[str] = None) -> dict[str, Any]:
+def propose_remedy(
+    issue_id: str, payload: dict[str, Any], *, idempotency_key: Optional[str] = None
+) -> dict[str, Any]:
     state = load_state()
     idem = _idempotency_key(f"seller.issues.remedy.{issue_id}", idempotency_key)
     if idem and idem in state.idempotency:
@@ -687,7 +837,9 @@ def propose_remedy(issue_id: str, payload: dict[str, Any], *, idempotency_key: O
     return response
 
 
-def accept_remedy(remedy_id: str, *, idempotency_key: Optional[str] = None) -> dict[str, Any]:
+def accept_remedy(
+    remedy_id: str, *, idempotency_key: Optional[str] = None
+) -> dict[str, Any]:
     state = load_state()
     idem = _idempotency_key(f"buyer.remedies.accept.{remedy_id}", idempotency_key)
     if idem and idem in state.idempotency:
@@ -696,7 +848,9 @@ def accept_remedy(remedy_id: str, *, idempotency_key: Optional[str] = None) -> d
     if not remedy:
         raise KeyError(f"Unknown remedy: {remedy_id}")
     if remedy.get("status") != "promised":
-        raise ValueError(f"Invalid remedy transition {remedy.get('status')} -> accepted")
+        raise ValueError(
+            f"Invalid remedy transition {remedy.get('status')} -> accepted"
+        )
     issue_id = str(remedy.get("issue_id") or "")
     issue = state.issues.get(issue_id)
     if not issue:
@@ -721,7 +875,11 @@ def accept_remedy(remedy_id: str, *, idempotency_key: Optional[str] = None) -> d
         "version": closed_version,
         "updated_at": _utcnow(),
     }
-    response = {"remedy": accepted, "issue": state.issues[issue_id], "message_id": _new_id("msg")}
+    response = {
+        "remedy": accepted,
+        "issue": state.issues[issue_id],
+        "message_id": _new_id("msg"),
+    }
     _remember(state, idem, response)
     save_state(state)
     return response
@@ -736,7 +894,9 @@ def _require_item_owner(item_id: str, principal_id: str) -> dict[str, Any]:
     return item
 
 
-def _require_order_owner(order_id: str, principal_id: str, owner_field: str) -> dict[str, Any]:
+def _require_order_owner(
+    order_id: str, principal_id: str, owner_field: str
+) -> dict[str, Any]:
     order = load_state().orders.get(order_id)
     if not order:
         raise KeyError(f"Unknown order: {order_id}")
@@ -774,7 +934,9 @@ def _require_remedy_buyer(remedy_id: str, principal_id: str) -> dict[str, Any]:
     return remedy
 
 
-def _require_bound_resource(payload: dict[str, Any], field: str, resource_id: str) -> str:
+def _require_bound_resource(
+    payload: dict[str, Any], field: str, resource_id: str
+) -> str:
     target_id = str(payload.get(field) or "")
     if not target_id:
         raise ValueError(f"{field} is required.")
@@ -793,7 +955,9 @@ def publish_item_from_payload(
     item_id = payload.get("item_id")
     effective_payload = {**payload, "seller_id": principal_id}
     if not item_id:
-        created = create_item(effective_payload, idempotency_key=f"{idempotency_key}:create")
+        created = create_item(
+            effective_payload, idempotency_key=f"{idempotency_key}:create"
+        )
         item_id = created["item"]["item_id"]
     else:
         item_id = str(item_id)
@@ -835,7 +999,9 @@ def create_order_from_payload(
     principal_id: str,
     idempotency_key: str,
 ) -> dict[str, Any]:
-    return create_order({**payload, "buyer_id": principal_id}, idempotency_key=idempotency_key)
+    return create_order(
+        {**payload, "buyer_id": principal_id}, idempotency_key=idempotency_key
+    )
 
 
 def transition_order_from_payload(
@@ -847,13 +1013,15 @@ def transition_order_from_payload(
     idempotency_key: str,
 ) -> dict[str, Any]:
     status = {
-        "seller.order.accept": "accepted",
+        "seller.order.accept": "confirmed",
         "seller.order.reject": "rejected",
-        "seller.fulfilment.commit": "fulfilled",
+        "seller.fulfilment.commit": str(payload.get("status") or "shipped"),
     }[action]
     order_id = _require_bound_resource(payload, "order_id", resource_id)
     _require_order_owner(order_id, principal_id, "seller_id")
-    return transition_order(order_id, status, idempotency_key=idempotency_key)
+    return transition_order(
+        order_id, status, idempotency_key=idempotency_key, payload=payload
+    )
 
 
 def issue_from_payload(
@@ -868,7 +1036,7 @@ def issue_from_payload(
     _require_order_owner(order_id, principal_id, "buyer_id")
     if action == "buyer.order.cancel":
         return transition_order(order_id, "cancelled", idempotency_key=idempotency_key)
-    return create_issue(order_id, payload, idempotency_key=idempotency_key)
+    return create_return(order_id, payload, idempotency_key=idempotency_key)
 
 
 def accept_remedy_from_payload(
@@ -878,7 +1046,16 @@ def accept_remedy_from_payload(
     resource_id: str,
     idempotency_key: str,
 ) -> dict[str, Any]:
-    remedy_id = _require_bound_resource(payload, "remedy_id", resource_id)
+    if payload.get("issue_id"):
+        issue_id = _require_bound_resource(payload, "issue_id", resource_id)
+        issue = load_state().issues.get(issue_id)
+        if not issue:
+            raise KeyError(f"Unknown issue: {issue_id}")
+        remedy_id = str(issue.get("remedy_id") or payload.get("remedy_id") or "")
+        if not remedy_id:
+            raise ValueError("Issue has no proposed remedy.")
+    else:
+        remedy_id = _require_bound_resource(payload, "remedy_id", resource_id)
     _require_remedy_buyer(remedy_id, principal_id)
     return accept_remedy(remedy_id, idempotency_key=idempotency_key)
 
@@ -931,9 +1108,13 @@ def refund_from_payload(
     new_refunded_amount = refunded_amount + amount_inr
     updated_order = {
         **order,
-        "status": "cancelled" if new_refunded_amount == int(order["amount_inr"]) else order["status"],
+        "status": "cancelled"
+        if new_refunded_amount == int(order["amount_inr"])
+        else order["status"],
         "refunded_amount_inr": new_refunded_amount,
-        "refund_status": "refunded" if new_refunded_amount == int(order["amount_inr"]) else "partially_refunded",
+        "refund_status": "refunded"
+        if new_refunded_amount == int(order["amount_inr"])
+        else "partially_refunded",
         "last_refund": refund,
         "updated_at": _utcnow(),
     }

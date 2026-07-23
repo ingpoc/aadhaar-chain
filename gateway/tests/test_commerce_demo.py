@@ -1,4 +1,5 @@
 """Local commerce exchange tests."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,9 +12,12 @@ from main import app
 from app import agentguard_routes
 from app.session_auth import SESSION_COOKIE_NAME, create_principal_session_token
 from app.commerce_demo import (
+    accept_remedy_from_payload,
     archive_item_from_payload,
+    create_issue,
     create_item,
     load_state,
+    propose_remedy,
     publish_item,
     publish_item_from_payload,
     search_items,
@@ -32,18 +36,76 @@ def _isolate_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 @pytest.mark.parametrize(
     ("method", "registered_path", "request_path", "payload"),
     [
-        ("POST", "/api/demo-commerce/seller/items", "/api/demo-commerce/seller/items", {"title": "Bypass item", "price_inr": 1}),
-        ("PATCH", "/api/demo-commerce/seller/items/{item_id}", "/api/demo-commerce/seller/items/item_missing", {"title": "Bypass update"}),
-        ("POST", "/api/demo-commerce/seller/items/{item_id}/publish", "/api/demo-commerce/seller/items/item_missing/publish", {}),
-        ("POST", "/api/demo-commerce/buyer/orders", "/api/demo-commerce/buyer/orders", {"item_id": "item_missing", "quantity": 1}),
-        ("POST", "/api/demo-commerce/seller/orders/{order_id}/transition", "/api/demo-commerce/seller/orders/order_missing/transition", {"status": "accepted"}),
-        ("POST", "/api/demo-commerce/buyer/orders/{order_id}/issues", "/api/demo-commerce/buyer/orders/order_missing/issues", {"reason": "Bypass issue"}),
-        ("POST", "/api/demo-commerce/seller/issues/{issue_id}/respond", "/api/demo-commerce/seller/issues/issue_missing/respond", {"response": "Bypass"}),
-        ("POST", "/api/demo-commerce/seller/issues/{issue_id}/remedy", "/api/demo-commerce/seller/issues/issue_missing/remedy", {"data": {"amount_inr": 1}}),
-        ("POST", "/api/ondc/bpp/ensure-catalog-item", "/api/ondc/bpp/ensure-catalog-item", {}),
-        ("POST", "/api/commerce-integrations/payments/intents", "/api/commerce-integrations/payments/intents", {"amount_inr": 1, "order_id": "order_missing", "agentguard_receipt_id": "receipt_unverified"}),
-        ("POST", "/api/commerce-integrations/logistics/transitions", "/api/commerce-integrations/logistics/transitions", {"order_id": "order_missing", "to_state": "fulfilled"}),
-        ("POST", "/api/commerce-integrations/igm/issues", "/api/commerce-integrations/igm/issues", {"order_id": "order_missing", "description": "Bypass issue"}),
+        (
+            "POST",
+            "/api/demo-commerce/seller/items",
+            "/api/demo-commerce/seller/items",
+            {"title": "Bypass item", "price_inr": 1},
+        ),
+        (
+            "PATCH",
+            "/api/demo-commerce/seller/items/{item_id}",
+            "/api/demo-commerce/seller/items/item_missing",
+            {"title": "Bypass update"},
+        ),
+        (
+            "POST",
+            "/api/demo-commerce/seller/items/{item_id}/publish",
+            "/api/demo-commerce/seller/items/item_missing/publish",
+            {},
+        ),
+        (
+            "POST",
+            "/api/demo-commerce/buyer/orders",
+            "/api/demo-commerce/buyer/orders",
+            {"item_id": "item_missing", "quantity": 1},
+        ),
+        (
+            "POST",
+            "/api/demo-commerce/seller/orders/{order_id}/transition",
+            "/api/demo-commerce/seller/orders/order_missing/transition",
+            {"status": "accepted"},
+        ),
+        (
+            "POST",
+            "/api/demo-commerce/seller/issues/{issue_id}/respond",
+            "/api/demo-commerce/seller/issues/issue_missing/respond",
+            {"response": "Bypass"},
+        ),
+        (
+            "POST",
+            "/api/demo-commerce/seller/issues/{issue_id}/remedy",
+            "/api/demo-commerce/seller/issues/issue_missing/remedy",
+            {"data": {"amount_inr": 1}},
+        ),
+        (
+            "POST",
+            "/api/ondc/bpp/ensure-catalog-item",
+            "/api/ondc/bpp/ensure-catalog-item",
+            {},
+        ),
+        (
+            "POST",
+            "/api/commerce-integrations/payments/intents",
+            "/api/commerce-integrations/payments/intents",
+            {
+                "amount_inr": 1,
+                "order_id": "order_missing",
+                "agentguard_receipt_id": "receipt_unverified",
+            },
+        ),
+        (
+            "POST",
+            "/api/commerce-integrations/logistics/transitions",
+            "/api/commerce-integrations/logistics/transitions",
+            {"order_id": "order_missing", "to_state": "fulfilled"},
+        ),
+        (
+            "POST",
+            "/api/commerce-integrations/igm/issues",
+            "/api/commerce-integrations/igm/issues",
+            {"order_id": "order_missing", "description": "Bypass issue"},
+        ),
     ],
 )
 def test_public_mutation_routes_cannot_bypass_agentguard(
@@ -81,7 +143,9 @@ def test_fixture_mutations_are_hidden_outside_demo_runtime(
     assert load_state().items == {}
 
 
-def _signed_in_client(audience: str, principal_id: str | None = None) -> tuple[TestClient, str]:
+def _signed_in_client(
+    audience: str, principal_id: str | None = None
+) -> tuple[TestClient, str]:
     client = TestClient(app)
     if principal_id:
         token = create_principal_session_token(
@@ -96,6 +160,38 @@ def _signed_in_client(audience: str, principal_id: str | None = None) -> tuple[T
     return client, str(login.json()["data"]["principal_id"])
 
 
+def test_buyer_issue_creation_requires_the_authenticated_order_owner() -> None:
+    buyer, buyer_id = _signed_in_client("ondcbuyer")
+    other_buyer, _ = _signed_in_client(
+        "ondcbuyer", "principal:auth0:foreign-issue-buyer"
+    )
+    fixtures = TestClient(app)
+    item = fixtures.post(
+        "/api/demo-commerce/test-fixtures/seller/items",
+        json={"title": "Issue ownership item", "price_inr": 50, "inventory": 1},
+    ).json()["data"]["item"]
+    fixtures.post(
+        f"/api/demo-commerce/test-fixtures/seller/items/{item['item_id']}/publish"
+    )
+    order = fixtures.post(
+        "/api/demo-commerce/test-fixtures/buyer/orders",
+        json={"item_id": item["item_id"], "quantity": 1, "buyer_id": buyer_id},
+    ).json()["data"]["order"]
+    path = f"/api/demo-commerce/buyer/orders/{order['order_id']}/issues"
+
+    unauthenticated = fixtures.post(path, json={"reason": "No session"})
+    foreign = other_buyer.post(path, json={"reason": "Foreign order"})
+    owned = buyer.post(
+        path,
+        json={"reason": "fulfillment", "description": "Package has not moved"},
+    )
+
+    assert unauthenticated.status_code == 401
+    assert foreign.status_code == 404
+    assert owned.status_code == 200
+    assert owned.json()["data"]["issue"]["reason"] == "fulfillment"
+
+
 def test_commerce_reads_are_session_scoped_by_audience_and_principal() -> None:
     seller, seller_id = _signed_in_client("ondcseller")
     other_seller, _ = _signed_in_client("ondcseller", "principal:auth0:other-seller")
@@ -105,14 +201,28 @@ def test_commerce_reads_are_session_scoped_by_audience_and_principal() -> None:
 
     item = fixtures.post(
         "/api/demo-commerce/test-fixtures/seller/items",
-        json={"title": "Scoped item", "price_inr": 50, "inventory": 2, "seller_id": seller_id},
+        json={
+            "title": "Scoped item",
+            "price_inr": 50,
+            "inventory": 2,
+            "seller_id": seller_id,
+        },
     ).json()["data"]["item"]
-    fixtures.post(f"/api/demo-commerce/test-fixtures/seller/items/{item['item_id']}/publish")
+    fixtures.post(
+        f"/api/demo-commerce/test-fixtures/seller/items/{item['item_id']}/publish"
+    )
     other_item = fixtures.post(
         "/api/demo-commerce/test-fixtures/seller/items",
-        json={"title": "Other item", "price_inr": 60, "inventory": 3, "seller_id": "another-seller"},
+        json={
+            "title": "Other item",
+            "price_inr": 60,
+            "inventory": 3,
+            "seller_id": "another-seller",
+        },
     ).json()["data"]["item"]
-    fixtures.post(f"/api/demo-commerce/test-fixtures/seller/items/{other_item['item_id']}/publish")
+    fixtures.post(
+        f"/api/demo-commerce/test-fixtures/seller/items/{other_item['item_id']}/publish"
+    )
     order = fixtures.post(
         "/api/demo-commerce/test-fixtures/buyer/orders",
         json={"item_id": item["item_id"], "quantity": 1, "buyer_id": buyer_id},
@@ -123,32 +233,70 @@ def test_commerce_reads_are_session_scoped_by_audience_and_principal() -> None:
     )
 
     assert buyer.get("/api/demo-commerce/buyer/orders").json()["data"]["count"] == 1
-    assert other_buyer.get(
-        "/api/demo-commerce/buyer/orders",
-        params={"buyer_id": buyer_id},
-    ).json()["data"]["count"] == 0
-    assert buyer.get(f"/api/demo-commerce/buyer/orders/{order['order_id']}").status_code == 200
-    assert other_buyer.get(f"/api/demo-commerce/buyer/orders/{order['order_id']}").status_code == 404
+    assert (
+        other_buyer.get(
+            "/api/demo-commerce/buyer/orders",
+            params={"buyer_id": buyer_id},
+        ).json()["data"]["count"]
+        == 0
+    )
+    assert (
+        buyer.get(f"/api/demo-commerce/buyer/orders/{order['order_id']}").status_code
+        == 200
+    )
+    assert (
+        other_buyer.get(
+            f"/api/demo-commerce/buyer/orders/{order['order_id']}"
+        ).status_code
+        == 404
+    )
 
     assert seller.get("/api/demo-commerce/seller/orders").json()["data"]["count"] == 1
-    assert other_seller.get("/api/demo-commerce/seller/orders").json()["data"]["count"] == 0
-    assert seller.get(f"/api/demo-commerce/seller/orders/{order['order_id']}").status_code == 200
-    assert other_seller.get(f"/api/demo-commerce/seller/orders/{order['order_id']}").status_code == 404
+    assert (
+        other_seller.get("/api/demo-commerce/seller/orders").json()["data"]["count"]
+        == 0
+    )
+    assert (
+        seller.get(f"/api/demo-commerce/seller/orders/{order['order_id']}").status_code
+        == 200
+    )
+    assert (
+        other_seller.get(
+            f"/api/demo-commerce/seller/orders/{order['order_id']}"
+        ).status_code
+        == 404
+    )
 
     seller_items = seller.get("/api/demo-commerce/seller/items").json()["data"]
     assert seller_items["count"] == 1
     assert seller_items["items"][0]["item_id"] == item["item_id"]
-    assert seller.get(f"/api/demo-commerce/seller/items/{item['item_id']}").status_code == 200
-    assert other_seller.get(f"/api/demo-commerce/seller/items/{item['item_id']}").status_code == 404
+    assert (
+        seller.get(f"/api/demo-commerce/seller/items/{item['item_id']}").status_code
+        == 200
+    )
+    assert (
+        other_seller.get(
+            f"/api/demo-commerce/seller/items/{item['item_id']}"
+        ).status_code
+        == 404
+    )
 
     assert buyer.get("/api/demo-commerce/buyer/issues").json()["data"]["count"] == 1
-    assert other_buyer.get("/api/demo-commerce/buyer/issues").json()["data"]["count"] == 0
-    assert other_buyer.get(
-        "/api/demo-commerce/buyer/issues",
-        params={"order_id": order["order_id"]},
-    ).status_code == 404
+    assert (
+        other_buyer.get("/api/demo-commerce/buyer/issues").json()["data"]["count"] == 0
+    )
+    assert (
+        other_buyer.get(
+            "/api/demo-commerce/buyer/issues",
+            params={"order_id": order["order_id"]},
+        ).status_code
+        == 404
+    )
     assert seller.get("/api/demo-commerce/seller/issues").json()["data"]["count"] == 1
-    assert other_seller.get("/api/demo-commerce/seller/issues").json()["data"]["count"] == 0
+    assert (
+        other_seller.get("/api/demo-commerce/seller/issues").json()["data"]["count"]
+        == 0
+    )
 
     assert buyer.get("/api/demo-commerce/seller/orders").status_code == 403
     assert seller.get("/api/demo-commerce/buyer/orders").status_code == 403
@@ -202,11 +350,18 @@ def test_publish_search_order_and_idempotency() -> None:
             "country": "IND",
         },
     }
-    order = client.post("/api/demo-commerce/test-fixtures/buyer/orders", json=order_payload)
-    duplicate = client.post("/api/demo-commerce/test-fixtures/buyer/orders", json=order_payload)
+    order = client.post(
+        "/api/demo-commerce/test-fixtures/buyer/orders", json=order_payload
+    )
+    duplicate = client.post(
+        "/api/demo-commerce/test-fixtures/buyer/orders", json=order_payload
+    )
     assert order.status_code == 200
     assert duplicate.status_code == 200
-    assert duplicate.json()["data"]["order"]["order_id"] == order.json()["data"]["order"]["order_id"]
+    assert (
+        duplicate.json()["data"]["order"]["order_id"]
+        == order.json()["data"]["order"]["order_id"]
+    )
     assert order.json()["data"]["order"]["item_title"] == "Token Nxt demo product"
     assert order.json()["data"]["order"]["delivery_address"]["city"] == "Pune"
     state_after_order = load_state()
@@ -217,14 +372,23 @@ def test_publish_search_order_and_idempotency() -> None:
     assert reservation["quantity"] == 2
     assert state_after_order.inventory[item_id] == 2
 
-    seller_orders = client.get("/api/demo-commerce/test-fixtures/seller/orders", params={"seller_id": "seller-demo"})
+    seller_orders = client.get(
+        "/api/demo-commerce/test-fixtures/seller/orders",
+        params={"seller_id": "seller-demo"},
+    )
     assert seller_orders.status_code == 200
     assert seller_orders.json()["data"]["count"] == 1
     assert seller_orders.json()["data"]["orders"][0]["buyer_id"] == "buyer-demo"
 
-    buyer_orders = client.get("/api/demo-commerce/test-fixtures/buyer/orders", params={"buyer_id": "buyer-demo"})
+    buyer_orders = client.get(
+        "/api/demo-commerce/test-fixtures/buyer/orders",
+        params={"buyer_id": "buyer-demo"},
+    )
     assert buyer_orders.status_code == 200
-    assert buyer_orders.json()["data"]["orders"][0]["order_id"] == order.json()["data"]["order"]["order_id"]
+    assert (
+        buyer_orders.json()["data"]["orders"][0]["order_id"]
+        == order.json()["data"]["order"]["order_id"]
+    )
 
     issue = client.post(
         f"/api/demo-commerce/test-fixtures/buyer/orders/{order.json()['data']['order']['order_id']}/issues",
@@ -236,7 +400,10 @@ def test_publish_search_order_and_idempotency() -> None:
         params={"order_id": order.json()["data"]["order"]["order_id"]},
     )
     assert buyer_issues.status_code == 200
-    assert buyer_issues.json()["data"]["issues"][0]["issue_id"] == issue.json()["data"]["issue"]["issue_id"]
+    assert (
+        buyer_issues.json()["data"]["issues"][0]["issue_id"]
+        == issue.json()["data"]["issue"]["issue_id"]
+    )
 
 
 def test_buyer_search_excludes_offer_without_customer_safe_seller_name() -> None:
@@ -266,7 +433,11 @@ def test_buyer_search_supplies_safe_fallback_commerce_terms() -> None:
     )
     publish_item(created["item"]["item_id"])
 
-    row = next(item for item in search_items("atta")["items"] if item["title"] == "Sampoorna Atta 1kg")
+    row = next(
+        item
+        for item in search_items("atta")["items"]
+        if item["title"] == "Sampoorna Atta 1kg"
+    )
     assert row["delivery_estimate"] == "Delivery timing confirmed at checkout"
     assert row["return_policy"] == "Return eligibility confirmed before order placement"
 
@@ -327,7 +498,10 @@ def test_buyer_search_relevance_rejects_unrelated_titles() -> None:
     assert search_items("tv")["count"] == 1
     assert search_items("tv")["items"][0]["title"].startswith("Horizon LED TV")
     assert search_items("oil")["count"] >= 1
-    assert all("oil" in str(row.get("title", "")).lower() for row in search_items("oil")["items"])
+    assert all(
+        "oil" in str(row.get("title", "")).lower()
+        for row in search_items("oil")["items"]
+    )
     assert search_items("television-remote-xyz")["count"] == 0
 
 
@@ -381,7 +555,9 @@ def test_sold_out_item_is_not_returned_to_buyer_search() -> None:
     )
     assert order.status_code == 200
 
-    search = client.get("/api/demo-commerce/buyer/search", params={"q": "Last Pack Atta"})
+    search = client.get(
+        "/api/demo-commerce/buyer/search", params={"q": "Last Pack Atta"}
+    )
     assert search.status_code == 200
     assert search.json()["data"] == {"items": [], "count": 0}
 
@@ -414,9 +590,16 @@ def test_seller_fulfilment_and_remedy_reach_buyer_state() -> None:
     client = TestClient(app)
     item = client.post(
         "/api/demo-commerce/test-fixtures/seller/items",
-        json={"title": "Lifecycle Atta", "price_inr": 120, "inventory": 3, "seller_id": "seller-lifecycle"},
+        json={
+            "title": "Lifecycle Atta",
+            "price_inr": 120,
+            "inventory": 3,
+            "seller_id": "seller-lifecycle",
+        },
     ).json()["data"]["item"]
-    client.post(f"/api/demo-commerce/test-fixtures/seller/items/{item['item_id']}/publish")
+    client.post(
+        f"/api/demo-commerce/test-fixtures/seller/items/{item['item_id']}/publish"
+    )
     order = client.post(
         "/api/demo-commerce/test-fixtures/buyer/orders",
         json={
@@ -445,7 +628,10 @@ def test_seller_fulfilment_and_remedy_reach_buyer_state() -> None:
         json={"status": "fulfilled", "idempotency_key": "fulfil-lifecycle-1"},
     )
     assert fulfilled.status_code == 200
-    buyer_orders = client.get("/api/demo-commerce/test-fixtures/buyer/orders", params={"buyer_id": "buyer-lifecycle"})
+    buyer_orders = client.get(
+        "/api/demo-commerce/test-fixtures/buyer/orders",
+        params={"buyer_id": "buyer-lifecycle"},
+    )
     assert buyer_orders.json()["data"]["orders"][0]["status"] == "fulfilled"
 
     issue = client.post(
@@ -468,7 +654,10 @@ def test_seller_fulfilment_and_remedy_reach_buyer_state() -> None:
     )
     assert remedy.status_code == 200
 
-    buyer_issue = client.get("/api/demo-commerce/test-fixtures/buyer/issues", params={"order_id": order["order_id"]})
+    buyer_issue = client.get(
+        "/api/demo-commerce/test-fixtures/buyer/issues",
+        params={"order_id": order["order_id"]},
+    )
     visible_issue = buyer_issue.json()["data"]["issues"][0]
     assert visible_issue["status"] == "resolution_proposed"
     assert visible_issue["remedy_id"] == remedy.json()["data"]["remedy"]["remedy_id"]
@@ -478,7 +667,12 @@ def test_seller_fulfilment_and_remedy_reach_buyer_state() -> None:
 
 def test_agentguard_catalog_executor_updates_existing_item_before_publish() -> None:
     created = create_item(
-        {"title": "Draft Atta", "price_inr": 80, "inventory": 2, "seller_id": "seller-a"},
+        {
+            "title": "Draft Atta",
+            "price_inr": 80,
+            "inventory": 2,
+            "seller_id": "seller-a",
+        },
         idempotency_key="draft-create",
     )
     item_id = created["item"]["item_id"]
@@ -509,7 +703,12 @@ def test_agentguard_catalog_executor_updates_existing_item_before_publish() -> N
         idempotency_key="agentguard-archive",
     )
     assert archived["item"]["status"] == "archived"
-    assert TestClient(app).get("/api/demo-commerce/buyer/search", params={"q": "Published Atta"}).json()["data"]["count"] == 0
+    assert (
+        TestClient(app)
+        .get("/api/demo-commerce/buyer/search", params={"q": "Published Atta"})
+        .json()["data"]["count"]
+        == 0
+    )
 
 
 def test_cleanup_removes_only_deterministic_test_artifacts() -> None:
@@ -548,7 +747,9 @@ def test_cleanup_exact_order_restores_real_item_inventory() -> None:
         "/api/demo-commerce/test-fixtures/seller/items",
         json={"title": "Millet Flour", "price_inr": 120, "inventory": 3},
     ).json()["data"]["item"]
-    client.post(f"/api/demo-commerce/test-fixtures/seller/items/{item['item_id']}/publish")
+    client.post(
+        f"/api/demo-commerce/test-fixtures/seller/items/{item['item_id']}/publish"
+    )
     order = client.post(
         "/api/demo-commerce/test-fixtures/buyer/orders",
         json={"item_id": item["item_id"], "quantity": 2},
@@ -626,3 +827,45 @@ def test_cleanup_exact_item_does_not_remove_another_fixture() -> None:
     ids = set(load_state().items)
     assert first["item_id"] not in ids
     assert second["item_id"] in ids
+
+
+def test_buyer_accepts_local_remedy_by_issue_contract() -> None:
+    client = TestClient(app)
+    item = client.post(
+        "/api/demo-commerce/test-fixtures/seller/items",
+        json={
+            "title": "Issue contract item",
+            "price_inr": 149,
+            "inventory": 1,
+            "seller_id": "seller-remedy",
+        },
+    ).json()["data"]["item"]
+    client.post(
+        f"/api/demo-commerce/test-fixtures/seller/items/{item['item_id']}/publish"
+    )
+    order = client.post(
+        "/api/demo-commerce/test-fixtures/buyer/orders",
+        json={
+            "item_id": item["item_id"],
+            "quantity": 1,
+            "buyer_id": "buyer-remedy",
+        },
+    ).json()["data"]["order"]
+    issue = create_issue(
+        order["order_id"],
+        {"reason": "post_delivery", "description": "Damaged package"},
+    )["issue"]
+    propose_remedy(
+        issue["issue_id"],
+        {"type": "replacement", "message": "Replacement approved"},
+    )
+
+    accepted = accept_remedy_from_payload(
+        {"issue_id": issue["issue_id"]},
+        principal_id="buyer-remedy",
+        resource_id=issue["issue_id"],
+        idempotency_key="buyer-remedy:accept",
+    )
+
+    assert accepted["remedy"]["status"] == "accepted"
+    assert accepted["issue"]["status"] == "closed"

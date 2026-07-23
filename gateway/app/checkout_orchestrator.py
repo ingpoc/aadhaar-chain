@@ -7,7 +7,9 @@ from hashlib import sha256
 from typing import Any
 from uuid import UUID, uuid4
 
+from app import agentguard
 from app.agentguard_contract import canonicalize
+from app.commerce_compat import CommerceCompatibilityAdapter
 from app.commerce_v1 import CommerceV1
 from app.persistence.agentguard_repository import (
     AgentGuardConflict,
@@ -41,14 +43,20 @@ def _hash(payload: dict[str, Any]) -> str:
 
 
 class CheckoutOrchestrator:
-    """Own exact checkout authority, intent persistence, and saga resumption."""
+    """Own Buyer authority, intent persistence, and commerce execution."""
 
     operation = "buyer.checkout.commit"
     policy_id = "buyer.checkout.limit"
+    default_actions = sorted(
+        action
+        for action in agentguard.AGENTGUARD_ACTIONS
+        if action.startswith("buyer.")
+    )
 
     def __init__(self, pool: ConnectionPool) -> None:
         self.pool = pool
         self.commerce = CommerceV1(pool)
+        self.compat = CommerceCompatibilityAdapter(pool)
 
     @staticmethod
     def agent_id(principal_id: str) -> str:
@@ -67,7 +75,8 @@ class CheckoutOrchestrator:
         return _jsonable(
             {
                 **mandate,
-                "allowed_actions": payload.get("allowed_actions") or [cls.operation],
+                "allowed_actions": payload.get("allowed_actions")
+                or cls.default_actions,
                 "limits": {
                     "auto_approve_max_inr": {cls.operation: maximum // 100},
                     "max_order_paise": maximum,
@@ -80,7 +89,7 @@ class CheckoutOrchestrator:
         return {
             "policy_id": cls.policy_id,
             "version": 1,
-            "allowed_actions": [cls.operation],
+            "allowed_actions": cls.default_actions,
         }
 
     async def ensure_agent(self, *, principal_id: str) -> dict[str, Any]:
@@ -111,7 +120,11 @@ class CheckoutOrchestrator:
         }
 
     async def compile_mandate(
-        self, *, principal_id: str, limits: dict[str, Any]
+        self,
+        *,
+        principal_id: str,
+        limits: dict[str, Any],
+        allowed_actions: list[str] | None = None,
     ) -> dict[str, Any]:
         max_order_paise = limits.get("max_order_paise")
         if max_order_paise is None:
@@ -124,6 +137,13 @@ class CheckoutOrchestrator:
         max_order_paise = int(max_order_paise)
         if max_order_paise < 0:
             raise ValueError("max order amount must be non-negative")
+        selected_actions = [
+            action
+            for action in (allowed_actions or self.default_actions)
+            if action in self.default_actions
+        ]
+        if self.operation not in selected_actions:
+            selected_actions.insert(0, self.operation)
         agent_id = self.agent_id(principal_id)
         mandate_id = self.mandate_id(principal_id)
         async with UnitOfWork(self.pool) as unit_of_work:
@@ -150,7 +170,7 @@ class CheckoutOrchestrator:
                 principal_id=principal_id,
                 agent_id=agent_id,
                 payload={
-                    "allowed_actions": [self.operation],
+                    "allowed_actions": selected_actions,
                     "max_order_paise": max_order_paise,
                     "currency": "INR",
                 },
@@ -252,6 +272,315 @@ class CheckoutOrchestrator:
         if receipt is None:
             raise AgentGuardNotFound("receipt not found")
         return _jsonable(receipt)
+
+    async def evaluate_protected_action(
+        self,
+        *,
+        principal_id: str,
+        action: str,
+        amount_inr: int,
+        resource_id: str,
+        counterparty_id: str | None,
+        payload: dict[str, Any],
+        correlation_id: str,
+    ) -> dict[str, Any]:
+        normalized = agentguard.normalize_action(action)
+        if normalized is None or not normalized.startswith("buyer."):
+            raise ValueError("unsupported Buyer protected action")
+        if normalized == self.operation:
+            raise ValueError("checkout must be evaluated against a durable quote")
+        async with UnitOfWork(self.pool) as unit_of_work:
+            repository = AgentGuardRepository(unit_of_work)
+            agent = await repository.get_agent(
+                principal_id=principal_id, agent_id=self.agent_id(principal_id)
+            )
+            if agent is None or agent.get("current_mandate_id") is None:
+                raise AgentGuardNotFound("buyer mandate not found")
+            mandate = await repository.get_mandate_version(
+                principal_id=principal_id,
+                mandate_id=agent["current_mandate_id"],
+                version=agent["current_mandate_version"],
+            )
+            if mandate is None:
+                raise AgentGuardNotFound("buyer mandate not found")
+            mandate_payload = mandate.get("payload") or {}
+            allowed_actions = mandate_payload.get("allowed_actions") or []
+            status = "allow"
+            reason_code = "within_policy"
+            human_reason = "Buyer action is within the confirmed mandate."
+            if agent["status"] != "active":
+                status = "deny"
+                reason_code = f"agent_{agent['status']}"
+                human_reason = f"Buyer agent is {agent['status']}."
+            elif normalized not in allowed_actions:
+                status = "deny"
+                reason_code = "action_not_allowed"
+                human_reason = "Buyer action is not in the confirmed mandate."
+            limits = mandate_payload.get("auto_approve_max_inr") or {}
+            threshold = int(limits.get(normalized, 0))
+            requires_approval = status == "allow" and amount_inr > threshold
+            bound_action = {
+                "action": normalized,
+                "amount_inr": amount_inr,
+                "resource_id": resource_id,
+                "counterparty_id": counterparty_id,
+                "payload": payload,
+                "correlation_id": correlation_id,
+            }
+            request_hash = _hash(bound_action)
+            decision_id = f"decision_{uuid4().hex}"
+            expiry = _utcnow() + timedelta(minutes=10)
+            await repository.record_decision(
+                decision_id=decision_id,
+                principal_id=principal_id,
+                agent_id=agent["agent_id"],
+                mandate_id=mandate["mandate_id"],
+                mandate_version=mandate["version"],
+                status=status,
+                policy={"policy_id": self.policy_id, "version": mandate["version"]},
+                risk={"level": "high"},
+                required_action="review" if requires_approval else "none",
+                expiry=expiry,
+                payload={
+                    "request_hash": request_hash,
+                    "bound_action": bound_action,
+                    "reason_code": reason_code,
+                    "human_reason": human_reason,
+                },
+            )
+            approval = None
+            if requires_approval:
+                approval = await repository.issue_approval(
+                    approval_id=f"approval_{uuid4().hex}",
+                    principal_id=principal_id,
+                    decision_id=decision_id,
+                    agent_id=agent["agent_id"],
+                    mandate_id=mandate["mandate_id"],
+                    mandate_version=mandate["version"],
+                    request_hash=request_hash,
+                    expires_at=expiry,
+                    payload={"bound_action": bound_action},
+                )
+        response = {
+            "schema_version": "2",
+            "decision": status,
+            "decision_id": decision_id,
+            "policy_id": self.policy_id,
+            "reason_code": reason_code,
+            "human_reason": human_reason,
+            "reason": human_reason,
+            "required_action": "review" if requires_approval else "none",
+            "risk_level": "high",
+            "policy_version": mandate["version"],
+            "expires_at": expiry.isoformat(),
+            "request_hash": request_hash,
+            "bound_action": bound_action,
+            "agent": _jsonable(agent),
+            "mandate": self._mandate_view(mandate),
+        }
+        if approval is not None:
+            response["approval"] = _jsonable(approval)
+        return response
+
+    async def execute_protected_action(
+        self,
+        *,
+        principal_id: str,
+        decision_id: str | None,
+        approval_id: str | None,
+        action: str,
+        amount_inr: int,
+        resource_id: str,
+        idempotency_key: str,
+        correlation_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized = agentguard.normalize_action(action)
+        if normalized is None or not normalized.startswith("buyer."):
+            raise ValueError("unsupported Buyer protected action")
+        if normalized == self.operation:
+            raise ValueError("checkout must execute against a durable quote")
+        if decision_id is None:
+            evaluated = await self.evaluate_protected_action(
+                principal_id=principal_id,
+                action=normalized,
+                amount_inr=amount_inr,
+                resource_id=resource_id,
+                counterparty_id=None,
+                payload=payload,
+                correlation_id=correlation_id,
+            )
+            decision_id = evaluated["decision_id"]
+            if evaluated.get("approval") is not None and approval_id is None:
+                return evaluated
+        bound_action = {
+            "action": normalized,
+            "amount_inr": amount_inr,
+            "resource_id": resource_id,
+            "counterparty_id": None,
+            "payload": payload,
+            "correlation_id": correlation_id,
+        }
+        request_hash = _hash(bound_action)
+        intent_id = f"intent_{uuid4().hex}"
+        async with UnitOfWork(self.pool) as unit_of_work:
+            repository = AgentGuardRepository(unit_of_work)
+            decision = await repository.get_decision(
+                principal_id=principal_id, decision_id=decision_id
+            )
+            if decision is None:
+                raise AgentGuardNotFound("Buyer decision not found")
+            if decision["status"] != "allow":
+                raise AgentGuardConflict("Buyer decision denied the protected action")
+            if decision.get("expiry") and decision["expiry"] <= _utcnow():
+                raise AgentGuardConflict("Buyer decision expired")
+            if (decision.get("payload") or {}).get("request_hash") != request_hash:
+                raise AgentGuardConflict("Buyer action changed after evaluation")
+            agent = await repository.get_agent(
+                principal_id=principal_id, agent_id=decision["agent_id"]
+            )
+            if agent is None or agent["status"] != "active":
+                raise AgentGuardConflict(
+                    f"Buyer agent is {(agent or {}).get('status', 'missing')}"
+                )
+            if (
+                agent.get("current_mandate_id"),
+                agent.get("current_mandate_version"),
+            ) != (decision["mandate_id"], decision["mandate_version"]):
+                raise AgentGuardConflict("Buyer decision mandate is stale")
+            if approval_id is not None:
+                approval = await repository.get_approval(
+                    principal_id=principal_id, approval_id=approval_id
+                )
+                if approval is None or approval["decision_id"] != decision_id:
+                    raise AgentGuardConflict(
+                        "Buyer approval does not match the decision"
+                    )
+            intent, created = await repository.create_execution_intent(
+                intent_id=intent_id,
+                principal_id=principal_id,
+                operation=normalized,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                decision_id=decision_id,
+                approval_id=approval_id,
+                payload={"bound_action": bound_action},
+                status="pending",
+            )
+            if not created and intent.get("result") is not None:
+                return _jsonable(intent["result"])
+            if decision["required_action"] == "review":
+                if approval_id is None:
+                    raise AgentGuardConflict("exact Buyer approval is required")
+                if created:
+                    await repository.consume_approval(
+                        principal_id=principal_id,
+                        approval_id=approval_id,
+                        request_hash=request_hash,
+                    )
+            await repository.set_execution_intent_status(
+                principal_id=principal_id,
+                intent_id=intent["intent_id"],
+                status="executing",
+            )
+            mandate = await repository.get_mandate_version(
+                principal_id=principal_id,
+                mandate_id=decision["mandate_id"],
+                version=decision["mandate_version"],
+            )
+            if mandate is None:
+                raise AgentGuardConflict("Buyer mandate is unavailable")
+
+        effect = await self._execute_protected_effect(
+            principal_id=principal_id,
+            action=normalized,
+            resource_id=resource_id,
+            payload=payload,
+        )
+        receipt_id = f"receipt_{uuid4().hex}"
+        receipt = sign_receipt(
+            {
+                "schema_version": "2",
+                "receipt_id": receipt_id,
+                "principal_id": principal_id,
+                "action": normalized,
+                "decision_id": decision_id,
+                "approval_id": approval_id,
+                "intent_id": intent["intent_id"],
+                "idempotency_key": idempotency_key,
+                "correlation_id": correlation_id,
+                "bound_action": bound_action,
+                "result": effect,
+                "outcome": "succeeded",
+                "created_at": _utcnow().isoformat(),
+            }
+        )
+        response = {
+            "schema_version": "2",
+            "decision": "allow",
+            "decision_id": decision_id,
+            "policy_id": self.policy_id,
+            "reason_code": "executed",
+            "human_reason": "Buyer action completed and its outcome was verified.",
+            "reason": "Buyer action completed and its outcome was verified.",
+            "required_action": "none",
+            "risk_level": "high",
+            "policy_version": mandate["version"],
+            "result": effect,
+            "receipt": receipt,
+        }
+        async with UnitOfWork(self.pool) as unit_of_work:
+            repository = AgentGuardRepository(unit_of_work)
+            await repository.set_execution_intent_status(
+                principal_id=principal_id,
+                intent_id=intent["intent_id"],
+                status="succeeded",
+                result=response,
+            )
+            await repository.record_receipt(
+                receipt_id=receipt_id,
+                principal_id=principal_id,
+                agent_id=agent["agent_id"],
+                mandate_id=mandate["mandate_id"],
+                mandate_version=mandate["version"],
+                decision_id=decision_id,
+                approval_id=approval_id,
+                intent_id=intent["intent_id"],
+                status="succeeded",
+                payload=receipt,
+            )
+        return response
+
+    async def _execute_protected_effect(
+        self,
+        *,
+        principal_id: str,
+        action: str,
+        resource_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            order = await self.compat.get_order(resource_id, principal_id=principal_id)
+        except KeyError:
+            order = None
+        if action == "buyer.order.cancel":
+            if order is None:
+                raise AgentGuardNotFound("Buyer order not found")
+            return await self.compat.transition_order(
+                resource_id, "cancelled", payload=payload
+            )
+        if action == "buyer.return.submit":
+            if order is None:
+                raise AgentGuardNotFound("Buyer order not found")
+            return await self.compat.create_return(
+                resource_id, principal_id=principal_id, body=payload
+            )
+        if action == "buyer.remedy.accept":
+            issues = await self.compat.list_issues(principal_id=principal_id)
+            if resource_id not in {issue["issue_id"] for issue in issues["issues"]}:
+                raise AgentGuardNotFound("Buyer issue not found")
+            return await self.compat.accept_remedy(resource_id)
+        raise ValueError("unsupported Buyer protected action")
 
     async def _bound_quote(
         self,

@@ -80,6 +80,14 @@ def _record(method: str, path: str, handler: str) -> MutationRecord:
         risk = "high"
         audit = "fixture_domain_row_and_idempotency_record"
         negative = "reject_when_fixture_mode_disabled_or_principal_mismatch"
+    elif path.startswith("/api/demo-commerce/"):
+        policy_family = "commerce_compatibility"
+        owner = "CommerceCompatibilityAdapter"
+        authority = "authenticated_session_principal"
+        action = "buyer_issue_create"
+        risk = "low"
+        audit = "versioned_commerce_issue_row"
+        negative = "reject_unauthenticated_or_foreign_order_principal"
     elif path.startswith("/api/ondc/") or path.startswith("/ondc/"):
         policy_family = "ondc_protocol"
         owner = "ONDC_message_runtime"

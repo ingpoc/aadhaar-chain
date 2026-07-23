@@ -45,7 +45,9 @@ class SellerAgentGuardOrchestrator:
 
     policy_id = "seller.ops.limit"
     default_actions = sorted(
-        action for action in agentguard.AGENTGUARD_ACTIONS if action.startswith("seller.")
+        action
+        for action in agentguard.AGENTGUARD_ACTIONS
+        if action.startswith("seller.")
     )
 
     def __init__(self, pool: ConnectionPool) -> None:
@@ -70,7 +72,8 @@ class SellerAgentGuardOrchestrator:
             {
                 **mandate,
                 "template": "seller_ops_v1",
-                "allowed_actions": payload.get("allowed_actions") or cls.default_actions,
+                "allowed_actions": payload.get("allowed_actions")
+                or cls.default_actions,
                 "limits": {"auto_approve_max_inr": limits},
             }
         )
@@ -261,7 +264,9 @@ class SellerAgentGuardOrchestrator:
                 reason_code = "action_not_allowed"
                 human_reason = "Seller action is not in the confirmed mandate."
             limits = mandate_payload.get("auto_approve_max_inr") or {}
-            threshold = int(limits.get(normalized, limits.get("seller.refund.issue", 0)))
+            threshold = int(
+                limits.get(normalized, limits.get("seller.refund.issue", 0))
+            )
             requires_approval = status == "allow" and amount_inr > threshold
             bound_action = {
                 "action": normalized,
@@ -395,7 +400,9 @@ class SellerAgentGuardOrchestrator:
                     principal_id=principal_id, approval_id=approval_id
                 )
                 if approval is None or approval["decision_id"] != decision_id:
-                    raise AgentGuardConflict("Seller approval does not match the decision")
+                    raise AgentGuardConflict(
+                        "Seller approval does not match the decision"
+                    )
             intent, created = await repository.create_execution_intent(
                 intent_id=intent_id,
                 principal_id=principal_id,
@@ -522,7 +529,9 @@ class SellerAgentGuardOrchestrator:
                 raise AgentGuardConflict("Seller does not own catalog item")
             return await self.commerce.publish_item(
                 resource_id,
-                status="published" if action == "seller.catalog.publish" else "archived",
+                status="published"
+                if action == "seller.catalog.publish"
+                else "archived",
             )
         if action in {"seller.price.change", "seller.inventory.commit"}:
             try:
@@ -550,7 +559,9 @@ class SellerAgentGuardOrchestrator:
                 "seller.order.reject": "cancelled",
                 "seller.fulfilment.commit": str(payload.get("status") or "shipped"),
             }[action]
-            return await self.commerce.transition_order(resource_id, status)
+            return await self.commerce.transition_order(
+                resource_id, status, payload=payload
+            )
         if action == "seller.remedy.promise":
             issues = await self.commerce.list_issues(seller_id=principal_id)
             if resource_id not in {issue["issue_id"] for issue in issues["issues"]}:

@@ -1,4 +1,5 @@
 """HTTP routes for the local AgentGuard commerce demo."""
+
 from __future__ import annotations
 
 from typing import Any, Optional
@@ -140,11 +141,15 @@ async def cleanup_test_fixtures(
 ) -> ApiResponse:
     requested = body.data.get("order_ids") or []
     explicit_order_ids = {
-        str(order_id) for order_id in requested if isinstance(order_id, str) and order_id.strip()
+        str(order_id)
+        for order_id in requested
+        if isinstance(order_id, str) and order_id.strip()
     }
     requested_items = body.data.get("item_ids") or []
     explicit_item_ids = {
-        str(item_id) for item_id in requested_items if isinstance(item_id, str) and item_id.strip()
+        str(item_id)
+        for item_id in requested_items
+        if isinstance(item_id, str) and item_id.strip()
     }
     compat = _compat(request)
     if compat is not None:
@@ -376,16 +381,41 @@ async def create_issue(
     return ApiResponse(success=True, message="Issue created", data=result)
 
 
+@router.post("/buyer/orders/{order_id}/issues", response_model=ApiResponse)
+async def create_buyer_issue(
+    order_id: str,
+    request: Request,
+    body: IssueBody,
+) -> ApiResponse:
+    principal_id = _session_principal(request, "ondcbuyer")
+    await _owned_order(request, order_id, principal_id, "buyer_id")
+    payload = body.model_dump(exclude_none=True)
+    try:
+        compat = _compat(request)
+        result = (
+            await compat.create_issue(order_id, payload)
+            if compat is not None
+            else commerce_demo.create_issue(
+                order_id,
+                payload,
+                idempotency_key=body.idempotency_key,
+            )
+        )
+    except Exception as exc:
+        _handle_error(exc)
+    return ApiResponse(success=True, message="Issue created", data=result)
+
+
 @router.get("/buyer/issues", response_model=ApiResponse)
-async def list_buyer_issues(request: Request, order_id: Optional[str] = None) -> ApiResponse:
+async def list_buyer_issues(
+    request: Request, order_id: Optional[str] = None
+) -> ApiResponse:
     principal_id = _session_principal(request, "ondcbuyer")
     compat = _compat(request)
     if compat is not None:
         if order_id:
             await _owned_order(request, order_id, principal_id, "buyer_id")
-        data = await compat.list_issues(
-            principal_id=principal_id, order_id=order_id
-        )
+        data = await compat.list_issues(principal_id=principal_id, order_id=order_id)
         return ApiResponse(success=True, message="Issues", data=data)
     if order_id:
         await _owned_order(request, order_id, principal_id, "buyer_id")
@@ -394,9 +424,12 @@ async def list_buyer_issues(request: Request, order_id: Optional[str] = None) ->
         rows = [
             issue
             for issue in rows
-            if commerce_demo.get_order(str(issue["order_id"]))["order"].get("buyer_id") == principal_id
+            if commerce_demo.get_order(str(issue["order_id"]))["order"].get("buyer_id")
+            == principal_id
         ]
-    return ApiResponse(success=True, message="Issues", data={"issues": rows, "count": len(rows)})
+    return ApiResponse(
+        success=True, message="Issues", data={"issues": rows, "count": len(rows)}
+    )
 
 
 @router.get("/seller/issues", response_model=ApiResponse)
@@ -412,9 +445,40 @@ async def list_seller_issues(request: Request) -> ApiResponse:
     rows = [
         issue
         for issue in commerce_demo.list_seller_issues()["issues"]
-        if commerce_demo.get_order(str(issue["order_id"]))["order"].get("seller_id") == principal_id
+        if commerce_demo.get_order(str(issue["order_id"]))["order"].get("seller_id")
+        == principal_id
     ]
-    return ApiResponse(success=True, message="Issues", data={"issues": rows, "count": len(rows)})
+    return ApiResponse(
+        success=True, message="Issues", data={"issues": rows, "count": len(rows)}
+    )
+
+
+@router.get("/buyer/returns", response_model=ApiResponse)
+async def list_buyer_returns(
+    request: Request, order_id: Optional[str] = None
+) -> ApiResponse:
+    principal_id = _session_principal(request, "ondcbuyer")
+    compat = _compat(request)
+    data = (
+        await compat.list_returns(principal_id=principal_id, order_id=order_id)
+        if compat is not None
+        else commerce_demo.list_returns(principal_id=principal_id, order_id=order_id)
+    )
+    return ApiResponse(success=True, message="Returns", data=data)
+
+
+@router.get("/seller/returns", response_model=ApiResponse)
+async def list_seller_returns(
+    request: Request, order_id: Optional[str] = None
+) -> ApiResponse:
+    principal_id = _session_principal(request, "ondcseller")
+    compat = _compat(request)
+    data = (
+        await compat.list_returns(seller_id=principal_id, order_id=order_id)
+        if compat is not None
+        else commerce_demo.list_returns(seller_id=principal_id, order_id=order_id)
+    )
+    return ApiResponse(success=True, message="Returns", data=data)
 
 
 @fixture_router.post("/seller/issues/{issue_id}/respond", response_model=ApiResponse)
