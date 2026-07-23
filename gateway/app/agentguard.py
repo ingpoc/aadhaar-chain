@@ -21,6 +21,7 @@ from app.agentguard_contract import (
     principal_id_from_wallet,
     sha256_hex,
 )
+from app.domain_state_machines import require_transition
 from app.receipt_signing import sign_receipt, verify_receipt
 from config import settings
 
@@ -177,7 +178,7 @@ class ApprovalRecord(BaseModel):
     policy_version: int = 1
     nonce: str
     expires_at: str = "9999-12-31T23:59:59+00:00"
-    status: Literal["issued", "consumed", "expired"] = "issued"
+    status: Literal["issued", "consumed", "expired", "revoked"] = "issued"
     created_at: str
     consumed_at: Optional[str] = None
 
@@ -514,7 +515,7 @@ def _confirm_mandate_locked(mandate_id: str, principal_id: str) -> MandateRecord
     state.agents[agent.agent_id] = agent
     state.mandates[mandate_id] = mandate
     state.policies[policy_id] = _policy_from_mandate(policy_id, mandate)
-    _expire_pending_approvals(state, agent.agent_id)
+    _invalidate_pending_approvals(state, agent.agent_id, target="revoked")
     state.mandate_history.append(
         {"event": "confirmed", "mandate_id": mandate_id, "principal_id": principal_id, "at": now}
     )
@@ -551,15 +552,21 @@ def _revoke_agent_locked(agent_id: str) -> AgentRecord:
         state.mandates[agent.mandate_id] = state.mandates[agent.mandate_id].model_copy(
             update={"status": "revoked"}
         )
-    _expire_pending_approvals(state, agent_id)
+    _invalidate_pending_approvals(state, agent_id, target="revoked")
     save_state(state)
     return agent
 
 
-def _expire_pending_approvals(state: AgentGuardState, agent_id: str) -> None:
+def _invalidate_pending_approvals(
+    state: AgentGuardState,
+    agent_id: str,
+    *,
+    target: Literal["expired", "revoked"],
+) -> None:
     for approval_id, approval in list(state.approvals.items()):
         if approval.agent_id == agent_id and approval.status == "issued":
-            state.approvals[approval_id] = approval.model_copy(update={"status": "expired"})
+            require_transition("approval", approval.status, target)
+            state.approvals[approval_id] = approval.model_copy(update={"status": target})
 
 
 def _set_agent_status(agent_id: str, status: AgentStatus) -> AgentRecord:
@@ -571,7 +578,11 @@ def _set_agent_status(agent_id: str, status: AgentStatus) -> AgentRecord:
         agent = agent.model_copy(update={"status": status, "updated_at": _utcnow()})
         state.agents[agent_id] = agent
         if status != "active":
-            _expire_pending_approvals(state, agent_id)
+            _invalidate_pending_approvals(
+                state,
+                agent_id,
+                target="revoked" if status == "revoked" else "expired",
+            )
         save_state(state)
         return agent
 
@@ -974,6 +985,7 @@ def _consume_approval_locked(
     if approval.status != "issued":
         raise ConflictError(f"Approval not consumable: {approval.status}")
     if _parse_dt(approval.expires_at) < datetime.now(timezone.utc):
+        require_transition("approval", approval.status, "expired")
         approval = approval.model_copy(update={"status": "expired"})
         state.approvals[approval_id] = approval
         save_state(state)
@@ -1022,6 +1034,7 @@ def _consume_approval_locked(
             raise ConflictError("Approval canonical request mismatch.")
 
     now = _utcnow()
+    require_transition("approval", approval.status, "consumed")
     approval = approval.model_copy(update={"status": "consumed", "consumed_at": now})
     state.approvals[approval_id] = approval
     state.consumed_nonces[approval.nonce] = approval_id

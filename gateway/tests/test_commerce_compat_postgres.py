@@ -143,6 +143,20 @@ async def test_demo_commerce_is_a_postgres_compatibility_adapter(
                 json={"response": "Investigating now"},
             )
             assert response.status_code == 200, response.text
+            assert response.json()["data"]["issue"]["status"] == "acknowledged"
+            assert response.json()["data"]["issue"]["version"] == 2
+            duplicate_response = await client.post(
+                f"/api/demo-commerce/test-fixtures/seller/issues/{issue_id}/respond",
+                json={"response": "Duplicate response"},
+            )
+            assert duplicate_response.status_code == 409
+            remedy = await client.post(
+                f"/api/demo-commerce/test-fixtures/seller/issues/{issue_id}/remedy",
+                json={"data": {"type": "refund", "amount_inr": 25}},
+            )
+            assert remedy.status_code == 200, remedy.text
+            assert remedy.json()["data"]["issue"]["status"] == "resolution_proposed"
+            assert remedy.json()["data"]["issue"]["version"] == 3
 
             buyer_orders = await client.get(
                 "/api/demo-commerce/buyer/orders",

@@ -438,7 +438,7 @@ def test_pending_approval_is_invalid_after_mandate_replacement() -> None:
     )
     agentguard.confirm_mandate(draft.mandate_id, draft.principal_id)
 
-    with pytest.raises(agentguard.ConflictError, match="not consumable: expired"):
+    with pytest.raises(agentguard.ConflictError, match="not consumable: revoked"):
         agentguard.consume_approval(approval_id=approval_id, wallet_address=WALLET)
 
 

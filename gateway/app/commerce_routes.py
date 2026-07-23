@@ -112,6 +112,7 @@ class OrderBody(BaseModel):
 
 class TransitionBody(BaseModel):
     idempotency_key: Optional[str] = None
+    expected_version: Optional[int] = Field(default=None, ge=1)
     status: str
 
 
@@ -334,7 +335,11 @@ async def transition_order(
     try:
         compat = _compat(request)
         result = (
-            await compat.transition_order(order_id, body.status)
+            await compat.transition_order(
+                order_id,
+                body.status,
+                expected_version=body.expected_version,
+            )
             if compat is not None
             else commerce_demo.transition_order(
                 order_id,

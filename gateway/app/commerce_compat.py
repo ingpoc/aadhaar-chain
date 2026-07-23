@@ -14,6 +14,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from app.commerce_v1 import CommerceV1
+from app.domain_state_machines import require_transition
 from app.persistence.connection import ConnectionPool
 from app.persistence.transaction import UnitOfWork
 
@@ -100,6 +101,7 @@ class CommerceCompatibilityAdapter:
             "issue_id": str(row["issue_id"]),
             "order_id": str(row["order_id"]),
             "status": row["status"],
+            "version": row["version"],
             "reason": row["reason"],
             "description": row["description"],
             "response": row.get("response"),
@@ -295,19 +297,41 @@ class CommerceCompatibilityAdapter:
         ]
         return {"orders": orders, "count": len(orders)}
 
-    async def transition_order(self, order_id: str, status: str) -> dict[str, Any]:
-        if status not in {"confirmed", "preparing", "shipped", "delivered", "cancelled"}:
-            raise ValueError("unsupported order transition")
+    async def transition_order(
+        self,
+        order_id: str,
+        status: str,
+        *,
+        expected_version: int | None = None,
+    ) -> dict[str, Any]:
         async with UnitOfWork(self.pool) as unit_of_work:
+            current_result = await unit_of_work.connection.execute(
+                """
+                SELECT status, version FROM commerce_orders
+                WHERE order_id = %s FOR UPDATE
+                """,
+                (UUID(order_id),),
+            )
+            current = await current_result.fetchone()
+            if current is None:
+                raise KeyError("order not found")
+            next_version = require_transition(
+                "order",
+                current[0],
+                status,
+                current_version=current[1],
+                expected_version=expected_version,
+            )
             result = await unit_of_work.connection.execute(
                 """
-                UPDATE commerce_orders SET status = %s, version = version + 1,
-                    updated_at = NOW() WHERE order_id = %s RETURNING order_id
+                UPDATE commerce_orders SET status = %s, version = %s,
+                    updated_at = NOW()
+                WHERE order_id = %s AND version = %s RETURNING order_id
                 """,
-                (status, UUID(order_id)),
+                (status, next_version, UUID(order_id), current[1]),
             )
             if await result.fetchone() is None:
-                raise KeyError("order not found")
+                raise RuntimeError("stale order transition")
         return {"order": await self.get_order(order_id)}
 
     async def create_issue(self, order_id: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -363,12 +387,14 @@ class CommerceCompatibilityAdapter:
         return await self._update_issue(
             issue_id,
             response=str(body.get("response") or body.get("message") or ""),
-            status=str(body.get("status") or "investigating"),
+            status=str(body.get("status") or "acknowledged"),
         )
 
     async def remedy_issue(self, issue_id: str, body: dict[str, Any]) -> dict[str, Any]:
         return await self._update_issue(
-            issue_id, remedy=body, status=str(body.get("status") or "resolved")
+            issue_id,
+            remedy=body,
+            status=str(body.get("status") or "resolution_proposed"),
         )
 
     async def cleanup(
@@ -530,27 +556,53 @@ class CommerceCompatibilityAdapter:
         remedy: dict[str, Any] | None = None,
         status: str,
     ) -> dict[str, Any]:
-        if status not in {"open", "investigating", "resolved"}:
-            raise ValueError("unsupported issue status")
         async with UnitOfWork(self.pool) as unit_of_work:
             async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(
                     """
+                    SELECT * FROM commerce_issues
+                    WHERE issue_id = %s FOR UPDATE
+                    """,
+                    (UUID(issue_id),),
+                )
+                current = await cursor.fetchone()
+                if current is None:
+                    raise KeyError("issue not found")
+                current_status = current["status"]
+                current_version = current["version"]
+                if current_status == "open" and status == "resolution_proposed":
+                    current_version = require_transition(
+                        "issue",
+                        current_status,
+                        "acknowledged",
+                        current_version=current_version,
+                    )
+                    current_status = "acknowledged"
+                next_version = require_transition(
+                    "issue",
+                    current_status,
+                    status,
+                    current_version=current_version,
+                )
+                await cursor.execute(
+                    """
                     UPDATE commerce_issues
                     SET response = COALESCE(%s, response), remedy = COALESCE(%s, remedy),
-                        status = %s, updated_at = NOW()
-                    WHERE issue_id = %s RETURNING *
+                        status = %s, version = %s, updated_at = NOW()
+                    WHERE issue_id = %s AND version = %s RETURNING *
                     """,
                     (
                         response,
                         Jsonb(remedy) if remedy is not None else None,
                         status,
+                        next_version,
                         UUID(issue_id),
+                        current["version"],
                     ),
                 )
                 row = await cursor.fetchone()
         if row is None:
-            raise KeyError("issue not found")
+            raise RuntimeError("stale issue transition")
         return {"issue": self._issue(row)}
 
 

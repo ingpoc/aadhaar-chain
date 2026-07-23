@@ -13,6 +13,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+from .domain_state_machines import (
+    PAYMENT_ORDER_TARGETS,
+    TransitionError,
+    require_transition,
+)
 from .persistence.commerce_repository import CommerceRepository
 from .persistence.connection import ConnectionPool
 from .persistence.repositories import IdempotencyConflict, IdempotencyRepository
@@ -406,6 +411,13 @@ class CommerceV1:
                     raise CommerceNotFound("payment attempt not found")
                 if payment["status"] != "pending":
                     raise CommerceConflict("payment attempt is not pending")
+                order_before = await repository.get_order(payment["order_id"], lock=True)
+                require_transition("payment", payment["status"], status)
+                require_transition(
+                    "order",
+                    order_before["status"],
+                    PAYMENT_ORDER_TARGETS[status],
+                )
                 order, payment = await repository.set_payment_status(
                     attempt_uuid, status, detail or {}, provider_reference
                 )
@@ -416,6 +428,8 @@ class CommerceV1:
                     await repository.release_order_reservations(order["order_id"])
             except LookupError as exc:
                 raise CommerceNotFound(str(exc)) from exc
+            except TransitionError as exc:
+                raise CommerceConflict(str(exc)) from exc
         return _jsonable({"order": order, "payment_attempt": payment})
 
     async def reconcile_payment(
@@ -438,9 +452,14 @@ class CommerceV1:
                 payment = await repository.get_payment(attempt_uuid, lock=True)
                 if payment["principal_id"] != principal_id:
                     raise CommerceNotFound("payment attempt not found")
-                if payment["status"] != "unknown":
-                    raise CommerceConflict("only unknown payments can be reconciled")
                 persisted_status = "reconciled" if outcome == "succeeded" else "failed"
+                order_before = await repository.get_order(payment["order_id"], lock=True)
+                require_transition("payment", payment["status"], persisted_status)
+                require_transition(
+                    "order",
+                    order_before["status"],
+                    PAYMENT_ORDER_TARGETS[persisted_status],
+                )
                 order, payment = await repository.set_payment_status(
                     attempt_uuid, persisted_status, detail or {}
                 )
@@ -453,6 +472,8 @@ class CommerceV1:
                     await repository.release_order_reservations(order["order_id"])
             except LookupError as exc:
                 raise CommerceNotFound(str(exc)) from exc
+            except TransitionError as exc:
+                raise CommerceConflict(str(exc)) from exc
         return _jsonable({"order": order, "payment_attempt": payment})
 
     async def expire_quote(
@@ -510,6 +531,7 @@ class CommerceV1:
                     correlation_id=correlation_id,
                 )
                 if created:
+                    require_transition("refund", refund["status"], "succeeded")
                     transaction_id = uuid5(
                         NAMESPACE_URL, f"{refund_namespace}:ledger"
                     )
@@ -523,6 +545,9 @@ class CommerceV1:
                             (uuid5(transaction_id, "debit"), "seller_payable", "debit"),
                             (uuid5(transaction_id, "credit"), "payment_clearing", "credit"),
                         ),
+                    )
+                    refund = await repository.set_refund_status(
+                        refund["refund_id"], "pending", "succeeded"
                     )
             except LookupError as exc:
                 raise CommerceNotFound(str(exc)) from exc

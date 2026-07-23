@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
+from app.domain_state_machines import require_transition
 from app.payment_adapter import payment_adapter
 from config import settings
 
@@ -556,15 +557,19 @@ def transition_order(order_id: str, status: str, *, idempotency_key: Optional[st
         missing = [field for field in required if not str(address.get(field) or "").strip()]
         if missing:
             raise ValueError("Delivery details are incomplete; the order cannot be accepted.")
-    valid = {
-        "paid": {"accepted", "rejected", "cancelled"},
-        "accepted": {"fulfilled", "cancelled"},
-        "fulfilled": {"closed"},
-        "unknown": {"cancelled"},
+    current_status = "payment_unknown" if order["status"] == "unknown" else order["status"]
+    next_version = require_transition(
+        "order",
+        current_status,
+        status,
+        current_version=int(order.get("version") or 1),
+    )
+    updated = {
+        **order,
+        "status": status,
+        "version": next_version,
+        "updated_at": _utcnow(),
     }
-    if status not in valid.get(order["status"], set()):
-        raise ValueError(f"Invalid order transition {order['status']} -> {status}")
-    updated = {**order, "status": status, "updated_at": _utcnow()}
     state.orders[order_id] = updated
     response = {"order": updated, "message_id": _new_id("msg")}
     _remember(state, idem, response)
@@ -584,6 +589,7 @@ def create_issue(order_id: str, payload: dict[str, Any], *, idempotency_key: Opt
         "issue_id": issue_id,
         "order_id": order_id,
         "status": "open",
+        "version": 1,
         "reason": payload.get("reason") or "buyer_support",
         "description": payload.get("description") or "",
         "created_at": _utcnow(),
@@ -615,9 +621,16 @@ def respond_issue(issue_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     issue = state.issues.get(issue_id)
     if not issue:
         raise KeyError(f"Unknown issue: {issue_id}")
+    next_version = require_transition(
+        "issue",
+        issue["status"],
+        "acknowledged",
+        current_version=int(issue.get("version") or 1),
+    )
     updated = {
         **issue,
-        "status": "responded",
+        "status": "acknowledged",
+        "version": next_version,
         "response": payload.get("response") or payload.get("message") or "",
         "updated_at": _utcnow(),
     }
@@ -634,6 +647,22 @@ def propose_remedy(issue_id: str, payload: dict[str, Any], *, idempotency_key: O
     issue = state.issues.get(issue_id)
     if not issue:
         raise KeyError(f"Unknown issue: {issue_id}")
+    current_status = issue["status"]
+    current_version = int(issue.get("version") or 1)
+    if current_status == "open":
+        current_version = require_transition(
+            "issue",
+            current_status,
+            "acknowledged",
+            current_version=current_version,
+        )
+        current_status = "acknowledged"
+    next_version = require_transition(
+        "issue",
+        current_status,
+        "resolution_proposed",
+        current_version=current_version,
+    )
     remedy_id = _new_id("remedy")
     remedy = {
         "remedy_id": remedy_id,
@@ -648,6 +677,7 @@ def propose_remedy(issue_id: str, payload: dict[str, Any], *, idempotency_key: O
     state.issues[issue_id] = {
         **issue,
         "status": "resolution_proposed",
+        "version": next_version,
         "remedy_id": remedy_id,
         "updated_at": _utcnow(),
     }
@@ -671,9 +701,26 @@ def accept_remedy(remedy_id: str, *, idempotency_key: Optional[str] = None) -> d
     issue = state.issues.get(issue_id)
     if not issue:
         raise KeyError(f"Unknown issue: {issue_id}")
+    accepted_version = require_transition(
+        "issue",
+        issue["status"],
+        "accepted",
+        current_version=int(issue.get("version") or 1),
+    )
+    closed_version = require_transition(
+        "issue",
+        "accepted",
+        "closed",
+        current_version=accepted_version,
+    )
     accepted = {**remedy, "status": "accepted", "updated_at": _utcnow()}
     state.remedies[remedy_id] = accepted
-    state.issues[issue_id] = {**issue, "status": "closed", "updated_at": _utcnow()}
+    state.issues[issue_id] = {
+        **issue,
+        "status": "closed",
+        "version": closed_version,
+        "updated_at": _utcnow(),
+    }
     response = {"remedy": accepted, "issue": state.issues[issue_id], "message_id": _new_id("msg")}
     _remember(state, idem, response)
     save_state(state)

@@ -9,6 +9,8 @@ from uuid import UUID, uuid5
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from app.domain_state_machines import PAYMENT_ORDER_TARGETS
+
 from .transaction import UnitOfWork
 
 
@@ -372,13 +374,7 @@ class CommerceRepository:
             """,
             (status, Jsonb(result), provider_reference, payment_attempt_id),
         )
-        order_status = {
-            "pending": "payment_pending",
-            "succeeded": "paid",
-            "failed": "payment_failed",
-            "unknown": "payment_unknown",
-            "reconciled": "paid",
-        }[status]
+        order_status = PAYMENT_ORDER_TARGETS[status]
         await self.connection.execute(
             """
             UPDATE commerce_orders SET status = %s, version = version + 1, updated_at = NOW()
@@ -498,7 +494,7 @@ class CommerceRepository:
                 INSERT INTO commerce_refunds (
                     refund_id, order_id, payment_attempt_id, seller_id, principal_id,
                     amount_paise, status, idempotency_key, correlation_id
-                ) VALUES (%s, %s, %s, %s, %s, %s, 'succeeded', %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s)
                 ON CONFLICT DO NOTHING
                 RETURNING *
                 """,
@@ -533,6 +529,23 @@ class CommerceRepository:
         ):
             raise ValueError("idempotent refund replay changed the bound request")
         return refund, created
+
+    async def set_refund_status(
+        self, refund_id: UUID, current_status: str, status: str
+    ) -> dict[str, Any]:
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                """
+                UPDATE commerce_refunds SET status = %s
+                WHERE refund_id = %s AND status = %s
+                RETURNING *
+                """,
+                (status, refund_id, current_status),
+            )
+            refund = await cursor.fetchone()
+        if refund is None:
+            raise RuntimeError("stale refund transition")
+        return refund
 
     async def _dict_row(
         self,

@@ -8,6 +8,8 @@ from typing import Any
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from app.domain_state_machines import require_transition
+
 from .transaction import UnitOfWork
 
 
@@ -115,8 +117,13 @@ class AgentGuardRepository:
         if record is None:
             await self._raise_missing_or_foreign(
                 "agentguard_agents", "agent_id", agent_id, principal_id
-            )
+        )
         if status in {"paused", "revoked"}:
+            require_transition(
+                "approval",
+                "issued",
+                "revoked" if status == "revoked" else "expired",
+            )
             await self._connection.execute(
                 """
                 UPDATE agentguard_approvals
@@ -164,10 +171,13 @@ class AgentGuardRepository:
                 raise AgentGuardConflict(
                     "cannot activate a mandate for a missing or revoked agent"
                 )
+            require_transition("approval", "issued", "revoked")
             await self._connection.execute(
+                # A replacement mandate revokes the authority represented by
+                # every approval issued under an earlier version.
                 """
                 UPDATE agentguard_approvals
-                SET status = 'expired'
+                SET status = 'revoked'
                 WHERE principal_id = %s AND agent_id = %s AND status = 'issued'
                       AND (mandate_id, mandate_version) <> (%s, %s)
                 """,
@@ -326,6 +336,7 @@ class AgentGuardRepository:
             (principal_id, approval_id, request_hash),
         )
         if record is not None:
+            require_transition("approval", "issued", "consumed")
             return record
         approval = await self.get_approval(
             principal_id=principal_id, approval_id=approval_id
@@ -337,6 +348,7 @@ class AgentGuardRepository:
         if approval["request_hash"] != request_hash:
             raise AgentGuardConflict("approval request hash mismatch")
         if approval["status"] == "issued" and approval["expires_at"] <= utcnow():
+            require_transition("approval", approval["status"], "expired")
             await self._connection.execute(
                 """
                 UPDATE agentguard_approvals
