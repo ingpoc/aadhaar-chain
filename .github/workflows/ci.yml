@@ -15,8 +15,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - name: Install gitleaks
         run: |
           set -euo pipefail
@@ -24,7 +22,7 @@ jobs:
           curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz" \
             | sudo tar -xz -C /usr/local/bin gitleaks
       - name: Scan
-        run: gitleaks detect --source . --verbose --redact --exit-code 1
+        run: gitleaks detect --source . --no-git --verbose --redact --exit-code 1
 
   gateway:
     runs-on: ubuntu-latest

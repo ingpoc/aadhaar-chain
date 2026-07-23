@@ -173,7 +173,7 @@ def test_publish_search_order_and_idempotency() -> None:
 
     published = client.post(
         f"/api/demo-commerce/test-fixtures/seller/items/{item_id}/publish",
-        json={"idempotency_key": "item-publish-1"},
+        json={"idempotency_key": "item-publish-1"},  # gitleaks:allow
     )
     assert published.status_code == 200
     assert published.json()["data"]["item"]["status"] == "published"

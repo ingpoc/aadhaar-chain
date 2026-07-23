@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from main import app
-from cursor_agent_runtime.outcome import (
+from app.runtime_outcome import (
     RuntimeOutcomeError,
     parse_verified_runtime_outcome,
 )
