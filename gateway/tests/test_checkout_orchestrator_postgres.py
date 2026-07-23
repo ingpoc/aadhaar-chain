@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -66,6 +67,16 @@ async def test_over_limit_exact_approval_checkout_replays_one_paid_order(
     principal_id = "principal:checkout-e2e"
     commerce = CommerceV1(pool)
     orchestrator = CheckoutOrchestrator(pool)
+    delivery_context = {
+        "name": "Checkout Buyer",
+        "email": "buyer@example.com",
+        "phone": "+919876543210",
+        "line1": "42 Lifecycle Road",
+        "city": "Bengaluru",
+        "state": "Karnataka",
+        "postalCode": "560001",
+        "country": "IND",
+    }
     compiled = await orchestrator.compile_mandate(
         principal_id=principal_id, limits={"max_order_paise": 15_000}
     )
@@ -97,20 +108,39 @@ async def test_over_limit_exact_approval_checkout_replays_one_paid_order(
     )
     with pytest.raises(AgentGuardNotFound, match="mandate"):
         await orchestrator.evaluate_checkout(
-            principal_id=principal_id, quote_id=quote["quote_id"]
+            principal_id=principal_id,
+            quote_id=quote["quote_id"],
+            delivery_context=delivery_context,
         )
     await orchestrator.confirm_mandate(
         principal_id=principal_id,
         mandate_id=compiled["mandate"]["mandate_id"],
     )
     decision = await orchestrator.evaluate_checkout(
-        principal_id=principal_id, quote_id=quote["quote_id"]
+        principal_id=principal_id,
+        quote_id=quote["quote_id"],
+        delivery_context=delivery_context,
     )
     assert decision["decision"] == "need_approval"
     assert decision["bound_action"]["landed_total_paise"] == 20_000
+    assert decision["bound_action"]["delivery_context_hash"]
+    assert "email" not in decision["bound_action"]
     other_decision = await orchestrator.evaluate_checkout(
-        principal_id=principal_id, quote_id=quote["quote_id"]
+        principal_id=principal_id,
+        quote_id=quote["quote_id"],
+        delivery_context=delivery_context,
     )
+
+    with pytest.raises(AgentGuardConflict, match="checkout no longer matches"):
+        await orchestrator.execute_checkout(
+            principal_id=principal_id,
+            quote_id=quote["quote_id"],
+            decision_id=decision["decision_id"],
+            approval_id=decision["approval"]["approval_id"],
+            idempotency_key="checkout-mutated-delivery",
+            correlation_id="correlation-mutated-delivery",
+            delivery_context={**delivery_context, "postalCode": "560002"},
+        )
 
     with pytest.raises(AgentGuardConflict, match="approval does not match"):
         await orchestrator.execute_checkout(
@@ -120,6 +150,7 @@ async def test_over_limit_exact_approval_checkout_replays_one_paid_order(
             approval_id=other_decision["approval"]["approval_id"],
             idempotency_key="checkout-wrong-approval",
             correlation_id="correlation-wrong-approval",
+            delivery_context=delivery_context,
         )
 
     with pytest.raises(AgentGuardConflict, match="exact approval"):
@@ -130,6 +161,7 @@ async def test_over_limit_exact_approval_checkout_replays_one_paid_order(
             approval_id=None,
             idempotency_key="checkout-e2e",
             correlation_id="correlation-e2e",
+            delivery_context=delivery_context,
         )
 
     async def crash_before_receipt(*_args, **_kwargs):
@@ -145,6 +177,7 @@ async def test_over_limit_exact_approval_checkout_replays_one_paid_order(
                 approval_id=decision["approval"]["approval_id"],
                 idempotency_key="checkout-e2e",
                 correlation_id="correlation-e2e",
+                delivery_context=delivery_context,
             )
 
     first = await orchestrator.execute_checkout(
@@ -154,6 +187,7 @@ async def test_over_limit_exact_approval_checkout_replays_one_paid_order(
         approval_id=decision["approval"]["approval_id"],
         idempotency_key="checkout-e2e",
         correlation_id="correlation-e2e",
+        delivery_context=delivery_context,
     )
     replay = await orchestrator.execute_checkout(
         principal_id=principal_id,
@@ -162,11 +196,43 @@ async def test_over_limit_exact_approval_checkout_replays_one_paid_order(
         approval_id=decision["approval"]["approval_id"],
         idempotency_key="checkout-e2e",
         correlation_id="correlation-e2e",
+        delivery_context=delivery_context,
     )
 
     assert first["result"]["order"]["status"] == "paid"
     assert replay["receipt"]["receipt_id"] == first["receipt"]["receipt_id"]
     assert verify_receipt(first["receipt"])["valid"] is True
+    async with pool.connection() as connection:
+        await connection.execute(
+            """
+            INSERT INTO agentguard_receipts (
+                receipt_id, principal_id, agent_id, mandate_id, mandate_version,
+                status, payload, created_at
+            )
+            SELECT
+                'receipt_later_seller', principal_id, agent_id, mandate_id,
+                mandate_version, 'succeeded', %s::jsonb, NOW() + INTERVAL '1 second'
+            FROM agentguard_receipts
+            WHERE receipt_id = %s
+            """,
+            (
+                json.dumps(
+                    {
+                        "action": "seller.fulfilment.commit",
+                        "result": {
+                            "order": {"order_id": first["result"]["order"]["order_id"]}
+                        },
+                    }
+                ),
+                first["receipt"]["receipt_id"],
+            ),
+        )
+    stored = await orchestrator.compat.get_order(
+        first["result"]["order"]["order_id"],
+        principal_id=principal_id,
+    )
+    assert stored["delivery_address"] == delivery_context
+    assert stored["authorization"]["receipt_id"] == first["receipt"]["receipt_id"]
     async with pool.connection() as connection:
         counts = await connection.execute(
             """
@@ -178,7 +244,7 @@ async def test_over_limit_exact_approval_checkout_replays_one_paid_order(
                 (SELECT COUNT(*) FROM agentguard_receipts)
             """
         )
-        assert await counts.fetchone() == (1, 1, 1, 1, 1)
+        assert await counts.fetchone() == (1, 1, 1, 1, 2)
 
 
 async def test_http_mandate_preview_decision_execute_and_replay(
@@ -462,9 +528,7 @@ async def test_legacy_buyer_mandate_shape_uses_postgres_control_plane(
         current = await client.get("/api/agentguard/agents/current?role=buyer")
         assert current.status_code == 200
         agent_id = current.json()["data"]["agent"]["agent_id"]
-        paused = await client.post(
-            f"/api/agentguard/agents/{agent_id}/pause", json={}
-        )
+        paused = await client.post(f"/api/agentguard/agents/{agent_id}/pause", json={})
         assert paused.status_code == 200
         assert paused.json()["data"]["agent"]["status"] == "paused"
         resumed = await client.post(

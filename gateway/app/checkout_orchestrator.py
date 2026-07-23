@@ -42,6 +42,29 @@ def _hash(payload: dict[str, Any]) -> str:
     return sha256(canonicalize(_jsonable(payload)).encode("utf-8")).hexdigest()
 
 
+_DELIVERY_CONTEXT_KEYS = (
+    "name",
+    "email",
+    "phone",
+    "line1",
+    "line2",
+    "city",
+    "state",
+    "postalCode",
+    "country",
+)
+
+
+def _normalized_delivery_context(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: str(value[key]).strip()
+        for key in _DELIVERY_CONTEXT_KEYS
+        if value.get(key) is not None and str(value[key]).strip()
+    }
+
+
 class CheckoutOrchestrator:
     """Own Buyer authority, intent persistence, and commerce execution."""
 
@@ -590,6 +613,7 @@ class CheckoutOrchestrator:
         quote_id: str,
         lock: bool,
         require_open: bool = True,
+        delivery_context: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         quote = await repository.get_quote(UUID(quote_id), principal_id, lock=lock)
         if require_open and quote["status"] != "open":
@@ -608,17 +632,28 @@ class CheckoutOrchestrator:
             "inventory_commitment": quote["line_snapshot"],
             "expires_at": quote["expires_at"].isoformat(),
         }
+        if delivery_context:
+            bound["delivery_context_hash"] = _hash(delivery_context)
         return quote, _jsonable(bound)
 
     async def evaluate_checkout(
-        self, *, principal_id: str, quote_id: str
+        self,
+        *,
+        principal_id: str,
+        quote_id: str,
+        delivery_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        normalized_delivery_context = _normalized_delivery_context(delivery_context)
         async with UnitOfWork(self.pool) as unit_of_work:
             agentguard = AgentGuardRepository(unit_of_work)
             commerce = CommerceRepository(unit_of_work)
             agent, mandate = await self._authority(agentguard, principal_id)
             quote, bound = await self._bound_quote(
-                commerce, principal_id=principal_id, quote_id=quote_id, lock=True
+                commerce,
+                principal_id=principal_id,
+                quote_id=quote_id,
+                lock=True,
+                delivery_context=normalized_delivery_context,
             )
             limit = int(mandate["payload"]["max_order_paise"])
             requires_approval = quote["landed_total_paise"] > limit
@@ -699,9 +734,11 @@ class CheckoutOrchestrator:
         idempotency_key: str,
         correlation_id: str,
         payment_outcome: str = "succeeded",
+        delivery_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if payment_outcome not in {"succeeded", "failed", "unknown"}:
             raise ValueError("unsupported simulated payment outcome")
+        normalized_delivery_context = _normalized_delivery_context(delivery_context)
         async with UnitOfWork(self.pool) as unit_of_work:
             agentguard = AgentGuardRepository(unit_of_work)
             commerce = CommerceRepository(unit_of_work)
@@ -719,6 +756,7 @@ class CheckoutOrchestrator:
                 quote_id=quote_id,
                 lock=True,
                 require_open=False,
+                delivery_context=normalized_delivery_context,
             )
             request_hash = _hash(bound)
             if decision["payload"].get("request_hash") != request_hash:
@@ -777,6 +815,12 @@ class CheckoutOrchestrator:
                 idempotency_key=idempotency_key,
                 request=bound,
             )
+            if normalized_delivery_context:
+                await self.compat.set_delivery_context(
+                    str(commerce_result["order"]["order_id"]),
+                    principal_id=principal_id,
+                    delivery_context=normalized_delivery_context,
+                )
             payment_state = await self.commerce.get_payment_state(
                 principal_id=principal_id,
                 payment_attempt_id=commerce_result["payment_attempt"][

@@ -415,7 +415,9 @@ async def evaluate_action(
         quote_id = str(body.payload["quote_id"])
         try:
             result = await CheckoutOrchestrator(pool).evaluate_checkout(
-                principal_id=principal_id, quote_id=quote_id
+                principal_id=principal_id,
+                quote_id=quote_id,
+                delivery_context=body.payload.get("delivery_context"),
             )
         except Exception as error:
             _raise_persistent_error(error)
@@ -596,6 +598,7 @@ async def execute_action(
                 idempotency_key=effective_idempotency_key,
                 correlation_id=effective_correlation_id,
                 payment_outcome=str(body.payload.get("payment_outcome", "succeeded")),
+                delivery_context=body.payload.get("delivery_context"),
             )
         except Exception as error:
             _raise_persistent_error(error)

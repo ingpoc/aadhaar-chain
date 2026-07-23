@@ -72,6 +72,7 @@ class CommerceCompatibilityAdapter:
             "status": row["status"],
             "version": row["version"],
             "fulfilment": row.get("fulfilment") or {"history": []},
+            "delivery_address": (row.get("fulfilment") or {}).get("delivery_address"),
             "payment": {
                 "status": payment_status,
                 "amount_inr": row["payment_amount_paise"] / 100,
@@ -96,6 +97,38 @@ class CommerceCompatibilityAdapter:
             "created_at": _iso(row["created_at"]),
             "updated_at": _iso(row["updated_at"]),
         }
+
+    async def set_delivery_context(
+        self,
+        order_id: str,
+        *,
+        principal_id: str,
+        delivery_context: dict[str, Any],
+    ) -> None:
+        async with UnitOfWork(self.pool) as unit_of_work:
+            async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    """
+                    SELECT principal_id, fulfilment
+                    FROM commerce_orders
+                    WHERE order_id = %s
+                    FOR UPDATE
+                    """,
+                    (UUID(order_id),),
+                )
+                current = await cursor.fetchone()
+                if current is None or current["principal_id"] != principal_id:
+                    raise KeyError("order not found")
+                fulfilment = dict(current.get("fulfilment") or {})
+                fulfilment["delivery_address"] = delivery_context
+                await cursor.execute(
+                    """
+                    UPDATE commerce_orders
+                    SET fulfilment = %s, updated_at = NOW()
+                    WHERE order_id = %s
+                    """,
+                    (Jsonb(fulfilment), UUID(order_id)),
+                )
 
     @staticmethod
     def _issue(row: dict[str, Any]) -> dict[str, Any]:
@@ -690,6 +723,7 @@ class CommerceCompatibilityAdapter:
                             receipt.created_at AS authorization_created_at
                         FROM agentguard_receipts AS receipt
                         WHERE receipt.principal_id = o.principal_id
+                          AND receipt.payload->>'action' = 'buyer.checkout.commit'
                           AND receipt.payload->'result'->'order'->>'order_id'
                               = o.order_id::text
                         ORDER BY receipt.created_at DESC
