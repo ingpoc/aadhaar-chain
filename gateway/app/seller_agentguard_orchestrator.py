@@ -524,7 +524,7 @@ class SellerAgentGuardOrchestrator:
                 current = await self.commerce.create_item(
                     {**payload, "item_id": resource_id, "seller_id": principal_id}
                 )
-            item = current["item"]
+            item = current.get("item", current)
             if item["seller_id"] != principal_id:
                 raise AgentGuardConflict("Seller does not own catalog item")
             return await self.commerce.publish_item(
@@ -540,7 +540,8 @@ class SellerAgentGuardOrchestrator:
                 )
             except KeyError:
                 raise AgentGuardNotFound("Seller catalog item not found") from None
-            if current["item"]["seller_id"] != principal_id:
+            item = current.get("item", current)
+            if item["seller_id"] != principal_id:
                 raise AgentGuardConflict("Seller does not own catalog item")
             return await self.commerce.update_item(resource_id, payload)
         if action in {

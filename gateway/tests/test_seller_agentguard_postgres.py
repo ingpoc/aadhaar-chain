@@ -72,7 +72,7 @@ async def test_concurrent_seller_ensure_returns_one_durable_agent(
         assert await result.fetchone() == (1,)
 
 
-async def test_seller_catalog_publish_is_durable_exact_and_one_effect(
+async def test_seller_catalog_publish_and_archive_are_durable_exact_effects(
     pool: ConnectionPool,
 ) -> None:
     principal_id = "principal:seller:durable"
@@ -84,7 +84,7 @@ async def test_seller_catalog_publish_is_durable_exact_and_one_effect(
     compiled = await orchestrator.compile_mandate(
         principal_id=principal_id,
         limits={"auto_approve_max_inr": {"seller.catalog.publish": 0}},
-        allowed_actions=["seller.catalog.publish"],
+        allowed_actions=["seller.catalog.publish", "seller.catalog.archive"],
     )
     confirmed = await orchestrator.confirm_mandate(
         principal_id=principal_id,
@@ -131,6 +131,41 @@ async def test_seller_catalog_publish_is_durable_exact_and_one_effect(
 
     assert first["receipt"]["receipt_id"] == replay["receipt"]["receipt_id"]
     assert first["result"]["item"]["status"] == "published"
+
+    archive_decision = await orchestrator.evaluate(
+        principal_id=principal_id,
+        action="seller.catalog.archive",
+        amount_inr=0,
+        resource_id="seller-durable-atta",
+        counterparty_id=None,
+        payload={"item_id": "seller-durable-atta"},
+        correlation_id="seller-archive-correlation-1",
+    )
+    archived = await orchestrator.execute(
+        principal_id=principal_id,
+        decision_id=archive_decision["decision_id"],
+        approval_id=None,
+        action="seller.catalog.archive",
+        amount_inr=0,
+        resource_id="seller-durable-atta",
+        idempotency_key="seller-archive-1",
+        correlation_id="seller-archive-correlation-1",
+        payload={"item_id": "seller-durable-atta"},
+    )
+    archive_replay = await orchestrator.execute(
+        principal_id=principal_id,
+        decision_id=archive_decision["decision_id"],
+        approval_id=None,
+        action="seller.catalog.archive",
+        amount_inr=0,
+        resource_id="seller-durable-atta",
+        idempotency_key="seller-archive-1",
+        correlation_id="seller-archive-correlation-1",
+        payload={"item_id": "seller-durable-atta"},
+    )
+    assert archived["receipt"]["receipt_id"] == archive_replay["receipt"]["receipt_id"]
+    assert archived["result"]["item"]["status"] == "archived"
+
     async with pool.connection() as connection:
         result = await connection.execute(
             """
@@ -141,7 +176,7 @@ async def test_seller_catalog_publish_is_durable_exact_and_one_effect(
             """,
             ("seller-durable-atta",),
         )
-        assert await result.fetchone() == (1, 1, 1)
+        assert await result.fetchone() == (1, 2, 2)
 
     with pytest.raises(AgentGuardConflict, match="changed after evaluation"):
         await orchestrator.execute(
@@ -380,6 +415,12 @@ async def test_seller_refund_uses_one_durable_financial_effect(
     )
     assert projected["refunded_amount_inr"] == 89
     assert projected["refund_status"] == "succeeded"
+    assert projected["refund_authorization"] == {
+        "receipt_id": first["receipt"]["receipt_id"],
+        "outcome": "succeeded",
+        "amount_inr": 89,
+        "recorded_at": first["receipt"]["created_at"],
+    }
     async with pool.connection() as connection:
         counts = await connection.execute(
             """

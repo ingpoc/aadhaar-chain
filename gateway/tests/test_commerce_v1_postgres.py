@@ -329,6 +329,58 @@ async def test_cart_version_price_change_and_quote_expiry_fail_and_release(
         assert (await result.fetchone())[0] == 0
 
 
+async def test_new_preview_releases_abandoned_expired_quote_holds(commerce) -> None:
+    service, pool, clock = commerce
+    _, expired = await _cart_and_quote(
+        service,
+        sku="abandoned-item",
+        stock=2,
+        quantity=1,
+        ttl_seconds=1,
+    )
+    clock.now += timedelta(seconds=2)
+
+    cart = await service.create_cart(
+        principal_id="principal:buyer-1",
+        seller_id="seller-1",
+    )
+    cart = await service.set_cart_line(
+        principal_id="principal:buyer-1",
+        cart_id=cart["cart_id"],
+        sku="abandoned-item",
+        quantity=1,
+        expected_version=cart["version"],
+    )
+    current = await service.preview_checkout(
+        principal_id="principal:buyer-1",
+        cart_id=cart["cart_id"],
+        expected_version=cart["version"],
+    )
+
+    async with pool.connection() as connection:
+        inventory = await connection.execute(
+            """
+            SELECT reserved_quantity
+            FROM commerce_inventory
+            WHERE seller_id = 'seller-1' AND sku = 'abandoned-item'
+            """
+        )
+        assert (await inventory.fetchone())[0] == 1
+        quotes = await connection.execute(
+            """
+            SELECT quote_id, status
+            FROM commerce_quotes
+            WHERE quote_id IN (%s, %s)
+            ORDER BY quote_id
+            """,
+            (expired["quote_id"], current["quote_id"]),
+        )
+        assert {str(row[0]): row[1] for row in await quotes.fetchall()} == {
+            expired["quote_id"]: "expired",
+            current["quote_id"]: "open",
+        }
+
+
 async def test_failed_payment_releases_inventory_and_unknown_can_reconcile(
     commerce,
 ) -> None:

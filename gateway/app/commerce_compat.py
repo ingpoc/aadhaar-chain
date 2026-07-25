@@ -80,6 +80,20 @@ class CommerceCompatibilityAdapter:
             },
             "refunded_amount_inr": (row.get("refunded_amount_paise") or 0) / 100,
             "refund_status": row.get("refund_status"),
+            "refund_authorization": (
+                {
+                    "receipt_id": row.get("refund_authorization_receipt_id"),
+                    "outcome": row.get("refund_authorization_outcome") or "succeeded",
+                    "amount_inr": int(
+                        row.get("refund_authorization_amount_inr") or 0
+                    ),
+                    "recorded_at": _iso(
+                        row.get("refund_authorization_created_at")
+                    ),
+                }
+                if row.get("refund_authorization_receipt_id")
+                else None
+            ),
             "authorization": (
                 {
                     "decision": "allow",
@@ -708,6 +722,10 @@ class CommerceCompatibilityAdapter:
                            auth_receipt.authorization_outcome,
                            auth_receipt.authorization_amount_paise,
                            auth_receipt.authorization_created_at,
+                           refund_receipt.refund_authorization_receipt_id,
+                           refund_receipt.refund_authorization_outcome,
+                           refund_receipt.refund_authorization_amount_inr,
+                           refund_receipt.refund_authorization_created_at,
                            refund.refunded_amount_paise,
                            refund.refund_status
                     FROM commerce_orders o
@@ -729,6 +747,24 @@ class CommerceCompatibilityAdapter:
                         ORDER BY receipt.created_at DESC
                         LIMIT 1
                     ) AS auth_receipt ON TRUE
+                    LEFT JOIN LATERAL (
+                        SELECT
+                            receipt.receipt_id AS refund_authorization_receipt_id,
+                            receipt.payload->>'outcome' AS refund_authorization_outcome,
+                            receipt.payload->'bound_action'->>'amount_inr'
+                                AS refund_authorization_amount_inr,
+                            COALESCE(
+                                NULLIF(receipt.payload->>'created_at', '')::timestamptz,
+                                receipt.created_at
+                            ) AS refund_authorization_created_at
+                        FROM agentguard_receipts AS receipt
+                        WHERE receipt.principal_id = o.seller_id
+                          AND receipt.payload->>'action' = 'seller.refund.issue'
+                          AND receipt.payload->'bound_action'->>'resource_id'
+                              = o.order_id::text
+                        ORDER BY receipt.created_at DESC
+                        LIMIT 1
+                    ) AS refund_receipt ON TRUE
                     LEFT JOIN LATERAL (
                         SELECT amount_paise AS refunded_amount_paise,
                                status AS refund_status

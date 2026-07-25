@@ -226,6 +226,7 @@ class CommerceV1:
                         if record["status"] != "success" or record["response"] is None:
                             raise CommerceConflict("checkout preview is incomplete")
                         return record["response"]
+                await repository.release_expired_quotes(self.clock())
                 cart = await repository.get_cart_with_lines(
                     UUID(str(cart_id)), principal_id, lock=True
                 )

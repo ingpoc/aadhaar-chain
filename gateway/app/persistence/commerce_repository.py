@@ -282,6 +282,23 @@ class CommerceRepository:
             (status, quote_id),
         )
 
+    async def release_expired_quotes(self, now: datetime) -> int:
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                """
+                SELECT quote_id
+                FROM commerce_quotes
+                WHERE status = 'open' AND expires_at <= %s
+                ORDER BY expires_at, quote_id
+                FOR UPDATE SKIP LOCKED
+                """,
+                (now,),
+            )
+            expired = await cursor.fetchall()
+        for quote in expired:
+            await self.release_quote(quote["quote_id"], "expired")
+        return len(expired)
+
     async def create_order_and_payment(
         self,
         order_id: UUID,
