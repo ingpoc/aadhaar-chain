@@ -8,10 +8,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import time
 from typing import Any, Optional, Union
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 
 def minify_json(payload: Union[str, bytes, dict[str, Any], list[Any]]) -> str:
@@ -20,12 +24,16 @@ def minify_json(payload: Union[str, bytes, dict[str, Any], list[Any]]) -> str:
         text = payload.decode("utf-8")
         # Re-minify if already JSON text
         try:
-            return json.dumps(json.loads(text), separators=(",", ":"), ensure_ascii=False)
+            return json.dumps(
+                json.loads(text), separators=(",", ":"), ensure_ascii=False
+            )
         except json.JSONDecodeError:
             return text
     if isinstance(payload, str):
         try:
-            return json.dumps(json.loads(payload), separators=(",", ":"), ensure_ascii=False)
+            return json.dumps(
+                json.loads(payload), separators=(",", ":"), ensure_ascii=False
+            )
         except json.JSONDecodeError:
             return payload
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
@@ -49,7 +57,9 @@ def sign_ed25519(private_key: Ed25519PrivateKey, message: str) -> str:
     return base64.b64encode(sig).decode("ascii")
 
 
-def verify_ed25519(public_key: Ed25519PublicKey, message: str, signature_b64: str) -> bool:
+def verify_ed25519(
+    public_key: Ed25519PublicKey, message: str, signature_b64: str
+) -> bool:
     try:
         public_key.verify(base64.b64decode(signature_b64), message.encode("utf-8"))
         return True
@@ -79,6 +89,44 @@ def create_authorization_header(
         f'created="{created_ts}",expires="{expires_ts}",'
         f'headers="(created) (expires) digest",signature="{signature}"'
     )
+
+
+def verify_authorization_header(
+    body: Union[str, bytes, dict[str, Any]],
+    header: str,
+    *,
+    signing_public_key_b64: str,
+    expected_subscriber_id: str,
+    expected_unique_key_id: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Verify an ONDC Signature header against an exact registry identity."""
+    if not header.startswith("Signature "):
+        return False
+    params = dict(re.findall(r'([A-Za-z_]+)="([^"]*)"', header[10:]))
+    key_parts = params.get("keyId", "").split("|")
+    if key_parts != [expected_subscriber_id, expected_unique_key_id, "ed25519"]:
+        return False
+    if (
+        params.get("algorithm") != "ed25519"
+        or params.get("headers") != "(created) (expires) digest"
+    ):
+        return False
+    try:
+        created = int(params["created"])
+        expires = int(params["expires"])
+        current = int(time.time()) if now is None else int(now)
+        public_key = Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(signing_public_key_b64)
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    if created > current + 300 or expires < current or expires <= created:
+        return False
+    signing_string = create_signing_string(
+        blake2b_digest_b64(minify_json(body)), created, expires
+    )
+    return verify_ed25519(public_key, signing_string, params.get("signature", ""))
 
 
 def load_ed25519_private_pem(pem_bytes: bytes) -> Ed25519PrivateKey:

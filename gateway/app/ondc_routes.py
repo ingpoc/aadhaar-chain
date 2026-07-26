@@ -19,7 +19,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app import ondc_store
-from app.ondc_crypto import create_authorization_header, load_ed25519_private_pem, minify_json
+from app.ondc_crypto import (
+    create_authorization_header,
+    load_ed25519_private_pem,
+    minify_json,
+    verify_authorization_header,
+)
 from app.persistence.ondc_repository import (
     CorrelationMismatch,
     EnvelopeCommitmentMismatch,
@@ -36,6 +41,8 @@ PREPROD_LOOKUP = "https://preprod.registry.ondc.org/v2.0/lookup"
 DEFAULT_CITY = "std:080"
 DEFAULT_DOMAIN = "ONDC:RET10"
 CORE_VERSION = "1.2.0"
+LOGISTICS_DOMAIN = "ONDC:LOG10"
+LOGISTICS_CORE_VERSION = "1.2.5"
 
 
 async def _stage_outbox_before_dispatch(
@@ -56,8 +63,7 @@ async def _stage_outbox_before_dispatch(
 
     context = entry["payload"]["context"]
     correlation_id = (
-        request.headers.get("X-Correlation-ID")
-        or str(context["transaction_id"])
+        request.headers.get("X-Correlation-ID") or str(context["transaction_id"])
     ).strip()
     async with UnitOfWork(pool) as unit_of_work:
         repository = ONDCRepository(unit_of_work)
@@ -131,9 +137,7 @@ async def _complete_outbox_delivery(
 ) -> dict[str, Any] | None:
     """Finish the active lease or make the durable delivery retryable."""
     if staged["backend"] == "local_file":
-        ondc_store.update_outbox(
-            staged["entry"]["id"], **(file_updates or {})
-        )
+        ondc_store.update_outbox(staged["entry"]["id"], **(file_updates or {}))
         return None
 
     claimed = staged["persisted"]
@@ -157,10 +161,13 @@ def _buyer_paths() -> dict[str, Path]:
     return _role_paths("buyer")
 
 
-def _buyer_uk_id() -> Optional[str]:
-    if getattr(settings, "ondc_unique_key_id", None):
-        return str(settings.ondc_unique_key_id).strip() or None
-    paths = _buyer_paths()
+def _lbnp_paths() -> dict[str, Path]:
+    from app.ondc_onboard_routes import _role_paths
+
+    return _role_paths("lbnp")
+
+
+def _key_id_from_paths(paths: dict[str, Path]) -> Optional[str]:
     if paths["uk_id"].is_file():
         value = paths["uk_id"].read_text(encoding="utf-8").strip()
         if value:
@@ -168,15 +175,29 @@ def _buyer_uk_id() -> Optional[str]:
     if paths["meta"].is_file():
         try:
             meta = json.loads(paths["meta"].read_text(encoding="utf-8"))
-            uk = meta.get("unique_key_id")
-            if uk:
-                return str(uk).strip()
+            uk_id = meta.get("unique_key_id")
+            if uk_id:
+                return str(uk_id).strip()
         except json.JSONDecodeError:
             pass
     return None
 
 
-def _subscriber_id() -> Optional[str]:
+def _unique_key_id(role: str = "buyer") -> Optional[str]:
+    if role == "buyer" and getattr(settings, "ondc_unique_key_id", None):
+        return str(settings.ondc_unique_key_id).strip() or None
+    return _key_id_from_paths(_lbnp_paths() if role == "lbnp" else _buyer_paths())
+
+
+def _buyer_uk_id() -> Optional[str]:
+    return _unique_key_id("buyer")
+
+
+def _subscriber_id(role: str = "buyer") -> Optional[str]:
+    if role == "lbnp":
+        from app.ondc_onboard_routes import _subscriber_id as onboard_subscriber_id
+
+        return onboard_subscriber_id("lbnp")
     return (
         getattr(settings, "ondc_subscriber_id", None)
         or getattr(settings, "ondc_bap_id", None)
@@ -184,11 +205,11 @@ def _subscriber_id() -> Optional[str]:
     )
 
 
-def _bap_uri() -> Optional[str]:
-    configured = getattr(settings, "ondc_bap_uri", None)
+def _bap_uri(role: str = "buyer") -> Optional[str]:
+    configured = getattr(settings, "ondc_bap_uri", None) if role == "buyer" else None
     if configured:
         return configured.rstrip("/")
-    sid = _subscriber_id()
+    sid = _subscriber_id(role)
     if sid and "." in sid:
         return f"https://{sid}/ondc"
     return None
@@ -202,32 +223,44 @@ def _registry_url() -> str:
     return (getattr(settings, "ondc_registry_url", None) or PREPROD_LOOKUP).strip()
 
 
-def _signing_pem_path() -> Optional[Path]:
-    configured = getattr(settings, "ondc_signing_private_key_path", None)
+def _signing_role_for_envelope(envelope: dict[str, Any]) -> str:
+    context = envelope.get("context") or {}
+    return "lbnp" if context.get("domain") == LOGISTICS_DOMAIN else "buyer"
+
+
+def _signing_pem_path(role: str = "buyer") -> Optional[Path]:
+    configured = (
+        getattr(settings, "ondc_signing_private_key_path", None)
+        if role == "buyer"
+        else None
+    )
     if configured:
         path = Path(configured).expanduser()
         if path.is_file():
             return path
-    paths = _buyer_paths()
+    paths = _lbnp_paths() if role == "lbnp" else _buyer_paths()
     if paths["signing_pem"].is_file():
         return paths["signing_pem"]
     return None
 
 
-def _load_buyer_signing_key():
-    path = _signing_pem_path()
+def _load_signing_key(role: str = "buyer"):
+    path = _signing_pem_path(role)
     if path is None:
-        raise HTTPException(status_code=503, detail="ONDC Buyer signing key missing")
+        raise HTTPException(
+            status_code=503,
+            detail=f"ONDC {role} signing key missing",
+        )
     return load_ed25519_private_pem(path.read_bytes())
 
 
-def _ondc_configured() -> bool:
+def _ondc_configured(role: str = "buyer") -> bool:
     return bool(
         getattr(settings, "ondc_enabled", False)
-        and _subscriber_id()
-        and _bap_uri()
-        and _buyer_uk_id()
-        and _signing_pem_path() is not None
+        and _subscriber_id(role)
+        and _bap_uri(role)
+        and _unique_key_id(role)
+        and _signing_pem_path(role) is not None
     )
 
 
@@ -285,6 +318,17 @@ class OrderActionBody(BaseModel):
     domain: Optional[str] = None
 
 
+class LogisticsActionBody(BaseModel):
+    """Bounded LOG10 P2P forward-lifecycle message."""
+
+    message: dict[str, Any] = Field(default_factory=dict)
+    message_id: Optional[str] = None
+    transaction_id: Optional[str] = None
+    bpp_id: Optional[str] = None
+    bpp_uri: Optional[str] = None
+    city: Optional[str] = None
+
+
 class ConfirmBody(OrderActionBody):
     """Backward-compatible alias for confirm."""
 
@@ -301,15 +345,26 @@ def _iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
 
 
-def _build_search_envelope(body: SearchBody) -> dict[str, Any]:
+def _build_search_envelope(body: SearchBody, *, role: str = "buyer") -> dict[str, Any]:
     message_id = body.message_id or str(uuid.uuid4())
     transaction_id = body.transaction_id or str(uuid.uuid4())
     intent = dict(body.intent or {})
+    if role == "lbnp":
+        category_id = str((intent.get("category") or {}).get("id") or "")
+        fulfillment_type = str((intent.get("fulfillment") or {}).get("type") or "")
+        if category_id != "Immediate Delivery" or fulfillment_type != "Delivery":
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "LOG10 scope is Immediate Delivery, P2P, forward lifecycle "
+                    "with fulfillment.type=Delivery"
+                ),
+            )
     if body.query and not (intent.get("item") or {}).get("descriptor"):
         intent.setdefault("item", {})
         intent["item"].setdefault("descriptor", {})
         intent["item"]["descriptor"]["name"] = body.query
-    if "fulfillment" not in intent:
+    if role == "buyer" and "fulfillment" not in intent:
         intent["fulfillment"] = {
             "type": "Delivery",
             "end": {
@@ -319,19 +374,28 @@ def _build_search_envelope(body: SearchBody) -> dict[str, Any]:
                 }
             },
         }
-    payment = intent.setdefault("payment", {})
-    payment.setdefault("@ondc/org/buyer_app_finder_fee_type", "Percent")
-    payment.setdefault("@ondc/org/buyer_app_finder_fee_amount", "0")
-    bap_id = getattr(settings, "ondc_bap_id", None) or _subscriber_id()
+    if role == "buyer":
+        payment = intent.setdefault("payment", {})
+        payment.setdefault("@ondc/org/buyer_app_finder_fee_type", "Percent")
+        payment.setdefault("@ondc/org/buyer_app_finder_fee_amount", "0")
+    bap_id = (
+        getattr(settings, "ondc_bap_id", None) or _subscriber_id()
+        if role == "buyer"
+        else _subscriber_id("lbnp")
+    )
     return {
         "context": {
-            "domain": body.domain or DEFAULT_DOMAIN,
+            "domain": (
+                body.domain or DEFAULT_DOMAIN if role == "buyer" else LOGISTICS_DOMAIN
+            ),
             "action": "search",
             "country": "IND",
             "city": body.city or DEFAULT_CITY,
-            "core_version": CORE_VERSION,
+            "core_version": (
+                CORE_VERSION if role == "buyer" else LOGISTICS_CORE_VERSION
+            ),
             "bap_id": bap_id,
-            "bap_uri": _bap_uri(),
+            "bap_uri": _bap_uri(role),
             "transaction_id": transaction_id,
             "message_id": message_id,
             "timestamp": _iso_now(),
@@ -341,12 +405,16 @@ def _build_search_envelope(body: SearchBody) -> dict[str, Any]:
     }
 
 
-async def _signed_post(url: str, payload: dict[str, Any]) -> tuple[int, Any, str]:
-    subscriber_id = _subscriber_id()
-    uk_id = _buyer_uk_id()
+async def _signed_post(
+    url: str, payload: dict[str, Any], *, role: str = "buyer"
+) -> tuple[int, Any, str]:
+    subscriber_id = _subscriber_id(role)
+    uk_id = _unique_key_id(role)
     if not subscriber_id or not uk_id:
-        raise HTTPException(status_code=503, detail="ONDC subscriber_id / unique_key_id missing")
-    private_key = _load_buyer_signing_key()
+        raise HTTPException(
+            status_code=503, detail="ONDC subscriber_id / unique_key_id missing"
+        )
+    private_key = _load_signing_key(role)
     body_str = minify_json(payload)
     auth = create_authorization_header(
         body_str,
@@ -381,9 +449,7 @@ async def ondc_status(request: Request) -> JSONResponse:
             data["outbox_depth"] = len(
                 await repository.list_records("outbox", limit=500)
             )
-            data["inbox_depth"] = len(
-                await repository.list_records("inbox", limit=500)
-            )
+            data["inbox_depth"] = len(await repository.list_records("inbox", limit=500))
         data["persistence_backend"] = "postgres"
     else:
         data["persistence_backend"] = "local_file"
@@ -404,8 +470,10 @@ async def ondc_lookup(body: LookupBody) -> JSONResponse:
     }
     if body.type:
         payload["type"] = body.type
-    if body.ukId or _buyer_uk_id():
-        payload["ukId"] = body.ukId or _buyer_uk_id()
+    if body.ukId:
+        payload["ukId"] = body.ukId
+    elif not body.subscriber_id or body.subscriber_id == _subscriber_id():
+        payload["ukId"] = _buyer_uk_id()
     status, data, _ = await _signed_post(_registry_url(), payload)
     return JSONResponse(
         {
@@ -421,18 +489,19 @@ async def ondc_lookup(body: LookupBody) -> JSONResponse:
     )
 
 
-@router.post("/api/ondc/search")
-async def ondc_search(body: SearchBody, request: Request) -> JSONResponse:
+async def _dispatch_search(
+    body: SearchBody, request: Request, *, role: str = "buyer"
+) -> JSONResponse:
     """Signed Beckn search → PreProd gateway; persist outbox status."""
-    if not _ondc_configured():
+    if not _ondc_configured(role):
         raise HTTPException(
             status_code=503,
             detail=(
-                "ONDC adapter not ready. Set ONDC_ENABLED=true, subscriber/bap_uri, "
-                "Buyer signing PEM + unique_key_id."
+                f"ONDC {role} adapter not ready. Set ONDC_ENABLED=true, "
+                "subscriber/bap_uri, signing PEM + unique_key_id."
             ),
         )
-    envelope = _build_search_envelope(body)
+    envelope = _build_search_envelope(body, role=role)
     message_id = envelope["context"]["message_id"]
     transaction_id = envelope["context"]["transaction_id"]
     entry = {
@@ -467,7 +536,7 @@ async def ondc_search(body: SearchBody, request: Request) -> JSONResponse:
             }
         )
     try:
-        status, data, _ = await _signed_post(gateway_url, envelope)
+        status, data, _ = await _signed_post(gateway_url, envelope, role=role)
     except HTTPException:
         await _complete_outbox_delivery(
             staged,
@@ -483,7 +552,9 @@ async def ondc_search(body: SearchBody, request: Request) -> JSONResponse:
             error=str(exc),
             file_updates={"status": "error", "error": str(exc)},
         )
-        raise HTTPException(status_code=502, detail=f"ONDC gateway dispatch failed: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"ONDC gateway dispatch failed: {exc}"
+        ) from exc
 
     ack = None
     if isinstance(data, dict):
@@ -502,7 +573,7 @@ async def ondc_search(body: SearchBody, request: Request) -> JSONResponse:
         },
     )
     direct_bpp: Optional[dict[str, Any]] = None
-    if body.include_configured_bpp:
+    if role == "buyer" and body.include_configured_bpp:
         # Portfolio proof: keep normal PreProd fanout, and send the same signed
         # Beckn search to the server-configured BPP. Callers cannot supply a URL.
         # An explicitly blank Render env used to suppress the Settings default,
@@ -539,7 +610,9 @@ async def ondc_search(body: SearchBody, request: Request) -> JSONResponse:
                     )
                 bpp_ack = None
                 if isinstance(bpp_data, dict):
-                    bpp_ack = ((bpp_data.get("message") or {}).get("ack") or {}).get("status")
+                    bpp_ack = ((bpp_data.get("message") or {}).get("ack") or {}).get(
+                        "status"
+                    )
                 bpp_delivered = bpp_status < 400 and bpp_ack != "NACK"
                 if not direct_staged.get("already_delivered"):
                     await _complete_outbox_delivery(
@@ -563,9 +636,8 @@ async def ondc_search(body: SearchBody, request: Request) -> JSONResponse:
                         direct_bpp_status=bpp_status,
                     )
             except Exception as exc:  # noqa: BLE001
-                if (
-                    direct_staged["backend"] == "postgres"
-                    and not direct_staged.get("already_delivered")
+                if direct_staged["backend"] == "postgres" and not direct_staged.get(
+                    "already_delivered"
                 ):
                     await _complete_outbox_delivery(
                         direct_staged,
@@ -593,8 +665,22 @@ async def ondc_search(body: SearchBody, request: Request) -> JSONResponse:
     )
 
 
+@router.post("/api/ondc/search")
+async def ondc_search(body: SearchBody, request: Request) -> JSONResponse:
+    return await _dispatch_search(body, request)
+
+
+@router.post("/api/ondc/logistics/search")
+async def ondc_logistics_search(body: SearchBody, request: Request) -> JSONResponse:
+    return await _dispatch_search(body, request, role="lbnp")
+
+
 async def _resolve_bpp_target(
-    request: Request, body: OrderActionBody, *, transaction_id: str
+    request: Request,
+    body: OrderActionBody | LogisticsActionBody,
+    *,
+    transaction_id: str,
+    role: str = "buyer",
 ) -> tuple[str, str]:
     """Resolve bpp_id + bpp_uri from body or prior on_search catalogs."""
     bpp_id = (body.bpp_id or "").strip()
@@ -606,9 +692,7 @@ async def _resolve_bpp_target(
         catalogs = ondc_store.catalogs_for_transaction(transaction_id)
     else:
         async with UnitOfWork(pool) as unit_of_work:
-            durable_callbacks = await ONDCRepository(
-                unit_of_work
-            ).list_for_transaction(
+            durable_callbacks = await ONDCRepository(unit_of_work).list_for_transaction(
                 "inbox", transaction_id, action="on_search"
             )
         catalogs = [
@@ -625,39 +709,89 @@ async def _resolve_bpp_target(
             bpp_uri = str(row["bpp_uri"]).rstrip("/")
         if bpp_id and bpp_uri:
             break
+    if role == "lbnp" and (not bpp_id or not bpp_uri):
+        raise HTTPException(
+            status_code=422,
+            detail="LOG10 bpp_id and bpp_uri must come from the selected on_search",
+        )
     if not bpp_id:
         bpp_id = getattr(settings, "ondc_bpp_id", None) or "ondcseller.aadharcha.in"
     if not bpp_uri:
         bpp_uri = (
-            getattr(settings, "ondc_bpp_uri", None)
-            or f"https://{bpp_id}/ondc"
+            getattr(settings, "ondc_bpp_uri", None) or f"https://{bpp_id}/ondc"
         ).rstrip("/")
     return bpp_id, bpp_uri
 
 
 async def _dispatch_order_action(
-    request: Request, action: str, body: OrderActionBody
+    request: Request,
+    action: str,
+    body: OrderActionBody | LogisticsActionBody,
+    *,
+    role: str = "buyer",
 ) -> JSONResponse:
     """Signed select/init/confirm → bpp_uri/{action}; persist outbox."""
-    if action not in {"select", "init", "confirm"}:
+    allowed_actions = (
+        {"select", "init", "confirm"}
+        if role == "buyer"
+        else {"init", "confirm", "update", "status", "track"}
+    )
+    if action not in allowed_actions:
         raise HTTPException(status_code=400, detail=f"unsupported action: {action}")
-    if not _ondc_configured():
+    if not _ondc_configured(role):
         raise HTTPException(status_code=503, detail="ONDC adapter not ready.")
     message_id = body.message_id or str(uuid.uuid4())
     transaction_id = body.transaction_id or str(uuid.uuid4())
     bpp_id, bpp_uri = await _resolve_bpp_target(
-        request, body, transaction_id=transaction_id
+        request, body, transaction_id=transaction_id, role=role
     )
-    bap_id = getattr(settings, "ondc_bap_id", None) or _subscriber_id()
+    if role == "lbnp":
+        message = dict(body.message)  # type: ignore[union-attr]
+        if action in {"init", "confirm", "update"}:
+            order = message.get("order")
+            fulfillments = (
+                order.get("fulfillments") if isinstance(order, dict) else None
+            )
+            if not isinstance(fulfillments, list) or not fulfillments:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"LOG10 {action} requires message.order.fulfillments",
+                )
+            if any(
+                not isinstance(item, dict) or item.get("type") != "Delivery"
+                for item in fulfillments
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="LOG10 initial scope allows Delivery fulfillments only",
+                )
+        elif not str(message.get("order_id") or "").strip():
+            raise HTTPException(
+                status_code=422,
+                detail=f"LOG10 {action} requires message.order_id",
+            )
+    else:
+        message = {"order": body.order or {}}  # type: ignore[union-attr]
+    bap_id = (
+        getattr(settings, "ondc_bap_id", None) or _subscriber_id()
+        if role == "buyer"
+        else _subscriber_id("lbnp")
+    )
     envelope = {
         "context": {
-            "domain": body.domain or DEFAULT_DOMAIN,
+            "domain": (
+                body.domain or DEFAULT_DOMAIN  # type: ignore[union-attr]
+                if role == "buyer"
+                else LOGISTICS_DOMAIN
+            ),
             "action": action,
             "country": "IND",
             "city": body.city or DEFAULT_CITY,
-            "core_version": CORE_VERSION,
+            "core_version": (
+                CORE_VERSION if role == "buyer" else LOGISTICS_CORE_VERSION
+            ),
             "bap_id": bap_id,
-            "bap_uri": _bap_uri(),
+            "bap_uri": _bap_uri(role),
             "bpp_id": bpp_id,
             "bpp_uri": bpp_uri,
             "transaction_id": transaction_id,
@@ -665,7 +799,7 @@ async def _dispatch_order_action(
             "timestamp": _iso_now(),
             "ttl": "PT30S",
         },
-        "message": {"order": body.order or {}},
+        "message": message,
     }
     entry = {
         "id": f"out_{uuid.uuid4().hex[:12]}",
@@ -679,9 +813,7 @@ async def _dispatch_order_action(
         "bpp_uri": bpp_uri,
     }
     target = f"{bpp_uri}/{action}"
-    staged = await _stage_outbox_before_dispatch(
-        request, entry, destination=target
-    )
+    staged = await _stage_outbox_before_dispatch(request, entry, destination=target)
     if staged.get("already_delivered"):
         return JSONResponse(
             {
@@ -700,7 +832,7 @@ async def _dispatch_order_action(
             }
         )
     try:
-        status, data, _ = await _signed_post(target, envelope)
+        status, data, _ = await _signed_post(target, envelope, role=role)
     except HTTPException:
         await _complete_outbox_delivery(
             staged,
@@ -716,7 +848,9 @@ async def _dispatch_order_action(
             error=str(exc),
             file_updates={"status": "error", "error": str(exc)},
         )
-        raise HTTPException(status_code=502, detail=f"ONDC BPP {action} failed: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"ONDC BPP {action} failed: {exc}"
+        ) from exc
 
     ack = None
     if isinstance(data, dict):
@@ -770,6 +904,41 @@ async def ondc_confirm(body: ConfirmBody, request: Request) -> JSONResponse:
     return await _dispatch_order_action(request, "confirm", body)
 
 
+@router.post("/api/ondc/logistics/init")
+async def ondc_logistics_init(
+    body: LogisticsActionBody, request: Request
+) -> JSONResponse:
+    return await _dispatch_order_action(request, "init", body, role="lbnp")
+
+
+@router.post("/api/ondc/logistics/confirm")
+async def ondc_logistics_confirm(
+    body: LogisticsActionBody, request: Request
+) -> JSONResponse:
+    return await _dispatch_order_action(request, "confirm", body, role="lbnp")
+
+
+@router.post("/api/ondc/logistics/update")
+async def ondc_logistics_update(
+    body: LogisticsActionBody, request: Request
+) -> JSONResponse:
+    return await _dispatch_order_action(request, "update", body, role="lbnp")
+
+
+@router.post("/api/ondc/logistics/status")
+async def ondc_logistics_status(
+    body: LogisticsActionBody, request: Request
+) -> JSONResponse:
+    return await _dispatch_order_action(request, "status", body, role="lbnp")
+
+
+@router.post("/api/ondc/logistics/track")
+async def ondc_logistics_track(
+    body: LogisticsActionBody, request: Request
+) -> JSONResponse:
+    return await _dispatch_order_action(request, "track", body, role="lbnp")
+
+
 def _queue_record(row: dict[str, Any]) -> dict[str, Any]:
     """JSON-safe operational projection of a durable protocol record."""
     return {
@@ -807,6 +976,91 @@ async def _persistent_records(
     return [_queue_record(row) for row in rows]
 
 
+async def _advertised_logistics_version(
+    request: Request,
+    *,
+    transaction_id: str,
+    bpp_id: str,
+    version: str,
+) -> bool:
+    records = await _persistent_records(
+        request,
+        "inbox",
+        transaction_id=transaction_id,
+        action="on_search",
+        limit=100,
+    )
+    if records is None:
+        records = ondc_store.callbacks_for_transaction(transaction_id)
+    for record in records:
+        envelope = record.get("envelope") or record.get("payload") or {}
+        context = envelope.get("context") or {}
+        if context.get("bpp_id") == bpp_id and context.get("core_version") == version:
+            return True
+    return False
+
+
+async def _verify_logistics_callback(
+    request: Request,
+    body: dict[str, Any],
+    *,
+    action: str,
+) -> tuple[bool, str]:
+    context = body.get("context") or {}
+    version = str(context.get("core_version") or "")
+    if version not in {LOGISTICS_CORE_VERSION, "1.2.0"}:
+        return False, f"unsupported LOG10 core_version: {version or 'missing'}"
+    bpp_id = str(context.get("bpp_id") or "").strip()
+    if version == "1.2.0" and action != "on_search":
+        advertised = await _advertised_logistics_version(
+            request,
+            transaction_id=str(context.get("transaction_id") or ""),
+            bpp_id=bpp_id,
+            version=version,
+        )
+        if not advertised:
+            return False, "LOG10 1.2.0 was not advertised by this BPP in on_search"
+
+    authorization = (request.headers.get("Authorization") or "").strip()
+    if not authorization:
+        return False, "missing ONDC Authorization header"
+    query = {
+        "subscriber_id": bpp_id,
+        "domain": LOGISTICS_DOMAIN,
+        "type": "BPP",
+        "country": "IND",
+    }
+    try:
+        status, response, _ = await _signed_post(_registry_url(), query, role="lbnp")
+    except Exception:  # noqa: BLE001
+        return False, "LOG10 registry verification unavailable"
+    if status >= 400 or not isinstance(response, list):
+        return False, "LOG10 BPP registry lookup failed"
+    for record in response:
+        if (
+            record.get("subscriber_id") != bpp_id
+            or record.get("domain") != LOGISTICS_DOMAIN
+            or record.get("type") != "BPP"
+            or record.get("status") != "SUBSCRIBED"
+        ):
+            continue
+        unique_key_id = str(record.get("ukId") or "").strip()
+        public_key = str(record.get("signing_public_key") or "").strip()
+        if (
+            unique_key_id
+            and public_key
+            and verify_authorization_header(
+                body,
+                authorization,
+                signing_public_key_b64=public_key,
+                expected_subscriber_id=bpp_id,
+                expected_unique_key_id=unique_key_id,
+            )
+        ):
+            return True, ""
+    return False, "LOG10 callback signature did not match the registry"
+
+
 def _require_recovery_write_contract(request: Request) -> tuple[str, str]:
     idempotency_key = (request.headers.get("Idempotency-Key") or "").strip()
     correlation_id = (request.headers.get("X-Correlation-ID") or "").strip()
@@ -826,16 +1080,19 @@ async def ondc_orders(
         request, "outbox", transaction_id=transaction_id, limit=500
     )
     if outbox is not None:
-        inbox = await _persistent_records(
-            request, "inbox", transaction_id=transaction_id, limit=500
-        ) or []
+        inbox = (
+            await _persistent_records(
+                request, "inbox", transaction_id=transaction_id, limit=500
+            )
+            or []
+        )
         order_actions = {"select", "init", "confirm"}
         items = []
         for record in outbox:
             if record["action"] not in order_actions:
                 continue
             envelope = record.get("envelope") or {}
-            order = ((envelope.get("message") or {}).get("order") or {})
+            order = (envelope.get("message") or {}).get("order") or {}
             items.append(
                 {
                     "id": order.get("id") or f"pg_out_{record['outbox_id']}",
@@ -891,6 +1148,26 @@ async def _ingest_callback(
             status_code=400,
         )
 
+    signature_verified = False
+    if ctx.get("domain") == LOGISTICS_DOMAIN:
+        signature_verified, verification_error = await _verify_logistics_callback(
+            request,
+            body,
+            action=normalized_action,
+        )
+        if not signature_verified:
+            return JSONResponse(
+                {
+                    "message": {"ack": {"status": "NACK"}},
+                    "error": {
+                        "type": "CORE-ERROR",
+                        "code": "30000",
+                        "message": verification_error,
+                    },
+                },
+                status_code=401,
+            )
+
     persistence_pool = getattr(request.app.state, "persistence_pool", None)
     if persistence_pool is not None:
         correlation_id = (
@@ -905,7 +1182,11 @@ async def _ingest_callback(
                 action=normalized_action,
                 correlation_id=correlation_id,
                 raw_envelope=body,
-                redacted_payload={"status": "received"},
+                redacted_payload={
+                    "status": "received",
+                    "signature_verified": signature_verified,
+                    "core_version": ctx.get("core_version"),
+                },
             )
         except (
             CorrelationMismatch,
@@ -945,6 +1226,7 @@ async def _ingest_callback(
         "transaction_id": transaction_id,
         "message_id": message_id,
         "bpp_id": subscriber_id,
+        "signature_verified": signature_verified,
     }
     ondc_store.append_inbox(entry)
     return JSONResponse({"message": {"ack": {"status": "ACK"}}})
@@ -1055,7 +1337,7 @@ async def ondc_catalogs(request: Request, transaction_id: str) -> JSONResponse:
         items = []
         for record in records:
             message = (record.get("envelope") or {}).get("message") or {}
-            providers = ((message.get("catalog") or {}).get("bpp/providers") or [])
+            providers = (message.get("catalog") or {}).get("bpp/providers") or []
             items.extend(providers)
     return JSONResponse(
         {
@@ -1076,7 +1358,9 @@ async def drain_ondc_outbox(request: Request, body: OutboxDrainBody) -> JSONResp
     _require_recovery_write_contract(request)
     pool = getattr(request.app.state, "persistence_pool", None)
     if pool is None:
-        raise HTTPException(status_code=409, detail="PostgreSQL persistence is required")
+        raise HTTPException(
+            status_code=409, detail="PostgreSQL persistence is required"
+        )
     async with UnitOfWork(pool) as unit_of_work:
         claimed = await ONDCRepository(unit_of_work).claim_outbox(
             worker_id=body.worker_id,
@@ -1089,7 +1373,9 @@ async def drain_ondc_outbox(request: Request, body: OutboxDrainBody) -> JSONResp
         error = ""
         try:
             status, response, _ = await _signed_post(
-                record["destination"], record["envelope"]
+                record["destination"],
+                record["envelope"],
+                role=_signing_role_for_envelope(record["envelope"]),
             )
             ack = (
                 ((response.get("message") or {}).get("ack") or {}).get("status")
@@ -1131,7 +1417,9 @@ async def requeue_ondc_dead_letter(
         raise HTTPException(status_code=404, detail="queue must be inbox|outbox")
     pool = getattr(request.app.state, "persistence_pool", None)
     if pool is None:
-        raise HTTPException(status_code=409, detail="PostgreSQL persistence is required")
+        raise HTTPException(
+            status_code=409, detail="PostgreSQL persistence is required"
+        )
     async with UnitOfWork(pool) as unit_of_work:
         updated = await ONDCRepository(unit_of_work).requeue_dead_letter(
             queue,  # type: ignore[arg-type]
