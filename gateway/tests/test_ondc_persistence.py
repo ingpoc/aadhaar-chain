@@ -428,7 +428,7 @@ async def test_live_confirm_uses_durable_outbox_and_one_effect_replay(
     signed_post = AsyncMock(
         return_value=(200, {"message": {"ack": {"status": "ACK"}}}, {})
     )
-    monkeypatch.setattr("app.ondc_routes._ondc_configured", lambda: True)
+    monkeypatch.setattr("app.ondc_routes._ondc_configured", lambda _role="buyer": True)
     monkeypatch.setattr("app.ondc_routes._signed_post", signed_post)
 
     def reject_file_fork(_entry: dict[str, object]) -> None:
@@ -480,7 +480,7 @@ async def test_live_confirm_failure_remains_retryable(
     api = FastAPI()
     api.state.persistence_pool = pool
     api.include_router(ondc_router)
-    monkeypatch.setattr("app.ondc_routes._ondc_configured", lambda: True)
+    monkeypatch.setattr("app.ondc_routes._ondc_configured", lambda _role="buyer": True)
     monkeypatch.setattr(
         "app.ondc_routes._signed_post",
         AsyncMock(side_effect=RuntimeError("network unavailable")),
