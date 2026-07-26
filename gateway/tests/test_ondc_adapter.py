@@ -1,6 +1,7 @@
 """Tests for ONDC crypto + BAP adapter (PreProd wiring)."""
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -8,10 +9,85 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from fastapi.testclient import TestClient
 
 from app.ondc_crypto import create_authorization_header, minify_json
 from config import settings
+
+
+def test_lbnp_onboarding_uses_dedicated_identity_and_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    signing = Ed25519PrivateKey.generate()
+    encryption = X25519PrivateKey.generate()
+    for name, key in (
+        ("signing_private.pem", signing),
+        ("encryption_private.pem", encryption),
+    ):
+        (tmp_path / name).write_bytes(
+            key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+        )
+    (tmp_path / "request_id.txt").write_text("lbnp-test-request\n", encoding="utf-8")
+    (tmp_path / "public_metadata.json").write_text(
+        json.dumps(
+            {
+                "source": "local",
+                "encryption_public_key_format": "asn1_der_spki_b64",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings, "ondc_lbnp_keys_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "ondc_registry_env", "preprod")
+
+    from app import ondc_onboard_routes
+    from main import app
+
+    client = TestClient(app)
+    status = client.get("/ondc/np/lbnp/status").json()["data"]
+    assert status["subscriber_id"] == "ondclbnp.aadharcha.in"
+    assert status["callback_url"] == "https://ondclbnp.aadharcha.in/ondc"
+    assert status["keys_dir"] == str(tmp_path)
+    assert status["contract"] == {
+        "domain": "ONDC:LOG10",
+        "participant_role": "Logistics Buyer NP / LBNP / BAP",
+        "protocol_target": "1.2.5",
+        "accepted_response_versions": ["1.2.5", "1.2.0"],
+        "response_version_rule": "Accept 1.2.0 only when the selected LSP advertises it",
+        "initial_scope": "Immediate Delivery, P2P, forward lifecycle only",
+        "counterparty_role": "External LSP / BPP",
+        "fleet_owner": "external LSP",
+    }
+    verification = client.get(
+        "/ondc-site-verification.html",
+        headers={"host": "ondclbnp.aadharcha.in"},
+    )
+    assert verification.status_code == 200
+    assert 'name="ondc-site-verification"' in verification.text
+
+    ondc_public = serialization.load_der_public_key(
+        base64.b64decode(ondc_onboard_routes.ONDC_ENC_PUBLIC_KEYS["preprod"])
+    )
+    shared = encryption.exchange(ondc_public)
+    plain = b"lbnp-challenge"
+    pad_len = 16 - (len(plain) % 16)
+    encryptor = Cipher(algorithms.AES(shared), modes.ECB()).encryptor()
+    challenge = base64.b64encode(
+        encryptor.update(plain + bytes([pad_len]) * pad_len) + encryptor.finalize()
+    ).decode("ascii")
+    callback = client.post(
+        "/ondc/on_subscribe",
+        headers={"host": "ondclbnp.aadharcha.in"},
+        json={"subscriber_id": "ondclbnp.aadharcha.in", "challenge": challenge},
+    )
+    assert callback.status_code == 200
+    assert callback.json() == {"answer": "lbnp-challenge"}
 
 
 @pytest.fixture()

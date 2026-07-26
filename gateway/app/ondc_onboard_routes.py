@@ -1,6 +1,7 @@
 """ONDC site verification + /on_subscribe hosting (staging onboarding).
 
-Serves paths that Vercel rewrites from Buyer/Seller FQDNs:
+Serves paths for the existing Buyer/Seller FQDN rewrites and the dedicated
+Logistics Buyer NP hostname:
   GET  /ondc/np/{role}/ondc-site-verification.html
   POST /ondc/np/{role}/on_subscribe
 
@@ -11,13 +12,14 @@ Keys (priority):
   1. Render/env PEM secrets → materialize under /tmp/ondc-env/{role}/ (ephemeral FS safe)
   2. ONDC_{ROLE}_KEYS_DIR override
   3. portal-download/{buyer,seller}/ under .local/ondc-sandbox (local PreProd)
-  4. {buyer,seller}/ local DER sandbox
+  4. {buyer,seller,lbnp}/ local DER sandbox
 
 Env (prefer *_PEM_B64 on Render; never commit values):
   ONDC_BUYER_SIGNING_PRIVATE_PEM[_B64], ONDC_BUYER_ENCRYPTION_PRIVATE_PEM[_B64]
   ONDC_SELLER_SIGNING_PRIVATE_PEM[_B64], ONDC_SELLER_ENCRYPTION_PRIVATE_PEM[_B64]
-  ONDC_{BUYER|SELLER}_REQUEST_ID, ONDC_{BUYER|SELLER}_UNIQUE_KEY_ID
-  ONDC_{BUYER|SELLER}_PUBLIC_METADATA_JSON (optional)
+  ONDC_LBNP_SIGNING_PRIVATE_PEM[_B64], ONDC_LBNP_ENCRYPTION_PRIVATE_PEM[_B64]
+  ONDC_{BUYER|SELLER|LBNP}_REQUEST_ID, ONDC_{BUYER|SELLER|LBNP}_UNIQUE_KEY_ID
+  ONDC_{BUYER|SELLER|LBNP}_PUBLIC_METADATA_JSON (optional)
 
 Does not flip ONDC_ENABLED / commerce demo mode.
 """
@@ -49,6 +51,21 @@ _GATEWAY_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_SANDBOX = _GATEWAY_ROOT / ".local" / "ondc-sandbox"
 _ENV_KEYS_ROOT = Path(os.environ.get("ONDC_ENV_KEYS_DIR", "/tmp/ondc-env"))
 _ENV_MATERIALIZED: set[str] = set()
+_DEFAULT_SUBSCRIBER_IDS = {
+    "buyer": "ondcbuyer.aadharcha.in",
+    "seller": "ondcseller.aadharcha.in",
+    "lbnp": "ondclbnp.aadharcha.in",
+}
+_LBNP_CONTRACT = {
+    "domain": "ONDC:LOG10",
+    "participant_role": "Logistics Buyer NP / LBNP / BAP",
+    "protocol_target": "1.2.5",
+    "accepted_response_versions": ["1.2.5", "1.2.0"],
+    "response_version_rule": "Accept 1.2.0 only when the selected LSP advertises it",
+    "initial_scope": "Immediate Delivery, P2P, forward lifecycle only",
+    "counterparty_role": "External LSP / BPP",
+    "fleet_owner": "external LSP",
+}
 
 
 class OnSubscribeBody(BaseModel):
@@ -65,6 +82,13 @@ def _ondc_env() -> str:
 
 def _role_env_prefix(role: str) -> str:
     return f"ONDC_{role.upper()}"
+
+
+def _subscriber_id(role: str) -> str:
+    default = _DEFAULT_SUBSCRIBER_IDS.get(role)
+    if default is None:
+        raise HTTPException(status_code=404, detail="role must be buyer|seller|lbnp")
+    return (getattr(settings, f"ondc_{role}_subscriber_id", None) or default).lower()
 
 
 def _decode_pem_env(raw: str) -> bytes:
@@ -171,8 +195,7 @@ def _resolve_keys_base(role: str) -> Path:
 
 def _role_paths(role: str) -> dict[str, Path]:
     role = role.lower().strip()
-    if role not in {"buyer", "seller"}:
-        raise HTTPException(status_code=404, detail="role must be buyer|seller")
+    _subscriber_id(role)
     base = _resolve_keys_base(role)
     return {
         "base": base,
@@ -294,13 +317,10 @@ async def np_on_subscribe(role: str, body: OnSubscribeBody) -> JSONResponse:
 
 def _host_role(host: str) -> Optional[str]:
     host = (host or "").split(":")[0].lower()
-    buyer = (getattr(settings, "ondc_buyer_subscriber_id", None) or "ondcbuyer.aadharcha.in").lower()
-    seller = (getattr(settings, "ondc_seller_subscriber_id", None) or "ondcseller.aadharcha.in").lower()
-    if host == buyer:
-        return "buyer"
-    if host == seller:
-        return "seller"
-    return None
+    return next(
+        (role for role in _DEFAULT_SUBSCRIBER_IDS if host == _subscriber_id(role)),
+        None,
+    )
 
 
 @router.get("/ondc-site-verification.html")
@@ -320,16 +340,18 @@ async def root_on_subscribe(request: Request, body: OnSubscribeBody) -> JSONResp
     if role is None and body.subscriber_id:
         # Fall back: match subscriber_id from body
         sid = body.subscriber_id.lower().strip()
-        buyer = (getattr(settings, "ondc_buyer_subscriber_id", None) or "ondcbuyer.aadharcha.in").lower()
-        seller = (getattr(settings, "ondc_seller_subscriber_id", None) or "ondcseller.aadharcha.in").lower()
-        if sid == buyer:
-            role = "buyer"
-        elif sid == seller:
-            role = "seller"
+        role = next(
+            (
+                candidate
+                for candidate in _DEFAULT_SUBSCRIBER_IDS
+                if sid == _subscriber_id(candidate)
+            ),
+            None,
+        )
     if role is None:
         raise HTTPException(
             status_code=404,
-            detail="Host/subscriber not mapped; use /ondc/np/{buyer|seller}/on_subscribe",
+            detail="Host/subscriber not mapped; use /ondc/np/{buyer|seller|lbnp}/on_subscribe",
         )
     return await _on_subscribe(role, body)
 
@@ -348,32 +370,33 @@ async def np_onboard_status(role: str) -> JSONResponse:
     if paths["uk_id"].is_file():
         uk_id = paths["uk_id"].read_text(encoding="utf-8").strip() or None
     uk_id = uk_id or meta.get("unique_key_id")
-    return JSONResponse(
-        {
-            "success": True,
-            "data": {
-                "role": role,
-                "keys_dir": str(paths["base"]),
-                "keys_source": meta.get("source")
-                or (
-                    "env"
-                    if str(paths["base"]).startswith(str(_ENV_KEYS_ROOT))
-                    else (
-                        "portal-download"
-                        if "portal-download" in str(paths["base"])
-                        else "local"
-                    )
-                ),
-                "signing_key_present": paths["signing_pem"].is_file(),
-                "encryption_key_present": paths["encryption_pem"].is_file(),
-                "request_id": request_id,
-                "unique_key_id": uk_id,
-                "encryption_public_key_format": meta.get("encryption_public_key_format"),
-                "signing_public_key_b64": meta.get("signing_public_key_b64"),
-                "encryption_public_key_b64": meta.get("encryption_public_key_b64"),
-                "registry_env": _ondc_env(),
-                "callback_url": "/ondc",
-                "note": "Wire Vercel rewrites to these paths; deploy PUBLIC gateway before registry challenge.",
-            },
-        }
-    )
+    data = {
+        "role": role,
+        "subscriber_id": _subscriber_id(role),
+        "keys_dir": str(paths["base"]),
+        "keys_source": meta.get("source")
+        or (
+            "env"
+            if str(paths["base"]).startswith(str(_ENV_KEYS_ROOT))
+            else (
+                "portal-download"
+                if "portal-download" in str(paths["base"])
+                else "local"
+            )
+        ),
+        "signing_key_present": paths["signing_pem"].is_file(),
+        "encryption_key_present": paths["encryption_pem"].is_file(),
+        "request_id": request_id,
+        "unique_key_id": uk_id,
+        "encryption_public_key_format": meta.get("encryption_public_key_format"),
+        "signing_public_key_b64": meta.get("signing_public_key_b64"),
+        "encryption_public_key_b64": meta.get("encryption_public_key_b64"),
+        "registry_env": _ondc_env(),
+        "callback_url": (
+            f"https://{_subscriber_id(role)}/ondc" if role == "lbnp" else "/ondc"
+        ),
+        "note": "Expose this shared gateway route over the participant FQDN before registry challenge.",
+    }
+    if role == "lbnp":
+        data["contract"] = _LBNP_CONTRACT
+    return JSONResponse({"success": True, "data": data})

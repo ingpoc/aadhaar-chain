@@ -37,6 +37,7 @@ class Settings(BaseSettings):
         "https://www.aadharcha.in",
         "https://ondcbuyer.aadharcha.in",
         "https://ondcseller.aadharcha.in",
+        "https://ondclbnp.aadharcha.in",
         "https://flatwatch.aadharcha.in",
     ]
     cors_allow_credentials: bool = True
@@ -122,8 +123,10 @@ class Settings(BaseSettings):
     ondc_registry_env: str = "preprod"  # staging | preprod | prod — portal ACK is PreProd
     ondc_buyer_subscriber_id: Optional[str] = "ondcbuyer.aadharcha.in"
     ondc_seller_subscriber_id: Optional[str] = "ondcseller.aadharcha.in"
+    ondc_lbnp_subscriber_id: Optional[str] = "ondclbnp.aadharcha.in"
     ondc_buyer_keys_dir: Optional[str] = None
     ondc_seller_keys_dir: Optional[str] = None
+    ondc_lbnp_keys_dir: Optional[str] = None
     # auto | portal | local — auto prefers portal-download PEMs when registry_env=preprod
     ondc_keys_source: str = "auto"
     # Seller BPP (PreProd)
