@@ -9,7 +9,7 @@ import hashlib
 import json
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -358,6 +358,27 @@ def _build_search_envelope(body: SearchBody, *, role: str = "buyer") -> dict[str
                 detail=(
                     "LOG10 scope is Immediate Delivery, P2P, forward lifecycle "
                     "with fulfillment.type=Delivery"
+                ),
+            )
+        holidays = (
+            (((intent.get("provider") or {}).get("time") or {}).get("schedule") or {})
+            .get("holidays")
+        )
+        try:
+            valid_holidays = isinstance(holidays, list) and bool(holidays) and all(
+                isinstance(value, str)
+                and datetime.strptime(value, "%Y-%m-%d").date()
+                > datetime.now(timezone.utc).date()
+                for value in holidays
+            )
+        except ValueError:
+            valid_holidays = False
+        if not valid_holidays:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "LOG10 v1.2.5 requires at least one future-dated "
+                    "provider.time.schedule.holidays entry"
                 ),
             )
     if body.query and not (intent.get("item") or {}).get("descriptor"):

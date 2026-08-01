@@ -410,6 +410,9 @@ def test_logistics_routes_use_only_the_dedicated_lbnp_contract(
         "message_id": "msg-search",
         "intent": {
             "category": {"id": "Immediate Delivery"},
+            "provider": {
+                "time": {"schedule": {"holidays": ["2099-12-31"]}}
+            },
             "fulfillment": {
                 "type": "Delivery",
                 "start": {"location": {"gps": "12.4535,77.9283"}},
@@ -467,6 +470,19 @@ def test_logistics_routes_use_only_the_dedicated_lbnp_contract(
         "intent": {**search["intent"], "category": {"id": "Standard Delivery"}},
     }
     assert client.post("/api/ondc/logistics/search", json=bad).status_code == 422
+    missing_holidays = {
+        **search,
+        "intent": {**search["intent"], "provider": {"time": {"schedule": {"holidays": []}}}},
+    }
+    assert client.post("/api/ondc/logistics/search", json=missing_holidays).status_code == 422
+    past_holidays = {
+        **search,
+        "intent": {
+            **search["intent"],
+            "provider": {"time": {"schedule": {"holidays": ["2020-01-01"]}}},
+        },
+    }
+    assert client.post("/api/ondc/logistics/search", json=past_holidays).status_code == 422
 
 
 def test_third_party_lookup_does_not_send_the_callers_key_id(
