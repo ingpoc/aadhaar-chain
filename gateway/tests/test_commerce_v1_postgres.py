@@ -15,6 +15,7 @@ from httpx import ASGITransport, AsyncClient
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
+from app.commerce_compat import CommerceCompatibilityAdapter
 from app.commerce_v1 import CommerceConflict, CommerceV1, IdempotencyConflict
 from app.commerce_v1_routes import router as commerce_v1_router
 from app.persistence import ConnectionPool, MigrationRunner
@@ -249,6 +250,234 @@ async def test_successful_purchase_is_durable_and_ledger_balanced(commerce) -> N
                         result["payment_attempt"]["payment_attempt_id"],
                     ),
                 )
+
+
+async def test_logistics_callbacks_update_one_bound_order_idempotently(commerce) -> None:
+    service, pool, _ = commerce
+    _, quote = await _cart_and_quote(service)
+    prepared = await service.prepare_checkout(
+        principal_id="principal:buyer-1",
+        quote_id=quote["quote_id"],
+        idempotency_key="checkout-logistics",
+    )
+    await service.record_payment_result(
+        principal_id="principal:buyer-1",
+        payment_attempt_id=prepared["payment_attempt"]["payment_attempt_id"],
+        status="succeeded",
+    )
+    order_id = str(prepared["order"]["order_id"])
+    compatibility = CommerceCompatibilityAdapter(pool)
+    await compatibility.transition_order(order_id, "confirmed")
+    await compatibility.transition_order(
+        order_id,
+        "preparing",
+        payload={
+            "provider_name": "Compliant LSP",
+            "logistics": {
+                "transaction_id": "txn-logistics-1",
+                "bpp_id": "lsp.example",
+                "core_version": "1.2.5",
+            },
+        },
+    )
+
+    rejected = {
+        "action": "on_init",
+        "message_id": "msg-init",
+        "bpp_id": "lsp.example",
+        "conformance": {
+            "status": "rejected",
+            "reason": "Immediate Delivery requires rider_check/inline_check_for_rider=yes",
+        },
+        "status_message": "Delivery provider response rejected",
+        "review_reason": "Immediate Delivery requires rider_check/inline_check_for_rider=yes",
+    }
+    first = await service.apply_logistics_update(
+        transaction_id="txn-logistics-1",
+        event_commitment="a" * 64,
+        update=rejected,
+    )
+    assert first["duplicate"] is False
+    version_after_first = int(first["order"]["version"])
+    replay = await service.apply_logistics_update(
+        transaction_id="txn-logistics-1",
+        event_commitment="a" * 64,
+        update=rejected,
+    )
+    assert replay["duplicate"] is True
+    assert int(replay["order"]["version"]) == version_after_first
+
+    replacement = await service.rebind_rejected_logistics_provider(
+        order_id=order_id,
+        logistics={
+            "transaction_id": "txn-logistics-2",
+            "bpp_id": "replacement.example",
+            "provider_name": "Replacement LSP",
+            "core_version": "1.2.5",
+            "signature_verified": True,
+        },
+    )
+    assert replacement["fulfilment"]["logistics"]["attempts"][0]["bpp_id"] == "lsp.example"
+
+    _, other_quote = await _cart_and_quote(
+        service,
+        principal="principal:buyer-2",
+        seller="seller-2",
+        sku="rice-5kg",
+    )
+    other_prepared = await service.prepare_checkout(
+        principal_id="principal:buyer-2",
+        quote_id=other_quote["quote_id"],
+        idempotency_key="checkout-logistics-other",
+    )
+    await service.record_payment_result(
+        principal_id="principal:buyer-2",
+        payment_attempt_id=other_prepared["payment_attempt"]["payment_attempt_id"],
+        status="succeeded",
+    )
+    other_order_id = str(other_prepared["order"]["order_id"])
+    await compatibility.transition_order(other_order_id, "confirmed")
+    await compatibility.transition_order(
+        other_order_id,
+        "preparing",
+        payload={
+            "provider_name": "Other LSP",
+            "logistics": {
+                "transaction_id": "txn-logistics-other",
+                "bpp_id": "other-lsp.example",
+                "core_version": "1.2.5",
+            },
+        },
+    )
+
+    on_confirm = await service.apply_logistics_update(
+        transaction_id="txn-logistics-2",
+        event_commitment="8" * 64,
+        update={
+            "action": "on_confirm",
+            "message_id": "msg-confirm",
+            "bpp_id": "replacement.example",
+            "lsp_order_id": "LSP-ORDER-1",
+            "provider_timestamp": "2026-08-02T09:55:00Z",
+        },
+    )
+    assert on_confirm["order"]["status"] == "preparing"
+    assert on_confirm["order"]["fulfilment"]["logistics"]["lsp_order_id"] == "LSP-ORDER-1"
+
+    await service.apply_logistics_update(
+        transaction_id="txn-logistics-2",
+        event_commitment="b" * 64,
+        update={
+            "action": "on_track",
+            "message_id": "msg-track",
+            "bpp_id": "replacement.example",
+            "tracking_id": "AWB-1",
+            "tracking_url": "https://lsp.example/track/AWB-1",
+            "status_message": "Rider assigned",
+            "provider_timestamp": "2026-08-02T10:00:00Z",
+        },
+    )
+    await service.apply_logistics_update(
+        transaction_id="txn-logistics-2",
+        event_commitment="9" * 64,
+        update={
+            "action": "on_track",
+            "message_id": "msg-stale-track",
+            "bpp_id": "replacement.example",
+            "tracking_id": "AWB-OLD",
+            "provider_timestamp": "2026-08-02T09:59:59Z",
+        },
+    )
+    stale = await compatibility.get_order(order_id)
+    assert stale["fulfilment"]["tracking_id"] == "AWB-1"
+    assert stale["fulfilment"]["logistics"]["review_required"] is True
+    assert stale["fulfilment"]["logistics"]["review_reason"] == "stale LOG10 callback timestamp"
+    await service.apply_logistics_update(
+        transaction_id="txn-logistics-2",
+        event_commitment="c" * 64,
+        update={
+            "action": "on_status",
+            "message_id": "msg-picked-up",
+            "bpp_id": "replacement.example",
+            "provider_status": "Order-picked-up",
+            "target_status": "shipped",
+            "provider_timestamp": "2026-08-02T10:05:00Z",
+        },
+    )
+    await service.apply_logistics_update(
+        transaction_id="txn-logistics-2",
+        event_commitment="d" * 64,
+        update={
+            "action": "on_status",
+            "message_id": "msg-delivered",
+            "bpp_id": "replacement.example",
+            "provider_status": "Order-delivered",
+            "target_status": "delivered",
+            "provider_timestamp": "2026-08-02T10:30:00Z",
+        },
+    )
+    await service.apply_logistics_update(
+        transaction_id="txn-logistics-2",
+        event_commitment="e" * 64,
+        update={
+            "action": "on_status",
+            "message_id": "msg-regression",
+            "bpp_id": "replacement.example",
+            "provider_status": "Order-picked-up",
+            "target_status": "shipped",
+            "provider_timestamp": "2026-08-02T10:31:00Z",
+        },
+    )
+    order = await compatibility.get_order(order_id)
+    assert order["status"] == "delivered"
+    assert order["fulfilment"]["tracking_id"] == "AWB-1"
+    assert order["fulfilment"]["tracking_url"] == "https://lsp.example/track/AWB-1"
+    assert order["fulfilment"]["logistics"]["review_required"] is True
+    assert "illegal order transition delivered -> shipped" in order["fulfilment"]["logistics"]["review_reason"]
+    assert len(order["fulfilment"]["logistics"]["processed_callbacks"]) == 6
+    assert order["fulfilment"]["logistics"]["attempts"][0]["conformance"]["status"] == "rejected"
+
+    other_order = await compatibility.get_order(other_order_id)
+    assert other_order["status"] == "preparing"
+    assert other_order["fulfilment"].get("tracking_id") is None
+    skipped = await service.apply_logistics_update(
+        transaction_id="txn-logistics-other",
+        event_commitment="7" * 64,
+        update={
+            "action": "on_status",
+            "message_id": "msg-skipped-delivery",
+            "bpp_id": "other-lsp.example",
+            "provider_status": "Order-delivered",
+            "target_status": "delivered",
+            "provider_timestamp": "2026-08-02T11:00:00Z",
+        },
+    )
+    assert skipped["order"]["status"] == "preparing"
+    assert skipped["order"]["fulfilment"]["logistics"]["review_required"] is True
+    cancelled = await service.apply_logistics_update(
+        transaction_id="txn-logistics-other",
+        event_commitment="6" * 64,
+        update={
+            "action": "on_status",
+            "message_id": "msg-cancelled",
+            "bpp_id": "other-lsp.example",
+            "provider_status": "Cancelled",
+            "target_status": "cancelled",
+            "provider_timestamp": "2026-08-02T11:01:00Z",
+        },
+    )
+    assert cancelled["order"]["status"] == "cancelled"
+
+    with pytest.raises(CommerceConflict, match="does not match the bound provider"):
+        await service.apply_logistics_update(
+            transaction_id="txn-logistics-2",
+            event_commitment="f" * 64,
+            update={
+                "action": "on_track",
+                "message_id": "msg-wrong-bpp",
+                "bpp_id": "other.example",
+            },
+        )
 
 
 async def test_duplicate_checkout_concurrency_creates_one_set_and_hash_mismatch_conflicts(

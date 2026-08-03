@@ -314,6 +314,7 @@ class AgentGuardRepository:
         principal_id: str,
         approval_id: str,
         request_hash: str,
+        allow_paused_agent: bool = False,
     ) -> dict[str, Any]:
         """Atomically consume an approval; a concurrent caller cannot also win."""
         record = await self._fetch_one(
@@ -328,12 +329,12 @@ class AgentGuardRepository:
               AND approval.expires_at > NOW()
               AND agent.principal_id = approval.principal_id
               AND agent.agent_id = approval.agent_id
-              AND agent.status = 'active'
+              AND (agent.status = 'active' OR (%s AND agent.status = 'paused'))
               AND agent.current_mandate_id = approval.mandate_id
               AND agent.current_mandate_version = approval.mandate_version
             RETURNING approval.*
             """,
-            (principal_id, approval_id, request_hash),
+            (principal_id, approval_id, request_hash, allow_paused_agent),
         )
         if record is not None:
             require_transition("approval", "issued", "consumed")

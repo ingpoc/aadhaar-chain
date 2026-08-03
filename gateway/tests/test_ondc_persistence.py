@@ -574,6 +574,43 @@ async def test_dead_letter_requires_commitment_and_requeues_durably(
         await pool.close()
 
 
+async def test_inbox_drain_claims_and_completes_persisted_callbacks(
+    postgres_url: str,
+) -> None:
+    pool = await _pool(postgres_url)
+    api = FastAPI()
+    api.state.persistence_pool = pool
+    api.include_router(ondc_router)
+    try:
+        await persist_callback_before_ack(pool, **_callback())
+        headers = {
+            "Idempotency-Key": "drain-inbox-1",
+            "X-Correlation-ID": "drain-inbox-1",
+        }
+        async with AsyncClient(
+            transport=ASGITransport(app=api), base_url="http://test"
+        ) as client:
+            drained = await client.post(
+                "/api/ondc/inbox/drain",
+                headers=headers,
+                json={"worker_id": "inbox-test", "limit": 10},
+            )
+            replay = await client.post(
+                "/api/ondc/inbox/drain",
+                headers={
+                    "Idempotency-Key": "drain-inbox-2",
+                    "X-Correlation-ID": "drain-inbox-2",
+                },
+                json={"worker_id": "inbox-test", "limit": 10},
+            )
+        assert drained.status_code == 200
+        assert drained.json()["data"]["claimed"] == 1
+        assert drained.json()["data"]["items"][0]["state"] == "delivered"
+        assert replay.json()["data"]["claimed"] == 0
+    finally:
+        await pool.close()
+
+
 async def test_postgres_diagnostics_and_recovery_drain_never_read_files(
     postgres_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

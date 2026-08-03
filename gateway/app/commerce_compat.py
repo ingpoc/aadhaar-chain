@@ -406,6 +406,10 @@ class CommerceCompatibilityAdapter:
                 if payload.get("status_message"):
                     fulfilment["status_message"] = str(payload["status_message"])
                     event["status_message"] = str(payload["status_message"])
+                if payload.get("logistics"):
+                    logistics = dict(payload["logistics"])
+                    fulfilment["logistics"] = logistics
+                    event["logistics_transaction_id"] = logistics["transaction_id"]
                 fulfilment["status"] = status
                 fulfilment["history"] = [*history, event]
                 await cursor.execute(
@@ -424,6 +428,15 @@ class CommerceCompatibilityAdapter:
                 )
                 if await cursor.fetchone() is None:
                     raise RuntimeError("stale order transition")
+        return {"order": await self.get_order(order_id)}
+
+    async def rebind_rejected_logistics_provider(
+        self, order_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        await self.commerce.rebind_rejected_logistics_provider(
+            order_id=order_id,
+            logistics=dict(payload.get("logistics") or {}),
+        )
         return {"order": await self.get_order(order_id)}
 
     async def create_issue(self, order_id: str, body: dict[str, Any]) -> dict[str, Any]:

@@ -40,6 +40,7 @@ class AgentCreateRequest(BaseModel):
 class EvaluateRequest(BaseModel):
     wallet_address: Optional[str] = Field(None, min_length=32, max_length=64)
     agent_id: Optional[str] = None
+    actor: Literal["agent", "user"] = "agent"
     action: str = "refund"
     amount_inr: int = Field(..., ge=0)
     resource_id: str = Field(..., min_length=1)
@@ -72,6 +73,7 @@ class CompileMandateRequest(BaseModel):
 class ExecuteRequest(BaseModel):
     wallet_address: Optional[str] = Field(None, min_length=32, max_length=64)
     agent_id: Optional[str] = None
+    actor: Literal["agent", "user"] = "agent"
     approval_id: Optional[str] = None
     decision_id: Optional[str] = None
     action: str
@@ -417,6 +419,7 @@ async def evaluate_action(
             result = await CheckoutOrchestrator(pool).evaluate_checkout(
                 principal_id=principal_id,
                 quote_id=quote_id,
+                actor=body.actor,
                 delivery_context=body.payload.get("delivery_context"),
             )
         except Exception as error:
@@ -463,6 +466,7 @@ async def evaluate_action(
             resource_id=body.resource_id,
             counterparty_id=body.counterparty_id,
             payload=body.payload,
+            actor=body.actor,
         )
     except (KeyError, PermissionError) as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -593,6 +597,7 @@ async def execute_action(
             result = await CheckoutOrchestrator(pool).execute_checkout(
                 principal_id=principal_id,
                 quote_id=quote_id,
+                actor=body.actor,
                 decision_id=body.decision_id,
                 approval_id=body.approval_id,
                 idempotency_key=effective_idempotency_key,
@@ -659,6 +664,7 @@ async def execute_action(
             resource_id=body.resource_id,
             idempotency_key=effective_idempotency_key,
             payload={**body.payload, "correlation_id": effective_correlation_id},
+            actor=body.actor,
         )
     except agentguard.ConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

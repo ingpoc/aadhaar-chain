@@ -426,7 +426,76 @@ def test_logistics_routes_use_only_the_dedicated_lbnp_contract(
             "fulfillments": [{"id": "F1", "type": "Delivery"}],
         }
     }
-    with patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client):
+    confirm_message = {
+        "order": {
+            "id": "LO1",
+            "fulfillments": [
+                {
+                    "id": "F1",
+                    "type": "Delivery",
+                    "start": {
+                        "instructions": {
+                            "code": "2",
+                            "short_desc": "Pickup is ready",
+                        }
+                    },
+                    "tags": [
+                        {
+                            "code": "linked_order",
+                            "list": [
+                                {"code": "id", "value": "retail-order-1"},
+                                {"code": "prep_time", "value": "PT15M"},
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+    }
+    on_init = {
+        "context": {
+            "domain": "ONDC:LOG10",
+            "action": "on_init",
+            "core_version": "1.2.5",
+        },
+        "message": {
+            "order": {
+                "id": "LO1",
+                "provider": {"id": "P1"},
+                "items": [{"id": "I1", "fulfillment_id": "F1"}],
+                "quote": {"price": {"currency": "INR", "value": "59.00"}},
+                "fulfillments": [
+                    {
+                        "id": "F1",
+                        "type": "Delivery",
+                        "start": {},
+                        "tags": [
+                            {
+                                "code": "rider_check",
+                                "list": [
+                                    {
+                                        "code": "inline_check_for_rider",
+                                        "value": "yes",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        },
+    }
+    with (
+        patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client),
+        patch(
+            "app.ondc_routes._require_bound_logistics_order",
+            new=AsyncMock(return_value={"order_id": "retail-order-1"}),
+        ),
+        patch(
+            "app.ondc_routes._latest_signed_logistics_on_init",
+            new=AsyncMock(return_value=on_init),
+        ),
+    ):
         client = TestClient(app)
         response = client.post("/api/ondc/logistics/search", json=search)
         assert response.status_code == 200, response.text
@@ -438,7 +507,7 @@ def test_logistics_routes_use_only_the_dedicated_lbnp_contract(
                     "message_id": f"msg-{action}",
                     "bpp_id": "ondc.bringg.space",
                     "bpp_uri": "https://ondc.bringg.space",
-                    "message": order_message,
+                    "message": confirm_message if action == "confirm" else order_message,
                 },
             )
             assert response.status_code == 200, response.text
@@ -464,6 +533,29 @@ def test_logistics_routes_use_only_the_dedicated_lbnp_contract(
         in call.kwargs["headers"]["Authorization"]
         for call in mock_client.post.await_args_list
     )
+    confirm = next(payload for payload in sent if payload["context"]["action"] == "confirm")
+    assert confirm["message"]["order"]["quote"]["price"]["value"] == "59.00"
+    assert confirm["message"]["order"]["fulfillments"][0]["start"]["instructions"] == {
+        "code": "2",
+        "short_desc": "Pickup is ready",
+    }
+    assert confirm["message"]["order"]["fulfillments"][0]["tags"] == [
+        {
+            "code": "linked_order",
+            "list": [
+                {"code": "id", "value": "retail-order-1"},
+                {"code": "prep_time", "value": "PT15M"},
+            ],
+        },
+        {
+            "code": "state",
+            "list": [{"code": "ready_to_ship", "value": "yes"}],
+        },
+        {
+            "code": "rto_action",
+            "list": [{"code": "return_to_origin", "value": "no"}],
+        },
+    ]
     assert client.post("/api/ondc/logistics/select", json={}).status_code == 404
     bad = {
         **search,
@@ -483,6 +575,295 @@ def test_logistics_routes_use_only_the_dedicated_lbnp_contract(
         },
     }
     assert client.post("/api/ondc/logistics/search", json=past_holidays).status_code == 422
+
+
+def test_logistics_on_init_and_confirm_fail_closed_on_tags_and_terms():
+    from fastapi import HTTPException
+
+    from app.ondc_routes import (
+        _build_logistics_confirm_message,
+        _normalize_logistics_callback,
+        _on_init_conformance,
+        _on_init_matches_binding,
+    )
+
+    callback = {
+        "context": {
+            "domain": "ONDC:LOG10",
+            "action": "on_init",
+            "core_version": "1.2.5",
+            "bpp_id": "lsp.example",
+            "message_id": "msg-on-init",
+        },
+        "message": {
+            "order": {
+                "id": "lsp-order-1",
+                "provider": {"id": "P1"},
+                "items": [{"id": "I1", "fulfillment_id": "F1"}],
+                "quote": {"price": {"currency": "INR", "value": "59.00"}},
+                "fulfillments": [
+                    {
+                        "id": "F1",
+                        "type": "Delivery",
+                        "start": {},
+                        "tags": [],
+                    }
+                ],
+            }
+        },
+    }
+    compliant, reason = _on_init_conformance(callback)
+    assert compliant is False
+    assert reason == "Immediate Delivery requires rider_check/inline_check_for_rider=yes"
+    normalized = _normalize_logistics_callback(
+        {
+            "action": "on_init",
+            "message_id": "msg-on-init",
+            "subscriber_id": "lsp.example",
+            "envelope": callback,
+        }
+    )
+    assert normalized["conformance"]["status"] == "rejected"
+    assert normalized["target_status"] is None
+    with pytest.raises(HTTPException, match="inline_check_for_rider=yes"):
+        _build_logistics_confirm_message(callback, {"order": {"id": "lsp-order-1"}})
+
+    callback["message"]["order"]["fulfillments"][0]["tags"].append(
+        {
+            "code": "rider_check",
+            "list": [{"code": "inline_check_for_rider", "value": "yes"}],
+        }
+    )
+    matched, reason = _on_init_matches_binding(
+        callback,
+        {
+            "provider_id": "P1",
+            "item_id": "I1",
+            "fulfillment_id": "F1",
+            "price": {"currency": "INR", "value": "59"},
+        },
+    )
+    assert matched is True
+    assert reason == ""
+    matched, reason = _on_init_matches_binding(
+        callback,
+        {
+            "provider_id": "P1",
+            "item_id": "I1",
+            "fulfillment_id": "F1",
+            "price": {"currency": "INR", "value": "60.00"},
+        },
+    )
+    assert matched is False
+    assert reason == "on_init quote does not match the selected offer"
+
+    requested = {
+        "order": {
+            "id": "lsp-order-1",
+            "fulfillments": [
+                {
+                    "id": "F1",
+                    "start": {
+                        "instructions": {
+                            "code": "2",
+                            "short_desc": "Pickup is ready",
+                        }
+                    },
+                    "tags": [
+                        {
+                            "code": "linked_order",
+                            "list": [
+                                {"code": "id", "value": "retail-order-1"},
+                                {"code": "prep_time", "value": "PT15M"},
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+    }
+    confirm = _build_logistics_confirm_message(callback, requested)
+    assert [tag["code"] for tag in confirm["order"]["fulfillments"][0]["tags"]] == [
+        "linked_order",
+        "state",
+        "rto_action",
+    ]
+    callback["message"]["order"]["tags"] = [
+        {
+            "code": "bap_terms",
+            "list": [{"code": "accept_bpp_terms", "value": "yes"}],
+        }
+    ]
+    with pytest.raises(HTTPException, match="explicit operator authority"):
+        _build_logistics_confirm_message(callback, requested)
+
+
+def test_logistics_callback_mapping_preserves_unknown_state_and_rejects_unsafe_url():
+    from app.ondc_routes import _normalize_logistics_callback
+
+    normalized = _normalize_logistics_callback(
+        {
+            "action": "on_status",
+            "message_id": "msg-status",
+            "subscriber_id": "lsp.example",
+            "envelope": {
+                "context": {
+                    "domain": "ONDC:LOG10",
+                    "action": "on_status",
+                    "core_version": "1.2.5",
+                },
+                "message": {
+                    "order": {
+                        "fulfillments": [
+                            {
+                                "id": "F1",
+                                "type": "Delivery",
+                                "state": {"descriptor": {"code": "Teleporting"}},
+                                "tracking": {"url": "javascript:alert(1)"},
+                            }
+                        ]
+                    }
+                },
+            },
+        }
+    )
+    assert normalized["target_status"] is None
+    assert normalized["provider_status"] == "Teleporting"
+    assert normalized["tracking_url"] is None
+    assert normalized["review_reason"] == "unknown LOG10 fulfillment state: Teleporting"
+
+
+@pytest.mark.parametrize(
+    ("provider_state", "target_status"),
+    [
+        ("Pending", "preparing"),
+        ("Searching-for-Agent", "preparing"),
+        ("Agent-assigned", "preparing"),
+        ("Order-picked-up", "shipped"),
+        ("Out-for-delivery", "shipped"),
+        ("Order-delivered", "delivered"),
+        ("Cancelled", "cancelled"),
+    ],
+)
+def test_logistics_callback_state_mapping(provider_state, target_status):
+    from app.ondc_routes import _normalize_logistics_callback
+
+    normalized = _normalize_logistics_callback(
+        {
+            "action": "on_status",
+            "message_id": f"msg-{provider_state}",
+            "subscriber_id": "lsp.example",
+            "envelope": {
+                "context": {
+                    "domain": "ONDC:LOG10",
+                    "action": "on_status",
+                    "core_version": "1.2.5",
+                },
+                "message": {
+                    "order": {
+                        "fulfillments": [
+                            {
+                                "id": "F1",
+                                "type": "Delivery",
+                                "state": {"descriptor": {"code": provider_state}},
+                            }
+                        ]
+                    }
+                },
+            },
+        }
+    )
+    assert normalized["provider_status"] == provider_state
+    assert normalized["target_status"] == target_status
+    assert normalized["review_reason"] == ""
+
+
+def test_signed_logistics_offer_ranking_is_deterministic():
+    from app.seller_agentguard_orchestrator import _verified_logistics_offer
+
+    def record(bpp_id: str, price: str, tat: str) -> dict[str, object]:
+        return {
+            "action": "on_search",
+            "subscriber_id": bpp_id,
+            "transaction_id": "txn-log10",
+            "redacted_payload": {"signature_verified": True},
+            "envelope": {
+                "context": {
+                    "domain": "ONDC:LOG10",
+                    "core_version": "1.2.5",
+                    "bpp_id": bpp_id,
+                    "bpp_uri": f"https://{bpp_id}",
+                    "transaction_id": "txn-log10",
+                },
+                "message": {
+                    "catalog": {
+                        "bpp/providers": [
+                            {
+                                "id": f"provider-{bpp_id}",
+                                "descriptor": {"name": bpp_id},
+                                "fulfillments": [{"id": "F1", "type": "Delivery"}],
+                                "items": [
+                                    {
+                                        "id": "I1",
+                                        "descriptor": {"code": "P2P"},
+                                        "category_id": "Immediate Delivery",
+                                        "fulfillment_id": "F1",
+                                        "price": {"currency": "INR", "value": price},
+                                        "time": {"duration": tat},
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                },
+            },
+        }
+
+    chosen = _verified_logistics_offer(
+        [
+            record("slow.example", "49.00", "PT90M"),
+            record("fast.example", "49.00", "PT45M"),
+            record("expensive.example", "59.00", "PT10M"),
+        ]
+    )
+    assert chosen["bpp_id"] == "fast.example"
+
+
+@pytest.mark.asyncio
+async def test_rejected_provider_failover_stays_under_seller_agentguard():
+    from app.seller_agentguard_orchestrator import SellerAgentGuardOrchestrator
+
+    orchestrator = SellerAgentGuardOrchestrator(object())  # type: ignore[arg-type]
+    orchestrator.commerce = AsyncMock()
+    orchestrator.commerce.get_order.return_value = {
+        "order_id": "order-1",
+        "seller_id": "seller-1",
+        "status": "preparing",
+    }
+    replacement = {
+        "status": "preparing",
+        "logistics_transaction_id": "txn-replacement",
+        "logistics": {
+            "transaction_id": "txn-replacement",
+            "bpp_id": "replacement.example",
+        },
+    }
+    orchestrator._bind_logistics_offer = AsyncMock(return_value=replacement)  # type: ignore[method-assign]
+
+    await orchestrator._execute_effect(
+        principal_id="seller-1",
+        action="seller.fulfilment.commit",
+        resource_id="order-1",
+        payload={"status": "preparing"},
+        amount_inr=0,
+        idempotency_key="replace-provider",
+        correlation_id="replace-provider",
+    )
+
+    orchestrator.commerce.rebind_rejected_logistics_provider.assert_awaited_once_with(
+        "order-1", replacement
+    )
+    orchestrator.commerce.transition_order.assert_not_awaited()
 
 
 def test_third_party_lookup_does_not_send_the_callers_key_id(
@@ -582,7 +963,14 @@ def test_logistics_callback_requires_a_registry_matched_signature(
 
     from main import app
 
-    with patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client):
+    monkeypatch.setattr(app.state, "persistence_pool", object(), raising=False)
+    with (
+        patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client),
+        patch(
+            "app.ondc_routes.persist_callback_before_ack",
+            new=AsyncMock(return_value=(True, {"inbox_id": 1})),
+        ),
+    ):
         client = TestClient(app)
         good = client.post(
             "/ondc/on_search",
@@ -601,3 +989,47 @@ def test_logistics_callback_requires_a_registry_matched_signature(
         )
         assert bad.status_code == 401
         assert bad.json()["message"]["ack"]["status"] == "NACK"
+        unsigned = client.post("/ondc/on_search", json=callback)
+        assert unsigned.status_code == 401
+        assert "missing ONDC Authorization" in unsigned.json()["error"]["message"]
+        wrong_domain = client.post(
+            "/ondc/on_search",
+            json={
+                **callback,
+                "context": {
+                    **callback["context"],
+                    "domain": "ONDC:RET10",
+                    "message_id": "wrong-domain",
+                },
+            },
+        )
+        assert wrong_domain.status_code == 401
+        assert "domain must be ONDC:LOG10" in wrong_domain.json()["error"]["message"]
+        wrong_version = client.post(
+            "/ondc/on_search",
+            json={
+                **callback,
+                "context": {
+                    **callback["context"],
+                    "core_version": "1.2.0",
+                    "message_id": "wrong-version",
+                },
+            },
+        )
+        assert wrong_version.status_code == 401
+        assert "unsupported LOG10 core_version" in wrong_version.json()["error"]["message"]
+        wrong_action = client.post(
+            "/ondc/on_init",
+            json=callback,
+            headers={"Authorization": authorization},
+        )
+        assert wrong_action.status_code == 401
+        assert "does not match the callback route" in wrong_action.json()["error"]["message"]
+        app.state.persistence_pool = None
+        unavailable = client.post(
+            "/ondc/on_search",
+            json=callback,
+            headers={"Authorization": authorization},
+        )
+        assert unavailable.status_code == 503
+        assert "PostgreSQL persistence is required" in unavailable.json()["error"]["message"]

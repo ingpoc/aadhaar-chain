@@ -98,7 +98,11 @@ def _record(method: str, path: str, handler: str) -> MutationRecord:
         idempotency = "message_id_deduplication"
         audit = "signed_envelope_inbox_outbox_dead_letter"
         negative = "reject_bad_signature_duplicate_or_correlation_mismatch"
-        risk = "critical" if "dead-letter" in path or "outbox/drain" in path else "high"
+        risk = (
+            "critical"
+            if "dead-letter" in path or path.endswith("/inbox/drain") or path.endswith("/outbox/drain")
+            else "high"
+        )
     elif path.startswith("/api/identity/"):
         policy_family = "legacy_identity"
         owner = "legacy_identity_hangar"

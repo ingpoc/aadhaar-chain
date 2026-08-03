@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
+import re
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -16,6 +18,7 @@ from app.persistence.agentguard_repository import (
     AgentGuardRepository,
 )
 from app.persistence.connection import ConnectionPool
+from app.persistence.ondc_repository import ONDCRepository
 from app.persistence.transaction import UnitOfWork
 from app.receipt_signing import sign_receipt
 
@@ -40,6 +43,115 @@ def _hash(payload: dict[str, Any]) -> str:
     return sha256(canonicalize(_jsonable(payload)).encode("utf-8")).hexdigest()
 
 
+def _duration_seconds(value: Any) -> Decimal:
+    match = re.fullmatch(
+        r"P(?:(?P<days>\d+(?:\.\d+)?)D)?(?:T(?:(?P<hours>\d+(?:\.\d+)?)H)?"
+        r"(?:(?P<minutes>\d+(?:\.\d+)?)M)?(?:(?P<seconds>\d+(?:\.\d+)?)S)?)?",
+        str(value or ""),
+    )
+    if not match or not any(match.groupdict().values()):
+        return Decimal("Infinity")
+    parts = {key: Decimal(number or "0") for key, number in match.groupdict().items()}
+    return (
+        parts["days"] * 86400
+        + parts["hours"] * 3600
+        + parts["minutes"] * 60
+        + parts["seconds"]
+    )
+
+
+def _offer_rank(offer: dict[str, Any]) -> tuple[Decimal, Decimal, str, str, str]:
+    try:
+        price = Decimal(str((offer.get("price") or {}).get("value")))
+    except (InvalidOperation, TypeError):
+        price = Decimal("Infinity")
+    if price < 0:
+        price = Decimal("Infinity")
+    return (
+        price,
+        _duration_seconds(offer.get("tat")),
+        str(offer.get("bpp_id") or ""),
+        str(offer.get("provider_id") or ""),
+        str(offer.get("item_id") or ""),
+    )
+
+
+def _verified_logistics_offer(
+    records: list[dict[str, Any]], *, bpp_id: str | None = None
+) -> dict[str, Any]:
+    """Select one signed LOG10 1.2.5 P2P Immediate Delivery offer."""
+    offers: list[dict[str, Any]] = []
+    for record in records:
+        envelope = record.get("envelope") or {}
+        context = envelope.get("context") or {}
+        if (
+            record.get("action") != "on_search"
+            or (record.get("redacted_payload") or {}).get("signature_verified")
+            is not True
+            or context.get("domain") != "ONDC:LOG10"
+            or context.get("core_version") != "1.2.5"
+            or not context.get("bpp_id")
+            or not context.get("bpp_uri")
+            or context.get("bpp_id") != record.get("subscriber_id")
+            or str(context.get("transaction_id") or "")
+            != str(record.get("transaction_id") or "")
+            or (bpp_id and context.get("bpp_id") != bpp_id)
+        ):
+            continue
+        catalog = (envelope.get("message") or {}).get("catalog") or {}
+        for provider in catalog.get("bpp/providers") or []:
+            if not isinstance(provider, dict):
+                continue
+            fulfillments = {
+                fulfillment.get("id"): fulfillment
+                for fulfillment in provider.get("fulfillments") or []
+                if isinstance(fulfillment, dict)
+            }
+            for item in provider.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                fulfillment = fulfillments.get(item.get("fulfillment_id")) or {}
+                if (
+                    (item.get("descriptor") or {}).get("code") != "P2P"
+                    or item.get("category_id") != "Immediate Delivery"
+                    or fulfillment.get("type") != "Delivery"
+                ):
+                    continue
+                provider_name = (provider.get("descriptor") or {}).get(
+                    "name"
+                ) or fulfillment.get("@ondc/org/provider_name")
+                if (
+                    not provider_name
+                    or not provider.get("id")
+                    or not item.get("id")
+                    or not item.get("fulfillment_id")
+                ):
+                    continue
+                price = item.get("price")
+                offers.append(
+                    {
+                        "transaction_id": str(record["transaction_id"]),
+                        "bpp_id": str(context["bpp_id"]),
+                        "bpp_uri": str(context.get("bpp_uri") or ""),
+                        "provider_id": str(provider.get("id") or ""),
+                        "provider_name": str(provider_name),
+                        "item_id": str(item.get("id") or ""),
+                        "fulfillment_id": str(item.get("fulfillment_id") or ""),
+                        "core_version": "1.2.5",
+                        "category_id": "Immediate Delivery",
+                        "item_code": "P2P",
+                        "price": dict(price) if isinstance(price, dict) else {},
+                        "tat": (item.get("time") or {}).get("duration"),
+                        "signature_verified": True,
+                    }
+                )
+    if not offers:
+        raise AgentGuardConflict(
+            "no signed LOG10 1.2.5 P2P Immediate Delivery offer matched"
+        )
+    return min(offers, key=_offer_rank)
+
+
 class SellerAgentGuardOrchestrator:
     """Own Seller mandates, decisions, approvals, intents, and receipts in PostgreSQL."""
 
@@ -53,6 +165,24 @@ class SellerAgentGuardOrchestrator:
     def __init__(self, pool: ConnectionPool) -> None:
         self.pool = pool
         self.commerce = CommerceCompatibilityAdapter(pool)
+
+    async def _bind_logistics_offer(self, payload: dict[str, Any]) -> dict[str, Any]:
+        transaction_id = str(payload.get("logistics_transaction_id") or "").strip()
+        if not transaction_id:
+            return payload
+        async with UnitOfWork(self.pool) as unit_of_work:
+            records = await ONDCRepository(unit_of_work).list_for_transaction(
+                "inbox", transaction_id, action="on_search", limit=100
+            )
+        offer = _verified_logistics_offer(
+            records,
+            bpp_id=str(payload.get("logistics_bpp_id") or "").strip() or None,
+        )
+        return {
+            **payload,
+            "provider_name": offer["provider_name"],
+            "logistics": offer,
+        }
 
     @staticmethod
     def agent_id(principal_id: str) -> str:
@@ -555,11 +685,21 @@ class SellerAgentGuardOrchestrator:
                 raise AgentGuardNotFound("Seller order not found") from None
             if current["seller_id"] != principal_id:
                 raise AgentGuardConflict("Seller does not own order")
+            if action == "seller.fulfilment.commit":
+                payload = await self._bind_logistics_offer(payload)
             status = {
                 "seller.order.accept": "confirmed",
                 "seller.order.reject": "cancelled",
                 "seller.fulfilment.commit": str(payload.get("status") or "shipped"),
             }[action]
+            if (
+                action == "seller.fulfilment.commit"
+                and current["status"] == "preparing"
+                and status == "preparing"
+            ):
+                return await self.commerce.rebind_rejected_logistics_provider(
+                    resource_id, payload
+                )
             return await self.commerce.transition_order(
                 resource_id, status, payload=payload
             )

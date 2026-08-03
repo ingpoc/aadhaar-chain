@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from app import agentguard
@@ -251,14 +251,20 @@ class CheckoutOrchestrator:
         return {"agent": _jsonable(agent), "mandate": self._mandate_view(active)}
 
     async def _authority(
-        self, repository: AgentGuardRepository, principal_id: str
+        self,
+        repository: AgentGuardRepository,
+        principal_id: str,
+        *,
+        actor: Literal["agent", "user"] = "agent",
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         agent = await repository.get_agent(
             principal_id=principal_id, agent_id=self.agent_id(principal_id)
         )
         if agent is None or agent.get("current_mandate_id") is None:
             raise AgentGuardNotFound("buyer mandate not found")
-        if agent["status"] != "active":
+        if agent["status"] != "active" and not (
+            actor == "user" and agent["status"] == "paused"
+        ):
             raise AgentGuardConflict(f"agent is {agent['status']}")
         mandate = await repository.get_mandate_version(
             principal_id=principal_id,
@@ -612,6 +618,7 @@ class CheckoutOrchestrator:
         principal_id: str,
         quote_id: str,
         lock: bool,
+        actor: Literal["agent", "user"] = "agent",
         require_open: bool = True,
         delivery_context: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -622,6 +629,7 @@ class CheckoutOrchestrator:
             raise AgentGuardConflict("quote expired")
         bound = {
             "action": self.operation,
+            "actor": actor,
             "principal_id": principal_id,
             "quote_id": str(quote["quote_id"]),
             "cart_id": str(quote["cart_id"]),
@@ -641,18 +649,22 @@ class CheckoutOrchestrator:
         *,
         principal_id: str,
         quote_id: str,
+        actor: Literal["agent", "user"] = "agent",
         delivery_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_delivery_context = _normalized_delivery_context(delivery_context)
         async with UnitOfWork(self.pool) as unit_of_work:
             agentguard = AgentGuardRepository(unit_of_work)
             commerce = CommerceRepository(unit_of_work)
-            agent, mandate = await self._authority(agentguard, principal_id)
+            agent, mandate = await self._authority(
+                agentguard, principal_id, actor=actor
+            )
             quote, bound = await self._bound_quote(
                 commerce,
                 principal_id=principal_id,
                 quote_id=quote_id,
                 lock=True,
+                actor=actor,
                 delivery_context=normalized_delivery_context,
             )
             limit = int(mandate["payload"]["max_order_paise"])
@@ -733,6 +745,7 @@ class CheckoutOrchestrator:
         approval_id: str | None,
         idempotency_key: str,
         correlation_id: str,
+        actor: Literal["agent", "user"] = "agent",
         payment_outcome: str = "succeeded",
         delivery_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -742,7 +755,9 @@ class CheckoutOrchestrator:
         async with UnitOfWork(self.pool) as unit_of_work:
             agentguard = AgentGuardRepository(unit_of_work)
             commerce = CommerceRepository(unit_of_work)
-            agent, mandate = await self._authority(agentguard, principal_id)
+            agent, mandate = await self._authority(
+                agentguard, principal_id, actor=actor
+            )
             decision = await agentguard.get_decision(
                 principal_id=principal_id, decision_id=decision_id
             )
@@ -755,6 +770,7 @@ class CheckoutOrchestrator:
                 principal_id=principal_id,
                 quote_id=quote_id,
                 lock=True,
+                actor=actor,
                 require_open=False,
                 delivery_context=normalized_delivery_context,
             )
@@ -799,6 +815,7 @@ class CheckoutOrchestrator:
                         principal_id=principal_id,
                         approval_id=approval_id,
                         request_hash=request_hash,
+                        allow_paused_agent=actor == "user",
                     )
                 elif decision["status"] != "allow":
                     raise AgentGuardConflict("decision does not authorize checkout")

@@ -19,6 +19,7 @@ from app.commerce_compat import CommerceCompatibilityAdapter
 from app.commerce_v1 import CommerceV1
 from app.persistence import ConnectionPool, MigrationRunner
 from app.persistence.agentguard_repository import AgentGuardConflict
+from app.persistence.ondc_repository import persist_callback_before_ack
 from app.seller_agentguard_orchestrator import SellerAgentGuardOrchestrator
 from app.session_auth import SESSION_COOKIE_NAME, create_principal_session_token
 
@@ -326,6 +327,97 @@ async def test_seller_order_accept_uses_compatibility_order_shape(
 
     assert executed["result"]["order"]["status"] == "confirmed"
     assert executed["result"]["order"]["seller_id"] == seller_id
+
+    logistics_transaction_id = str(uuid4())
+    await persist_callback_before_ack(
+        pool,
+        subscriber_id="preprod-bpp.taptap.in",
+        transaction_id=logistics_transaction_id,
+        message_id=str(uuid4()),
+        action="on_search",
+        correlation_id=logistics_transaction_id,
+        raw_envelope={
+            "context": {
+                "domain": "ONDC:LOG10",
+                "action": "on_search",
+                "core_version": "1.2.5",
+                "transaction_id": logistics_transaction_id,
+                "bpp_id": "preprod-bpp.taptap.in",
+                "bpp_uri": "https://preprod-bpp.taptap.in/ondc",
+            },
+            "message": {
+                "catalog": {
+                    "bpp/providers": [
+                        {
+                            "id": "P1",
+                            "descriptor": {"name": "TapTap Logistics"},
+                            "fulfillments": [{"id": "F1", "type": "Delivery"}],
+                            "items": [
+                                {
+                                    "id": "I1",
+                                    "descriptor": {
+                                        "code": "P2P",
+                                        "name": "Intercity Courier",
+                                    },
+                                    "category_id": "Immediate Delivery",
+                                    "fulfillment_id": "F1",
+                                    "price": {"currency": "INR", "value": "59.00"},
+                                    "time": {"duration": "PT60M"},
+                                }
+                            ],
+                        }
+                    ]
+                }
+            },
+        },
+        redacted_payload={"signature_verified": True, "core_version": "1.2.5"},
+    )
+    await CommerceCompatibilityAdapter(pool).transition_order(order_id, "preparing")
+    dispatch_payload = {
+        "order_id": order_id,
+        "status": "shipped",
+        "tracking_id": "TAPTAP-123",
+        "logistics_transaction_id": logistics_transaction_id,
+    }
+    dispatch_decision = await orchestrator.evaluate(
+        principal_id=seller_id,
+        action="seller.fulfilment.commit",
+        amount_inr=0,
+        resource_id=order_id,
+        counterparty_id=None,
+        payload=dispatch_payload,
+        correlation_id="seller-dispatch-correlation",
+    )
+    dispatched = await orchestrator.execute(
+        principal_id=seller_id,
+        decision_id=dispatch_decision["decision_id"],
+        approval_id=None,
+        action="seller.fulfilment.commit",
+        amount_inr=0,
+        resource_id=order_id,
+        idempotency_key="seller-dispatch-effect",
+        correlation_id="seller-dispatch-correlation",
+        payload=dispatch_payload,
+    )
+
+    fulfilment = dispatched["result"]["order"]["fulfilment"]
+    assert fulfilment["provider_name"] == "TapTap Logistics"
+    assert fulfilment["tracking_id"] == "TAPTAP-123"
+    assert fulfilment["logistics"] == {
+        "transaction_id": logistics_transaction_id,
+        "bpp_id": "preprod-bpp.taptap.in",
+        "bpp_uri": "https://preprod-bpp.taptap.in/ondc",
+        "provider_id": "P1",
+        "provider_name": "TapTap Logistics",
+        "item_id": "I1",
+        "fulfillment_id": "F1",
+        "core_version": "1.2.5",
+        "category_id": "Immediate Delivery",
+        "item_code": "P2P",
+        "price": {"currency": "INR", "value": "59.00"},
+        "tat": "PT60M",
+        "signature_verified": True,
+    }
 
 
 async def test_seller_refund_uses_one_durable_financial_effect(

@@ -364,6 +364,49 @@ class CommerceRepository:
             "commerce_orders", "order_id = %s", (order_id,), lock=lock
         )
 
+    async def get_order_by_logistics_transaction(
+        self, transaction_id: str, *, lock: bool = False
+    ) -> dict[str, Any]:
+        suffix = " FOR UPDATE" if lock else ""
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                f"""
+                SELECT * FROM commerce_orders
+                WHERE fulfilment->'logistics'->>'transaction_id' = %s
+                ORDER BY created_at
+                LIMIT 2{suffix}
+                """,
+                (transaction_id,),
+            )
+            rows = list(await cursor.fetchall())
+        if not rows:
+            raise LookupError("logistics transaction is not bound to an order")
+        if len(rows) != 1:
+            raise ValueError("logistics transaction is bound to multiple orders")
+        return rows[0]
+
+    async def update_order_fulfilment(
+        self,
+        order_id: UUID,
+        *,
+        expected_version: int,
+        status: str,
+        fulfilment: dict[str, Any],
+    ) -> dict[str, Any]:
+        result = await self.connection.execute(
+            """
+            UPDATE commerce_orders
+            SET status = %s, version = version + 1, fulfilment = %s, updated_at = NOW()
+            WHERE order_id = %s AND version = %s
+            RETURNING *
+            """,
+            (status, Jsonb(fulfilment), order_id, expected_version),
+        )
+        row = await result.fetchone()
+        if row is None:
+            raise RuntimeError("stale order fulfilment update")
+        return await self.get_order(order_id)
+
     async def get_payment(
         self, payment_attempt_id: UUID, *, lock: bool = False
     ) -> dict[str, Any]:

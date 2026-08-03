@@ -34,6 +34,7 @@ Decision = Literal["allow", "need_approval", "deny"]
 RequiredAction = Literal["none", "review", "strong_authentication", "contact_support"]
 RiskLevel = Literal["read_only", "low", "medium", "high", "critical"]
 AgentStatus = Literal["active", "paused", "revoked"]
+Actor = Literal["agent", "user"]
 Role = Literal["buyer", "seller"]
 MandateStatus = Literal["draft", "active", "revoked", "expired"]
 
@@ -599,6 +600,7 @@ def evaluate_action(
     counterparty_id: Optional[str] = None,
     payload: Optional[dict[str, Any]] = None,
     write_receipt: bool = True,
+    actor: Actor = "agent",
 ) -> dict[str, Any]:
     normalized = normalize_action(action)
     if normalized is None:
@@ -630,7 +632,9 @@ def evaluate_action(
         role=role,
         agent_id=agent_id,
     )
-    reason_code = _authorization_failure(agent, mandate, normalized, amount_inr)
+    reason_code = _authorization_failure(
+        agent, mandate, normalized, amount_inr, actor=actor
+    )
     request = _action_request(
         principal_id=principal_id,
         wallet_address=wallet_address or agent.wallet_address,
@@ -639,6 +643,7 @@ def evaluate_action(
         action=normalized,
         amount_inr=amount_inr,
         resource_id=resource_id,
+        actor=actor,
         counterparty_id=counterparty_id,
         payload=payload,
     )
@@ -703,6 +708,7 @@ def evaluate_action(
         amount_inr=amount_inr,
         resource_id=resource_id,
         mandate=mandate,
+        actor=actor,
         counterparty_id=counterparty_id,
         payload=payload,
     )
@@ -724,8 +730,12 @@ def _authorization_failure(
     mandate: MandateRecord,
     action: str,
     amount_inr: int,
+    *,
+    actor: Actor = "agent",
 ) -> Optional[str]:
-    if agent.status == "paused":
+    if agent.status == "paused" and not (
+        actor == "user" and action == "buyer.checkout.commit"
+    ):
         return "agent_paused"
     if agent.status == "revoked":
         return "agent_revoked"
@@ -851,6 +861,7 @@ def _action_request(
     action: str,
     amount_inr: int,
     resource_id: str,
+    actor: Actor = "agent",
     nonce: Optional[str] = None,
     expires_at: Optional[str] = None,
     counterparty_id: Optional[str] = None,
@@ -865,6 +876,7 @@ def _action_request(
         "schema_version": SCHEMA_VERSION,
         "principal": principal,
         "agent_id": agent_id,
+        "actor": actor,
         "action": action,
         "resource_id": resource_id,
         "amount_inr": amount_inr,
@@ -889,6 +901,7 @@ def _issue_approval(
     amount_inr: int,
     resource_id: str,
     mandate: MandateRecord,
+    actor: Actor = "agent",
     counterparty_id: Optional[str],
     payload: Optional[dict[str, Any]],
 ) -> ApprovalRecord:
@@ -903,6 +916,7 @@ def _issue_approval(
         action=action,
         amount_inr=amount_inr,
         resource_id=resource_id,
+        actor=actor,
         nonce=nonce,
         expires_at=expires_at,
         counterparty_id=counterparty_id,
@@ -942,6 +956,7 @@ def consume_approval(
     counterparty_id: Optional[str] = None,
     payload: Optional[dict[str, Any]] = None,
     validate_request: bool = False,
+    actor: Actor = "agent",
 ) -> dict[str, Any]:
     with _STATE_LOCK:
         return _consume_approval_locked(
@@ -955,6 +970,7 @@ def consume_approval(
             counterparty_id=counterparty_id,
             payload=payload,
             validate_request=validate_request,
+            actor=actor,
         )
 
 
@@ -970,6 +986,7 @@ def _consume_approval_locked(
     counterparty_id: Optional[str] = None,
     payload: Optional[dict[str, Any]] = None,
     validate_request: bool = False,
+    actor: Actor = "agent",
 ) -> dict[str, Any]:
     state = load_state()
     approval = state.approvals.get(approval_id)
@@ -1004,7 +1021,9 @@ def _consume_approval_locked(
     agent = state.agents.get(approval.agent_id)
     if not agent or agent.principal_id != approval.principal_id:
         raise ConflictError("Approval agent is no longer valid.")
-    if agent.status != "active":
+    if agent.status != "active" and not (
+        actor == "user" and agent.status == "paused"
+    ):
         raise ConflictError(f"Approval invalidated: agent is {agent.status}.")
     if agent.mandate_id != approval.mandate_id:
         raise ConflictError("Approval invalidated by mandate replacement.")
@@ -1025,6 +1044,7 @@ def _consume_approval_locked(
             action=normalize_action(action or approval.action) or "",
             amount_inr=approval.amount_inr if amount_inr is None else amount_inr,
             resource_id=resource_id or approval.resource_id,
+            actor=actor,
             nonce=approval.nonce,
             expires_at=approval.expires_at,
             counterparty_id=counterparty_id,
@@ -1081,6 +1101,7 @@ def execute_action(
     approval_id: Optional[str] = None,
     idempotency_key: Optional[str] = None,
     payload: Optional[dict[str, Any]] = None,
+    actor: Actor = "agent",
 ) -> dict[str, Any]:
     normalized = normalize_action(action)
     if not normalized or normalized not in _EXECUTORS:
@@ -1095,6 +1116,7 @@ def execute_action(
             resource_id=resource_id,
             payload=payload,
             validate_request=True,
+            actor=actor,
         )
         agent = get_agent(consumed["approval"]["agent_id"])
         mandate = get_mandate(consumed["approval"]["mandate_id"])
@@ -1111,6 +1133,7 @@ def execute_action(
             agent_id=agent_id,
             payload=payload,
             write_receipt=False,
+            actor=actor,
         )
         if decision["decision"] != "allow":
             return decision

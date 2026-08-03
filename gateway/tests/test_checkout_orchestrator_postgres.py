@@ -247,6 +247,76 @@ async def test_over_limit_exact_approval_checkout_replays_one_paid_order(
         assert await counts.fetchone() == (1, 1, 1, 1, 2)
 
 
+async def test_paused_agent_blocks_agent_checkout_but_not_user_checkout(
+    pool: ConnectionPool,
+) -> None:
+    principal_id = "principal:paused-agent-manual-checkout"
+    commerce = CommerceV1(pool)
+    orchestrator = CheckoutOrchestrator(pool)
+    compiled = await orchestrator.compile_mandate(
+        principal_id=principal_id, limits={"max_order_paise": 10_000}
+    )
+    await orchestrator.confirm_mandate(
+        principal_id=principal_id,
+        mandate_id=compiled["mandate"]["mandate_id"],
+    )
+    await commerce.upsert_inventory(
+        seller_id="seller-manual-checkout",
+        sku="atta-manual-checkout",
+        title="Manual Checkout Atta",
+        unit_price_paise=8_900,
+        available_quantity=1,
+    )
+    cart = await commerce.create_cart(
+        principal_id=principal_id,
+        seller_id="seller-manual-checkout",
+        idempotency_key="cart-manual-checkout",
+    )
+    cart = await commerce.set_cart_line(
+        principal_id=principal_id,
+        cart_id=cart["cart_id"],
+        sku="atta-manual-checkout",
+        quantity=1,
+        expected_version=cart["version"],
+        idempotency_key="line-manual-checkout",
+    )
+    quote = await commerce.preview_checkout(
+        principal_id=principal_id,
+        cart_id=cart["cart_id"],
+        expected_version=cart["version"],
+        idempotency_key="preview-manual-checkout",
+    )
+    await orchestrator.set_agent_status(
+        principal_id=principal_id,
+        agent_id=orchestrator.agent_id(principal_id),
+        status="paused",
+    )
+
+    with pytest.raises(AgentGuardConflict, match="agent is paused"):
+        await orchestrator.evaluate_checkout(
+            principal_id=principal_id,
+            quote_id=quote["quote_id"],
+        )
+
+    decision = await orchestrator.evaluate_checkout(
+        principal_id=principal_id,
+        quote_id=quote["quote_id"],
+        actor="user",
+    )
+    assert decision["decision"] == "allow"
+    assert decision["bound_action"]["actor"] == "user"
+    completed = await orchestrator.execute_checkout(
+        principal_id=principal_id,
+        quote_id=quote["quote_id"],
+        actor="user",
+        decision_id=decision["decision_id"],
+        approval_id=None,
+        idempotency_key="execute-manual-checkout",
+        correlation_id="correlation-manual-checkout",
+    )
+    assert completed["result"]["order"]["status"] == "paid"
+
+
 async def test_http_mandate_preview_decision_execute_and_replay(
     pool: ConnectionPool,
 ) -> None:

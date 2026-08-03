@@ -67,6 +67,244 @@ class CommerceV1:
         self.pool = pool
         self.clock = clock
 
+    async def get_logistics_binding(self, transaction_id: str) -> dict[str, Any]:
+        if not transaction_id.strip():
+            raise CommerceValidation("logistics transaction_id is required")
+        async with UnitOfWork(self.pool) as unit_of_work:
+            try:
+                order = await CommerceRepository(
+                    unit_of_work
+                ).get_order_by_logistics_transaction(transaction_id.strip())
+            except LookupError as exc:
+                raise CommerceNotFound(str(exc)) from exc
+            except ValueError as exc:
+                raise CommerceConflict(str(exc)) from exc
+        return _jsonable(order)
+
+    async def apply_logistics_update(
+        self,
+        *,
+        transaction_id: str,
+        event_commitment: str,
+        update: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply one normalized, signature-verified LOG10 callback exactly once."""
+        transaction_id = transaction_id.strip()
+        event_commitment = event_commitment.strip()
+        if (
+            not transaction_id
+            or len(event_commitment) != 64
+            or any(character not in "0123456789abcdef" for character in event_commitment)
+        ):
+            raise CommerceValidation(
+                "transaction_id and SHA-256 event_commitment are required"
+            )
+        action = str(update.get("action") or "").strip()
+        bpp_id = str(update.get("bpp_id") or "").strip()
+        message_id = str(update.get("message_id") or "").strip()
+        if not action or not bpp_id or not message_id:
+            raise CommerceValidation("callback action, bpp_id, and message_id are required")
+
+        async with UnitOfWork(self.pool) as unit_of_work:
+            repository = CommerceRepository(unit_of_work)
+            try:
+                order = await repository.get_order_by_logistics_transaction(
+                    transaction_id, lock=True
+                )
+            except LookupError as exc:
+                raise CommerceNotFound(str(exc)) from exc
+            except ValueError as exc:
+                raise CommerceConflict(str(exc)) from exc
+
+            fulfilment = dict(order.get("fulfilment") or {})
+            logistics = dict(fulfilment.get("logistics") or {})
+            if str(logistics.get("bpp_id") or "") != bpp_id:
+                raise CommerceConflict("callback BPP does not match the bound provider")
+            if str(logistics.get("core_version") or "") != "1.2.5":
+                raise CommerceConflict("bound logistics version is not LOG10 1.2.5")
+
+            processed = list(logistics.get("processed_callbacks") or [])
+            if event_commitment in processed:
+                return _jsonable({"order": order, "duplicate": True})
+
+            current_status = str(order["status"])
+            next_status = current_status
+            review_reason = str(update.get("review_reason") or "").strip()
+            provider_timestamp = str(update.get("provider_timestamp") or "").strip()
+            latest_provider_timestamp = str(
+                logistics.get("latest_provider_timestamp")
+                or (logistics.get("last_callback") or {}).get("provider_timestamp")
+                or ""
+            ).strip()
+            stale_callback = False
+            if provider_timestamp and latest_provider_timestamp:
+                try:
+                    current_provider_time = datetime.fromisoformat(
+                        provider_timestamp.replace("Z", "+00:00")
+                    )
+                    previous_provider_time = datetime.fromisoformat(
+                        latest_provider_timestamp.replace("Z", "+00:00")
+                    )
+                    if current_provider_time <= previous_provider_time:
+                        review_reason = "stale LOG10 callback timestamp"
+                        stale_callback = True
+                except ValueError:
+                    review_reason = "invalid LOG10 callback timestamp"
+                    stale_callback = True
+            target_status = str(update.get("target_status") or "").strip()
+            if not review_reason and target_status and target_status != current_status:
+                try:
+                    require_transition("order", current_status, target_status)
+                    next_status = target_status
+                except TransitionError as exc:
+                    review_reason = str(exc)
+
+            recorded_at = self.clock().isoformat()
+            provider_status = str(update.get("provider_status") or "").strip()
+            status_message = str(update.get("status_message") or "").strip()
+            if review_reason:
+                status_message = status_message or review_reason
+            if update.get("provider_name") and not stale_callback:
+                fulfilment["provider_name"] = str(update["provider_name"])
+            if update.get("tracking_id") and not stale_callback:
+                fulfilment["tracking_id"] = str(update["tracking_id"])
+            if update.get("tracking_url") and not stale_callback:
+                fulfilment["tracking_url"] = str(update["tracking_url"])
+            if status_message:
+                fulfilment["status_message"] = status_message
+
+            logistics.update(
+                {
+                    "last_callback": {
+                        "action": action,
+                        "message_id": message_id,
+                        "event_commitment": event_commitment,
+                        "received_at": recorded_at,
+                        "provider_timestamp": provider_timestamp or None,
+                    },
+                    "processed_callbacks": [*processed, event_commitment],
+                    "review_required": bool(review_reason),
+                }
+            )
+            if review_reason:
+                logistics["review_reason"] = review_reason
+            else:
+                logistics.pop("review_reason", None)
+            if provider_timestamp and not stale_callback:
+                logistics["latest_provider_timestamp"] = provider_timestamp
+            for source, target in (
+                ("provider_status", "provider_status"),
+                ("lsp_order_id", "lsp_order_id"),
+                ("tracking_url", "tracking_url"),
+                ("tracking_location", "tracking_location"),
+            ):
+                if update.get(source) and not stale_callback:
+                    logistics[target] = update[source]
+            if update.get("conformance") and not stale_callback:
+                logistics["conformance"] = dict(update["conformance"])
+
+            event = {
+                "status": next_status,
+                "recorded_at": recorded_at,
+                "source": "ondc-log10",
+                "callback_action": action,
+                "message_id": message_id,
+                "event_commitment": event_commitment,
+            }
+            if provider_status:
+                event["provider_status"] = provider_status
+            if update.get("tracking_id"):
+                event["tracking_id"] = str(update["tracking_id"])
+            elif fulfilment.get("tracking_id"):
+                event["tracking_id"] = fulfilment["tracking_id"]
+            if status_message:
+                event["status_message"] = status_message
+            fulfilment["status"] = next_status
+            fulfilment["last_verified_update_at"] = recorded_at
+            fulfilment["logistics"] = logistics
+            fulfilment["history"] = [
+                *list(fulfilment.get("history") or []),
+                event,
+            ]
+            order = await repository.update_order_fulfilment(
+                order["order_id"],
+                expected_version=int(order["version"]),
+                status=next_status,
+                fulfilment=fulfilment,
+            )
+        return _jsonable({"order": order, "duplicate": False})
+
+    async def rebind_rejected_logistics_provider(
+        self, *, order_id: str, logistics: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Replace only a rejected pre-shipment LSP binding under AgentGuard."""
+        required = (
+            "transaction_id",
+            "bpp_id",
+            "provider_name",
+            "core_version",
+            "signature_verified",
+        )
+        if any(logistics.get(field) in {None, ""} for field in required):
+            raise CommerceValidation("complete signed logistics binding is required")
+        if (
+            logistics["core_version"] != "1.2.5"
+            or logistics["signature_verified"] is not True
+        ):
+            raise CommerceValidation("replacement LSP must be signed LOG10 1.2.5")
+        async with UnitOfWork(self.pool) as unit_of_work:
+            repository = CommerceRepository(unit_of_work)
+            try:
+                order = await repository.get_order(UUID(order_id), lock=True)
+            except LookupError as exc:
+                raise CommerceNotFound(str(exc)) from exc
+            fulfilment = dict(order.get("fulfilment") or {})
+            prior = dict(fulfilment.get("logistics") or {})
+            if order["status"] != "preparing":
+                raise CommerceConflict("replacement LSP requires a preparing order")
+            if (prior.get("conformance") or {}).get("status") != "rejected":
+                raise CommerceConflict("current LSP has not been rejected")
+            if prior.get("bpp_id") == logistics.get("bpp_id"):
+                raise CommerceConflict("replacement LSP must be a different provider")
+            recorded_at = self.clock().isoformat()
+            attempts = list(prior.get("attempts") or [])
+            attempts.append(
+                {
+                    "transaction_id": prior.get("transaction_id"),
+                    "bpp_id": prior.get("bpp_id"),
+                    "provider_name": fulfilment.get("provider_name"),
+                    "conformance": prior.get("conformance"),
+                    "last_callback": prior.get("last_callback"),
+                }
+            )
+            replacement = dict(logistics)
+            replacement["attempts"] = attempts
+            fulfilment.update(
+                {
+                    "provider_name": str(logistics["provider_name"]),
+                    "status": "preparing",
+                    "status_message": "Trying another ONDC-compliant delivery provider.",
+                    "logistics": replacement,
+                }
+            )
+            fulfilment["history"] = [
+                *list(fulfilment.get("history") or []),
+                {
+                    "status": "preparing",
+                    "recorded_at": recorded_at,
+                    "source": "agentguard-logistics-rebind",
+                    "status_message": fulfilment["status_message"],
+                    "logistics_transaction_id": str(logistics["transaction_id"]),
+                },
+            ]
+            order = await repository.update_order_fulfilment(
+                order["order_id"],
+                expected_version=int(order["version"]),
+                status="preparing",
+                fulfilment=fulfilment,
+            )
+        return _jsonable(order)
+
     async def upsert_inventory(
         self,
         *,

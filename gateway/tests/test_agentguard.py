@@ -77,6 +77,32 @@ def test_evaluate_allow_need_approval_and_pause() -> None:
     assert denied["receipt"]["outcome"] == "paused"
 
 
+def test_paused_buyer_agent_does_not_block_user_checkout() -> None:
+    agent, _mandate, _policy = agentguard.ensure_agent(
+        principal_id="principal:demo:manual-buyer",
+        role="buyer",
+        wallet_address=WALLET,
+    )
+    agentguard.pause_agent(agent.agent_id)
+
+    denied = agentguard.evaluate_action(
+        principal_id=agent.principal_id,
+        action="buyer.checkout.commit",
+        amount_inr=89,
+        resource_id="quote-agent",
+    )
+    allowed = agentguard.evaluate_action(
+        principal_id=agent.principal_id,
+        actor="user",
+        action="buyer.checkout.commit",
+        amount_inr=89,
+        resource_id="quote-user",
+    )
+
+    assert denied["reason_code"] == "agent_paused"
+    assert allowed["decision"] == "allow"
+
+
 def test_consume_approval_once_replay_conflicts() -> None:
     need = agentguard.evaluate_action(
         wallet_address=WALLET,

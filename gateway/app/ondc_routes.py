@@ -9,7 +9,9 @@ import hashlib
 import json
 import time
 import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Optional
 
@@ -17,8 +19,10 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from app import ondc_store
+from app.commerce_v1 import CommerceConflict, CommerceNotFound, CommerceV1
 from app.ondc_crypto import (
     create_authorization_header,
     load_ed25519_private_pem,
@@ -43,6 +47,280 @@ DEFAULT_DOMAIN = "ONDC:RET10"
 CORE_VERSION = "1.2.0"
 LOGISTICS_DOMAIN = "ONDC:LOG10"
 LOGISTICS_CORE_VERSION = "1.2.5"
+_LOGISTICS_LIFECYCLE_CALLBACKS = {
+    "on_init",
+    "on_confirm",
+    "on_update",
+    "on_status",
+    "on_track",
+}
+_LOGISTICS_STATE_TARGETS = {
+    "Pending": "preparing",
+    "Searching-for-Agent": "preparing",
+    "Agent-assigned": "preparing",
+    "Order-picked-up": "shipped",
+    "Out-for-delivery": "shipped",
+    "Order-delivered": "delivered",
+    "Delivered": "delivered",
+    "Cancelled": "cancelled",
+}
+
+
+def _tag_values(tags: Any, code: str) -> dict[str, str]:
+    if not isinstance(tags, list):
+        return {}
+    for tag in tags:
+        if not isinstance(tag, dict) or tag.get("code") != code:
+            continue
+        values: dict[str, str] = {}
+        for item in tag.get("list") or []:
+            if isinstance(item, dict) and item.get("code") and item.get("value") is not None:
+                values[str(item["code"])] = str(item["value"])
+        return values
+    return {}
+
+
+def _logistics_fulfillments(envelope: dict[str, Any]) -> list[dict[str, Any]]:
+    order = (envelope.get("message") or {}).get("order") or {}
+    fulfillments = order.get("fulfillments") or []
+    return [item for item in fulfillments if isinstance(item, dict)]
+
+
+def _on_init_conformance(envelope: dict[str, Any]) -> tuple[bool, str]:
+    context = envelope.get("context") or {}
+    if context.get("domain") != LOGISTICS_DOMAIN:
+        return False, "callback domain is not ONDC:LOG10"
+    if context.get("core_version") != LOGISTICS_CORE_VERSION:
+        return False, "callback core_version is not 1.2.5"
+    if context.get("action") != "on_init":
+        return False, "a signed on_init callback is required"
+    fulfillments = _logistics_fulfillments(envelope)
+    delivery = [item for item in fulfillments if item.get("type") == "Delivery"]
+    if not delivery:
+        return False, "on_init requires a Delivery fulfillment"
+    if len(delivery) != len(fulfillments):
+        return False, "initial LOG10 scope allows Delivery fulfillments only"
+    for fulfillment in delivery:
+        rider = _tag_values(fulfillment.get("tags"), "rider_check")
+        if rider.get("inline_check_for_rider") != "yes":
+            return False, "Immediate Delivery requires rider_check/inline_check_for_rider=yes"
+    return True, ""
+
+
+def _contains_legal_terms(envelope: dict[str, Any]) -> bool:
+    order = (envelope.get("message") or {}).get("order") or {}
+    tag_lists = [order.get("tags")]
+    tag_lists.extend(item.get("tags") for item in _logistics_fulfillments(envelope))
+    for tags in tag_lists:
+        if not isinstance(tags, list):
+            continue
+        for tag in tags:
+            if not isinstance(tag, dict):
+                continue
+            if tag.get("code") in {"bap_terms", "bpp_terms"}:
+                return True
+            if any(
+                isinstance(item, dict) and item.get("code") == "accept_bpp_terms"
+                for item in tag.get("list") or []
+            ):
+                return True
+    return False
+
+
+def _build_logistics_confirm_message(
+    on_init: dict[str, Any], requested: dict[str, Any]
+) -> dict[str, Any]:
+    compliant, reason = _on_init_conformance(on_init)
+    if not compliant:
+        raise HTTPException(status_code=409, detail=reason)
+    if _contains_legal_terms(on_init) or _contains_legal_terms(requested):
+        raise HTTPException(
+            status_code=409,
+            detail="accept_bpp_terms requires explicit operator authority",
+        )
+    signed_order = deepcopy((on_init.get("message") or {}).get("order") or {})
+    requested_order = (requested.get("order") or {}) if isinstance(requested, dict) else {}
+    if requested_order.get("id") and requested_order.get("id") != signed_order.get("id"):
+        raise HTTPException(
+            status_code=409, detail="confirm order does not match signed on_init"
+        )
+    signed_order.pop("tags", None)
+    requested_fulfillments = {
+        item.get("id"): item
+        for item in requested_order.get("fulfillments") or []
+        if isinstance(item, dict) and item.get("id")
+    }
+    for fulfillment in signed_order.get("fulfillments") or []:
+        if not isinstance(fulfillment, dict) or fulfillment.get("type") != "Delivery":
+            continue
+        requested_fulfillment = requested_fulfillments.get(fulfillment.get("id")) or {}
+        linked_order = _tag_values(requested_fulfillment.get("tags"), "linked_order")
+        if not linked_order.get("id") or not linked_order.get("prep_time"):
+            raise HTTPException(
+                status_code=409,
+                detail="confirm requires linked_order id/prep_time",
+            )
+        instructions = ((requested_fulfillment.get("start") or {}).get("instructions") or {})
+        if not instructions.get("code") or not instructions.get("short_desc"):
+            raise HTTPException(
+                status_code=409,
+                detail="ready_to_ship=yes requires pickup instruction code/short_desc",
+            )
+        start = fulfillment.get("start")
+        if not isinstance(start, dict):
+            raise HTTPException(
+                status_code=409,
+                detail="signed on_init lacks a valid pickup start",
+            )
+        start["instructions"] = {
+            key: str(instructions[key])
+            for key in ("code", "short_desc", "long_desc")
+            if instructions.get(key)
+        }
+        fulfillment["tags"] = [
+            {
+                "code": "linked_order",
+                "list": [
+                    {"code": "id", "value": linked_order["id"]},
+                    {"code": "prep_time", "value": linked_order["prep_time"]},
+                ],
+            },
+            {
+                "code": "state",
+                "list": [{"code": "ready_to_ship", "value": "yes"}],
+            },
+            {
+                "code": "rto_action",
+                "list": [{"code": "return_to_origin", "value": "no"}],
+            },
+        ]
+    return {"order": signed_order}
+
+
+def _on_init_matches_binding(
+    envelope: dict[str, Any], logistics: dict[str, Any]
+) -> tuple[bool, str]:
+    order = (envelope.get("message") or {}).get("order") or {}
+    provider = order.get("provider") or {}
+    if provider.get("id") != logistics.get("provider_id"):
+        return False, "on_init provider does not match the selected offer"
+    selected_item = next(
+        (
+            item
+            for item in order.get("items") or []
+            if isinstance(item, dict) and item.get("id") == logistics.get("item_id")
+        ),
+        None,
+    )
+    if not selected_item or selected_item.get("fulfillment_id") != logistics.get(
+        "fulfillment_id"
+    ):
+        return False, "on_init item does not match the selected offer"
+    quote_price = (order.get("quote") or {}).get("price") or {}
+    selected_price = logistics.get("price") or {}
+    try:
+        price_matches = (
+            quote_price.get("currency") == selected_price.get("currency")
+            and Decimal(str(quote_price.get("value")))
+            == Decimal(str(selected_price.get("value")))
+        )
+    except (InvalidOperation, TypeError):
+        price_matches = False
+    if not price_matches:
+        return False, "on_init quote does not match the selected offer"
+    return True, ""
+
+
+def _provider_state(fulfillment: dict[str, Any]) -> str:
+    state = fulfillment.get("state")
+    if isinstance(state, str):
+        return state
+    if not isinstance(state, dict):
+        return ""
+    descriptor = state.get("descriptor") or {}
+    return str(descriptor.get("code") or state.get("code") or "")
+
+
+def _normalize_logistics_callback(record: dict[str, Any]) -> dict[str, Any]:
+    envelope = record.get("envelope") or {}
+    context = envelope.get("context") or {}
+    message = envelope.get("message") or {}
+    order = message.get("order") or {}
+    fulfillments = _logistics_fulfillments(envelope)
+    fulfillment = fulfillments[0] if fulfillments else {}
+    provider_status = _provider_state(fulfillment)
+    state_descriptor = (
+        (fulfillment.get("state") or {}).get("descriptor") or {}
+        if isinstance(fulfillment.get("state"), dict)
+        else {}
+    )
+    tracking = message.get("tracking") or fulfillment.get("tracking") or {}
+    if not isinstance(tracking, dict):
+        tracking = {}
+    provider = order.get("provider") or {}
+    provider_name = (
+        (provider.get("descriptor") or {}).get("name")
+        if isinstance(provider, dict)
+        else None
+    )
+    tracking_id = (
+        tracking.get("id")
+        or fulfillment.get("tracking_id")
+        or fulfillment.get("@ondc/org/awb_no")
+    )
+    raw_tracking_url = str(tracking.get("url") or "").strip()
+    tracking_url = raw_tracking_url if raw_tracking_url.startswith("https://") else None
+    action = str(record.get("action") or context.get("action") or "")
+    target_status = (
+        _LOGISTICS_STATE_TARGETS.get(provider_status)
+        if action in {"on_update", "on_status"}
+        else None
+    )
+    review_reason = ""
+    conformance: dict[str, Any] | None = None
+    status_message = str(
+        state_descriptor.get("short_desc")
+        or state_descriptor.get("name")
+        or tracking.get("status")
+        or ""
+    )
+    if action == "on_init":
+        compliant, reason = _on_init_conformance(envelope)
+        conformance = {
+            "status": "accepted" if compliant else "rejected",
+            "reason": reason or "ONDC LOG10 1.2.5 Immediate Delivery checks passed",
+            "message_id": str(record.get("message_id") or ""),
+        }
+        if not compliant:
+            review_reason = reason
+            status_message = f"Delivery provider response rejected: {reason}"
+        else:
+            status_message = "Delivery provider passed ONDC Immediate Delivery checks."
+    elif action in {"on_update", "on_status"} and not target_status:
+        review_reason = (
+            f"unknown LOG10 fulfillment state: {provider_status or 'missing'}"
+        )
+        status_message = status_message or review_reason
+    if raw_tracking_url and tracking_url is None and not review_reason:
+        review_reason = "tracking URL must use HTTPS"
+        status_message = status_message or review_reason
+
+    return {
+        "action": action,
+        "message_id": str(record.get("message_id") or context.get("message_id") or ""),
+        "bpp_id": str(record.get("subscriber_id") or context.get("bpp_id") or ""),
+        "provider_timestamp": context.get("timestamp"),
+        "provider_status": provider_status,
+        "provider_name": provider_name,
+        "target_status": target_status,
+        "lsp_order_id": order.get("id") if action == "on_confirm" else None,
+        "tracking_id": tracking_id,
+        "tracking_url": tracking_url,
+        "tracking_location": tracking.get("location"),
+        "status_message": status_message,
+        "review_reason": review_reason,
+        "conformance": conformance,
+    }
 
 
 async def _stage_outbox_before_dispatch(
@@ -767,7 +1045,18 @@ async def _dispatch_order_action(
         request, body, transaction_id=transaction_id, role=role
     )
     if role == "lbnp":
+        bound_order = await _require_bound_logistics_order(
+            request, transaction_id=transaction_id, bpp_id=bpp_id
+        )
         message = dict(body.message)  # type: ignore[union-attr]
+        if action == "confirm":
+            on_init = await _latest_signed_logistics_on_init(
+                request,
+                transaction_id=transaction_id,
+                bpp_id=bpp_id,
+                logistics=dict((bound_order.get("fulfilment") or {}).get("logistics") or {}),
+            )
+            message = _build_logistics_confirm_message(on_init, message)
         if action in {"init", "confirm", "update"}:
             order = message.get("order")
             fulfillments = (
@@ -997,28 +1286,66 @@ async def _persistent_records(
     return [_queue_record(row) for row in rows]
 
 
-async def _advertised_logistics_version(
-    request: Request,
-    *,
-    transaction_id: str,
-    bpp_id: str,
-    version: str,
-) -> bool:
+async def _require_bound_logistics_order(
+    request: Request, *, transaction_id: str, bpp_id: str
+) -> dict[str, Any]:
+    pool = getattr(request.app.state, "persistence_pool", None)
+    if pool is None:
+        raise HTTPException(
+            status_code=409,
+            detail="PostgreSQL CommerceV1 binding is required for LOG10 actions",
+        )
+    try:
+        order = await CommerceV1(pool).get_logistics_binding(transaction_id)
+    except (CommerceNotFound, CommerceConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    logistics = dict((order.get("fulfilment") or {}).get("logistics") or {})
+    if logistics.get("bpp_id") != bpp_id:
+        raise HTTPException(
+            status_code=409,
+            detail="LOG10 target does not match the AgentGuard-bound provider",
+        )
+    return order
+
+
+async def _latest_signed_logistics_on_init(
+    request: Request, *, transaction_id: str, bpp_id: str, logistics: dict[str, Any]
+) -> dict[str, Any]:
     records = await _persistent_records(
         request,
         "inbox",
         transaction_id=transaction_id,
-        action="on_search",
+        action="on_init",
         limit=100,
     )
     if records is None:
-        records = ondc_store.callbacks_for_transaction(transaction_id)
+        raise HTTPException(
+            status_code=409,
+            detail="PostgreSQL callback persistence is required before LOG10 confirm",
+        )
     for record in records:
-        envelope = record.get("envelope") or record.get("payload") or {}
+        envelope = record.get("envelope") or {}
         context = envelope.get("context") or {}
-        if context.get("bpp_id") == bpp_id and context.get("core_version") == version:
-            return True
-    return False
+        if (
+            record.get("subscriber_id") == bpp_id
+            and (record.get("redacted_payload") or {}).get("signature_verified")
+            is True
+            and context.get("domain") == LOGISTICS_DOMAIN
+            and context.get("core_version") == LOGISTICS_CORE_VERSION
+            and context.get("bpp_id") == bpp_id
+            and context.get("transaction_id") == transaction_id
+        ):
+            compliant, reason = _on_init_conformance(envelope)
+            if not compliant:
+                raise HTTPException(status_code=409, detail=reason)
+            matched, reason = _on_init_matches_binding(envelope, logistics)
+            if not matched:
+                raise HTTPException(status_code=409, detail=reason)
+            return envelope
+    raise HTTPException(
+        status_code=409,
+        detail="a compliant signature-verified LOG10 1.2.5 on_init is required",
+    )
 
 
 async def _verify_logistics_callback(
@@ -1028,19 +1355,14 @@ async def _verify_logistics_callback(
     action: str,
 ) -> tuple[bool, str]:
     context = body.get("context") or {}
+    if context.get("domain") != LOGISTICS_DOMAIN:
+        return False, "LOG10 callback domain must be ONDC:LOG10"
+    if context.get("action") != action:
+        return False, "LOG10 callback action does not match the callback route"
     version = str(context.get("core_version") or "")
-    if version not in {LOGISTICS_CORE_VERSION, "1.2.0"}:
+    if version != LOGISTICS_CORE_VERSION:
         return False, f"unsupported LOG10 core_version: {version or 'missing'}"
     bpp_id = str(context.get("bpp_id") or "").strip()
-    if version == "1.2.0" and action != "on_search":
-        advertised = await _advertised_logistics_version(
-            request,
-            transaction_id=str(context.get("transaction_id") or ""),
-            bpp_id=bpp_id,
-            version=version,
-        )
-        if not advertised:
-            return False, "LOG10 1.2.0 was not advertised by this BPP in on_search"
 
     authorization = (request.headers.get("Authorization") or "").strip()
     if not authorization:
@@ -1091,6 +1413,50 @@ def _require_recovery_write_contract(request: Request) -> tuple[str, str]:
             detail="Idempotency-Key and X-Correlation-ID headers are required",
         )
     return idempotency_key, correlation_id
+
+
+async def _reconcile_claimed_inbox(pool: Any, record: dict[str, Any]) -> dict[str, Any]:
+    error = ""
+    delivered = False
+    try:
+        envelope = record.get("envelope") or {}
+        context = envelope.get("context") or {}
+        if (
+            context.get("domain") == LOGISTICS_DOMAIN
+            and record.get("action") in _LOGISTICS_LIFECYCLE_CALLBACKS
+        ):
+            await CommerceV1(pool).apply_logistics_update(
+                transaction_id=str(record["transaction_id"]),
+                event_commitment=str(record["event_commitment"]),
+                update=_normalize_logistics_callback(record),
+            )
+        delivered = True
+    except Exception as exc:  # noqa: BLE001
+        error = str(exc)
+    async with UnitOfWork(pool) as unit_of_work:
+        repository = ONDCRepository(unit_of_work)
+        if delivered:
+            return await repository.mark_delivered(
+                "inbox", record["inbox_id"], record["lease_token"]
+            )
+        return await repository.schedule_retry(
+            "inbox",
+            record["inbox_id"],
+            record["lease_token"],
+            error=error or "callback reconciliation failed",
+        )
+
+
+async def _process_inbox_record(pool: Any, record_id: int) -> dict[str, Any] | None:
+    async with UnitOfWork(pool) as unit_of_work:
+        record = await ONDCRepository(unit_of_work).claim_inbox_record(
+            record_id,
+            worker_id=f"ondc-callback-{record_id}",
+            lease_seconds=30,
+        )
+    if record is None:
+        return None
+    return await _reconcile_claimed_inbox(pool, record)
 
 
 @router.get("/api/ondc/orders")
@@ -1170,7 +1536,10 @@ async def _ingest_callback(
         )
 
     signature_verified = False
-    if ctx.get("domain") == LOGISTICS_DOMAIN:
+    if (
+        ctx.get("domain") == LOGISTICS_DOMAIN
+        or ctx.get("core_version") == LOGISTICS_CORE_VERSION
+    ):
         signature_verified, verification_error = await _verify_logistics_callback(
             request,
             body,
@@ -1190,12 +1559,24 @@ async def _ingest_callback(
             )
 
     persistence_pool = getattr(request.app.state, "persistence_pool", None)
+    if ctx.get("domain") == LOGISTICS_DOMAIN and persistence_pool is None:
+        return JSONResponse(
+            {
+                "message": {"ack": {"status": "NACK"}},
+                "error": {
+                    "type": "DOMAIN-ERROR",
+                    "code": "50000",
+                    "message": "PostgreSQL persistence is required for LOG10 callbacks",
+                },
+            },
+            status_code=503,
+        )
     if persistence_pool is not None:
         correlation_id = (
             request.headers.get("X-Correlation-ID") or transaction_id
         ).strip()
         try:
-            await persist_callback_before_ack(
+            _, persisted = await persist_callback_before_ack(
                 persistence_pool,
                 subscriber_id=subscriber_id,
                 transaction_id=transaction_id,
@@ -1237,7 +1618,20 @@ async def _ingest_callback(
                 },
                 status_code=503,
             )
-        return JSONResponse({"message": {"ack": {"status": "ACK"}}})
+        background = None
+        if (
+            ctx.get("domain") == LOGISTICS_DOMAIN
+            and normalized_action in _LOGISTICS_LIFECYCLE_CALLBACKS
+        ):
+            background = BackgroundTask(
+                _process_inbox_record,
+                persistence_pool,
+                int(persisted["inbox_id"]),
+            )
+        return JSONResponse(
+            {"message": {"ack": {"status": "ACK"}}},
+            background=background,
+        )
 
     entry = {
         "id": f"in_{uuid.uuid4().hex[:12]}",
@@ -1421,6 +1815,30 @@ async def drain_ondc_outbox(request: Request, body: OutboxDrainBody) -> JSONResp
                     error=error,
                 )
         results.append(_queue_record(updated))
+    return JSONResponse(
+        {"success": True, "data": {"claimed": len(claimed), "items": results}}
+    )
+
+
+@router.post("/api/ondc/inbox/drain")
+async def drain_ondc_inbox(request: Request, body: OutboxDrainBody) -> JSONResponse:
+    """Lease and reconcile persisted callbacks; safe after process restart."""
+    _require_recovery_write_contract(request)
+    pool = getattr(request.app.state, "persistence_pool", None)
+    if pool is None:
+        raise HTTPException(
+            status_code=409, detail="PostgreSQL persistence is required"
+        )
+    async with UnitOfWork(pool) as unit_of_work:
+        claimed = await ONDCRepository(unit_of_work).claim_inbox(
+            worker_id=body.worker_id,
+            lease_seconds=body.lease_seconds,
+            limit=body.limit,
+        )
+    results = [
+        _queue_record(await _reconcile_claimed_inbox(pool, record))
+        for record in claimed
+    ]
     return JSONResponse(
         {"success": True, "data": {"claimed": len(claimed), "items": results}}
     )

@@ -230,6 +230,14 @@ class ONDCRepository:
     ) -> list[dict[str, Any]]:
         return await self._claim("inbox", worker_id, lease_seconds, limit)
 
+    async def claim_inbox_record(
+        self, record_id: int, *, worker_id: str, lease_seconds: int = 30
+    ) -> dict[str, Any] | None:
+        """Claim one freshly persisted or expired callback for reconciliation."""
+        return await self._claim_record(
+            "inbox", record_id, worker_id=worker_id, lease_seconds=lease_seconds
+        )
+
     async def claim_outbox(
         self, *, worker_id: str, lease_seconds: int = 30, limit: int = 1
     ) -> list[dict[str, Any]]:
@@ -239,18 +247,31 @@ class ONDCRepository:
         self, record_id: int, *, worker_id: str, lease_seconds: int = 30
     ) -> dict[str, Any] | None:
         """Claim one freshly staged or expired outbox record for inline delivery."""
+        return await self._claim_record(
+            "outbox", record_id, worker_id=worker_id, lease_seconds=lease_seconds
+        )
+
+    async def _claim_record(
+        self,
+        queue: Queue,
+        record_id: int,
+        *,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> dict[str, Any] | None:
         if not worker_id.strip() or lease_seconds < 1:
             raise ValueError("worker_id and positive lease_seconds are required")
-        columns = self._columns("outbox")
+        table, id_column = self._table(queue)
+        columns = self._columns(queue)
         lease_token = uuid4()
         async with self._connection.cursor(row_factory=dict_row) as cursor:
             await cursor.execute(
                 f"""
-                UPDATE ondc_outbox
+                UPDATE {table}
                 SET state = 'processing', lease_token = %s, lease_owner = %s,
                     lease_expires_at = NOW() + make_interval(secs => %s),
                     updated_at = NOW()
-                WHERE outbox_id = %s
+                WHERE {id_column} = %s
                   AND next_attempt_at <= NOW()
                   AND (
                     state = 'pending'
