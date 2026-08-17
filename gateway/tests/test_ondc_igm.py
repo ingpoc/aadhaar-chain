@@ -160,6 +160,10 @@ def test_signed_igm_issue_request_uses_retail_scope_and_authorization(
     assert sent["message"]["issue"]["id"] == created["issue_id"]
     assert sent["message"]["issue"]["category"] == "FULFILLMENT"
     assert sent["message"]["issue"]["issue_type"] == "ISSUE"
+    actions = sent["message"]["issue"]["issue_actions"]["complainant_actions"]
+    assert actions[0]["complainant_action"] == "OPEN"
+    assert actions[0]["updated_by"]["org"]["name"].endswith("::ONDC:RET10")
+    assert sent["message"]["issue"]["created_at"] == sent["message"]["issue"]["updated_at"]
 
     issues = client.get(
         "/api/demo-commerce/test-fixtures/buyer/issues"
@@ -359,6 +363,9 @@ def test_seller_bpp_issue_acks_and_posts_signed_on_issue(
     assert sent["context"]["message_id"] == "msg-bpp-igm"
     assert sent["message"]["issue"]["id"] == "issue_from_buyer"
     assert sent["message"]["issue"]["status"] == "PROCESSING"
+    respondent = sent["message"]["issue"]["issue_actions"]["respondent_actions"]
+    assert respondent[0]["respondent_action"] == "PROCESSING"
+    assert respondent[0]["cascaded_level"] == 1
 
 
 def test_igm_dispatch_binds_confirmed_order_without_local_issue(
@@ -445,3 +452,92 @@ def test_igm_dispatch_binds_confirmed_order_without_local_issue(
     matching = [row for row in issues if row["issue_id"] == bound_id]
     assert len(matching) == 1
     assert matching[0]["order_id"] == order_id
+
+
+def test_igm_close_sends_complainant_close_action(
+    tmp_path: Path, ed25519_pem: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_retail_igm(tmp_path, ed25519_pem, monkeypatch)
+    mock_resp = AsyncMock()
+    mock_resp.status_code = 200
+    mock_resp.json = lambda: {"message": {"ack": {"status": "ACK"}}}
+    mock_resp.text = '{"message":{"ack":{"status":"ACK"}}}'
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = None
+    mock_client.post = AsyncMock(return_value=mock_resp)
+
+    from main import app
+
+    app.state.persistence_pool = None
+    with patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client):
+        client = TestClient(app)
+        created = _create_local_issue(client)
+        response = client.post(
+            "/api/ondc/issue",
+            json={
+                "issue_id": created["issue_id"],
+                "complainant_action": "CLOSE",
+                "bpp_id": "ondcseller.aadharcha.in",
+                "bpp_uri": "https://ondcseller.aadharcha.in/ondc",
+                "transaction_id": "txn-igm-close",
+                "message_id": "msg-igm-close",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    sent = json.loads(mock_client.post.await_args.kwargs["content"].decode("utf-8"))
+    actions = sent["message"]["issue"]["issue_actions"]["complainant_actions"]
+    assert [row["complainant_action"] for row in actions] == ["OPEN", "CLOSE"]
+    assert sent["message"]["issue"]["status"] == "CLOSED"
+
+
+def test_seller_bpp_issue_status_posts_resolved_actions(
+    tmp_path: Path, ed25519_pem: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_retail_igm(tmp_path, ed25519_pem, monkeypatch)
+    mock_resp = AsyncMock()
+    mock_resp.status_code = 200
+    mock_resp.json = lambda: {"message": {"ack": {"status": "ACK"}}}
+    mock_resp.text = '{"message":{"ack":{"status":"ACK"}}}'
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = None
+    mock_client.post = AsyncMock(return_value=mock_resp)
+
+    from main import app
+
+    app.state.persistence_pool = None
+    inbound = _on_issue_envelope(
+        issue_id="issue_from_buyer",
+        transaction_id="txn-bpp-igm-status",
+        message_id="msg-bpp-igm-status",
+    )
+    inbound["context"]["action"] = "issue_status"
+    inbound["message"] = {
+        "issue_id": "issue_from_buyer",
+        "issue": {
+            "id": "issue_from_buyer",
+            "status": "RESOLVED",
+            "issue_actions": {
+                "respondent_actions": [
+                    {"respondent_action": "PROCESSING", "cascaded_level": 1}
+                ]
+            },
+        },
+    }
+
+    with patch("app.ondc_bpp.httpx.AsyncClient", return_value=mock_client):
+        client = TestClient(app)
+        ack = client.post("/ondc/issue_status", json=inbound)
+
+    assert ack.status_code == 200
+    sent = json.loads(mock_client.post.await_args.kwargs["content"].decode("utf-8"))
+    assert sent["context"]["action"] == "on_issue_status"
+    call_actions = [
+        row["respondent_action"]
+        for row in sent["message"]["issue"]["issue_actions"]["respondent_actions"]
+    ]
+    assert call_actions[-1] == "RESOLVED"
+    assert sent["message"]["issue"]["status"] == "RESOLVED"
+    assert sent["message"]["issue"]["resolution"]["action_triggered"] == "NO-ACTION"

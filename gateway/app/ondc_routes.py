@@ -85,6 +85,13 @@ _IGM_REASON_CATEGORY = {
     "other": "OTHER",
     "buyer_support": "OTHER",
 }
+_IGM_COMPLAINANT_ACTIONS = frozenset({"OPEN", "CLOSE", "ESCALATE"})
+_IGM_SUB_CATEGORY = {
+    "FULFILLMENT": "FLM02",
+    "ITEM": "ITM02",
+    "ORDER": "ORD01",
+    "PAYMENT": "PMT01",
+}
 _LOGISTICS_STATE_TARGETS = {
     "Pending": "preparing",
     "Searching-for-Agent": "preparing",
@@ -655,6 +662,7 @@ class IgmIssueBody(BaseModel):
     order_id: Optional[str] = None
     issue_type: str = "ISSUE"
     category: Optional[str] = None
+    complainant_action: Optional[str] = None
     message_id: Optional[str] = None
     transaction_id: Optional[str] = None
     bpp_id: Optional[str] = None
@@ -1313,6 +1321,44 @@ def _igm_category(reason: str, override: str | None = None) -> str:
     return _IGM_REASON_CATEGORY.get(str(reason or "").strip().lower(), "OTHER")
 
 
+def _igm_updated_by(subscriber_id: str, *, person: str = "Buyer") -> dict[str, Any]:
+    return {
+        "org": {"name": f"{subscriber_id}::{DEFAULT_DOMAIN}"},
+        "contact": {
+            "phone": "9999999999",
+            "email": "support@ondcbuyer.aadharcha.in",
+        },
+        "person": {"name": person},
+    }
+
+
+def _igm_complainant_actions(
+    *,
+    action: str,
+    timestamp: str,
+    created_at: str,
+    subscriber_id: str,
+) -> list[dict[str, Any]]:
+    """Visible IGM schema: issue_actions.complainant_actions. OPEN then CLOSE/ESCALATE."""
+    opened = {
+        "complainant_action": "OPEN",
+        "short_desc": "Complaint created",
+        "updated_at": created_at,
+        "updated_by": _igm_updated_by(subscriber_id),
+    }
+    if action == "OPEN":
+        return [opened]
+    return [
+        opened,
+        {
+            "complainant_action": action,
+            "short_desc": f"Complaint {action.lower()}",
+            "updated_at": timestamp,
+            "updated_by": _igm_updated_by(subscriber_id),
+        },
+    ]
+
+
 def _confirm_order_id(envelope: dict[str, Any]) -> str:
     message = envelope.get("message") or {}
     order = message.get("order") if isinstance(message.get("order"), dict) else {}
@@ -1666,34 +1712,59 @@ async def _dispatch_igm_action(
         transaction_id=transaction_id,
     )
     timestamp = _iso_now()
+    bap_id = getattr(settings, "ondc_bap_id", None) or _subscriber_id()
+    complainant_action = str(body.complainant_action or "OPEN").strip().upper()
+    if complainant_action not in _IGM_COMPLAINANT_ACTIONS:
+        raise HTTPException(
+            status_code=422,
+            detail="complainant_action must be OPEN, CLOSE, or ESCALATE",
+        )
     if action == "issue_status":
         message: dict[str, Any] = {"issue_id": str(local["issue_id"])}
     else:
-        message = {
-            "issue": {
-                "id": str(local["issue_id"]),
-                "category": _igm_category(str(local.get("reason") or ""), body.category),
-                "complainant_id": str(
-                    local.get("principal_id")
-                    or (await _order_buyer_id(request, str(local.get("order_id") or "")))
-                    or ""
-                ),
-                "order_details": {"id": str(local.get("order_id") or "")},
-                "description": {
-                    "short_desc": str(local.get("reason") or "buyer_support"),
-                    "long_desc": str(local.get("description") or ""),
+        category = _igm_category(str(local.get("reason") or ""), body.category)
+        created_at = timestamp if complainant_action == "OPEN" else str(
+            local.get("created_at") or timestamp
+        )
+        igm_status = "CLOSED" if complainant_action == "CLOSE" else "OPEN"
+        issue: dict[str, Any] = {
+            "id": str(local["issue_id"]),
+            "category": category,
+            "complainant_info": {
+                "person": {"name": "Buyer"},
+                "contact": {
+                    "phone": "9999999999",
+                    "email": "support@ondcbuyer.aadharcha.in",
                 },
-                "source": {
-                    "network_participant_id": _subscriber_id() or "",
-                    "type": "CONSUMER",
-                },
-                "status": "OPEN",
-                "issue_type": issue_type,
-                "created_at": str(local.get("created_at") or timestamp),
-                "updated_at": timestamp,
-            }
+            },
+            "order_details": {"id": str(local.get("order_id") or "")},
+            "description": {
+                "short_desc": str(local.get("reason") or "buyer_support"),
+                "long_desc": str(local.get("description") or ""),
+            },
+            "source": {
+                "network_participant_id": _subscriber_id() or "",
+                "type": "CONSUMER",
+            },
+            "expected_response_time": {"duration": "PT2H"},
+            "expected_resolution_time": {"duration": "P1D"},
+            "status": igm_status,
+            "issue_type": issue_type,
+            "issue_actions": {
+                "complainant_actions": _igm_complainant_actions(
+                    action=complainant_action,
+                    timestamp=timestamp,
+                    created_at=created_at,
+                    subscriber_id=str(bap_id or ""),
+                )
+            },
+            "created_at": created_at,
+            "updated_at": timestamp,
         }
-    bap_id = getattr(settings, "ondc_bap_id", None) or _subscriber_id()
+        sub_category = _IGM_SUB_CATEGORY.get(category)
+        if sub_category:
+            issue["sub_category"] = sub_category
+        message = {"issue": issue}
     envelope = {
         "context": {
             "domain": DEFAULT_DOMAIN,

@@ -216,6 +216,83 @@ def _bpp_ready() -> bool:
     )
 
 
+def _igm_respondent_actor() -> dict[str, Any]:
+    return {
+        "org": {"name": f"{_bpp_id()}::{DEFAULT_DOMAIN}"},
+        "contact": {
+            "phone": "9999999999",
+            "email": "support@ondcseller.aadharcha.in",
+        },
+        "person": {"name": "Seller"},
+    }
+
+
+def _with_respondent_issue_actions(
+    inbound_issue: dict[str, Any],
+    *,
+    action: str,
+    timestamp: str,
+) -> dict[str, Any]:
+    """Workbench on_issue / on_issue_status require issue_actions.respondent_actions."""
+    inbound_actions = (
+        inbound_issue.get("issue_actions")
+        if isinstance(inbound_issue.get("issue_actions"), dict)
+        else {}
+    )
+    complainant_actions = list(inbound_actions.get("complainant_actions") or [])
+    respondent_actions = [
+        item
+        for item in (inbound_actions.get("respondent_actions") or [])
+        if isinstance(item, dict)
+    ]
+    inbound_status = str(inbound_issue.get("status") or "").strip().upper()
+    if action == "issue":
+        respondent_action = "PROCESSING"
+        status = "PROCESSING"
+    elif inbound_status == "RESOLVED" or (
+        respondent_actions
+        and respondent_actions[-1].get("respondent_action") == "RESOLVED"
+    ):
+        respondent_action = "RESOLVED"
+        status = "RESOLVED"
+    else:
+        respondent_action = "PROCESSING"
+        status = inbound_status if inbound_status in {"PROCESSING", "RESOLVED"} else "PROCESSING"
+    last = respondent_actions[-1].get("respondent_action") if respondent_actions else None
+    if last != respondent_action:
+        respondent_actions.append(
+            {
+                "respondent_action": respondent_action,
+                "short_desc": (
+                    "Complaint resolved"
+                    if respondent_action == "RESOLVED"
+                    else "Complaint is being processed"
+                ),
+                "updated_at": timestamp,
+                "updated_by": _igm_respondent_actor(),
+                "cascaded_level": 1,
+            }
+        )
+    issue = {
+        **inbound_issue,
+        "id": inbound_issue.get("id") or str(uuid.uuid4()),
+        "status": status,
+        "created_at": inbound_issue.get("created_at") or timestamp,
+        "updated_at": timestamp,
+        "issue_actions": {
+            "complainant_actions": complainant_actions,
+            "respondent_actions": respondent_actions,
+        },
+    }
+    if status == "RESOLVED" and not issue.get("resolution"):
+        issue["resolution"] = {
+            "short_desc": "Issue resolved",
+            "long_desc": "Seller confirmed the issue is resolved.",
+            "action_triggered": "NO-ACTION",
+        }
+    return issue
+
+
 def _iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
 
@@ -737,12 +814,8 @@ async def _post_on_issue(
     if action == "issue_status":
         inbound_id = (request_body.get("message") or {}).get("issue_id") or inbound_issue.get("id")
         inbound_issue = {**inbound_issue, "id": inbound_id}
-    issue = {
-        **inbound_issue,
-        "id": inbound_issue.get("id") or str(uuid.uuid4()),
-        "status": "PROCESSING" if action == "issue" else inbound_issue.get("status") or "PROCESSING",
-        "updated_at": _iso_now(),
-    }
+    timestamp = _iso_now()
+    issue = _with_respondent_issue_actions(inbound_issue, action=action, timestamp=timestamp)
     message_id = _paired_callback_message_id(ctx)
     if not message_id:
         logger.warning("BPP on_%s skipped — missing request message_id", action)
