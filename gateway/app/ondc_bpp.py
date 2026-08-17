@@ -719,3 +719,134 @@ async def root_init(request: Request, background: BackgroundTasks) -> JSONRespon
 @router.post("/ondc/confirm")
 async def root_confirm(request: Request, background: BackgroundTasks) -> JSONResponse:
     return await handle_bpp_order_action(request, "confirm", await request.json(), background)
+
+
+async def _post_on_issue(
+    action: str, request_body: dict[str, Any], pool: Any | None = None
+) -> None:
+    """ACK already returned; post signed on_issue / on_issue_status to bap_uri."""
+    if not _bpp_ready():
+        logger.warning("BPP on_%s skipped — seller keys / ONDC_ENABLED not ready", action)
+        return
+    ctx = request_body.get("context") or {}
+    bap_uri = str(ctx.get("bap_uri") or "").rstrip("/")
+    if not bap_uri:
+        logger.warning("BPP on_%s skipped — missing bap_uri", action)
+        return
+    inbound_issue = (request_body.get("message") or {}).get("issue") or {}
+    if action == "issue_status":
+        inbound_id = (request_body.get("message") or {}).get("issue_id") or inbound_issue.get("id")
+        inbound_issue = {**inbound_issue, "id": inbound_id}
+    issue = {
+        **inbound_issue,
+        "id": inbound_issue.get("id") or str(uuid.uuid4()),
+        "status": "PROCESSING" if action == "issue" else inbound_issue.get("status") or "PROCESSING",
+        "updated_at": _iso_now(),
+    }
+    message_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"{ctx.get('transaction_id')}:{ctx.get('message_id')}:on_{action}",
+        )
+    )
+    on_action = f"on_{action}"
+    envelope = {
+        "context": {
+            "domain": ctx.get("domain") or DEFAULT_DOMAIN,
+            "action": on_action,
+            "country": ctx.get("country") or "IND",
+            "city": ctx.get("city") or "std:080",
+            "core_version": ctx.get("core_version") or CORE_VERSION,
+            "bap_id": ctx.get("bap_id"),
+            "bap_uri": bap_uri,
+            "bpp_id": _bpp_id(),
+            "bpp_uri": _bpp_uri(),
+            "transaction_id": ctx.get("transaction_id"),
+            "message_id": message_id,
+            "timestamp": _iso_now(),
+            "ttl": ctx.get("ttl") or "PT30S",
+        },
+        "message": {"issue": issue},
+    }
+    uk = _seller_uk_id()
+    pem = _seller_signing_pem()
+    if not uk or pem is None:
+        return
+    private_key = load_ed25519_private_pem(pem.read_bytes())
+    body_str = minify_json(envelope)
+    auth = create_authorization_header(
+        body_str,
+        subscriber_id=_bpp_id(),
+        unique_key_id=uk,
+        private_key=private_key,
+    )
+    url = f"{bap_uri}/{on_action}"
+    staged = await _stage_bpp_callback(pool, envelope, url)
+    if staged is not None and (
+        staged.get("delivered") or staged["record"].get("lease_token") is None
+    ):
+        return
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(
+                url,
+                content=body_str.encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Authorization": auth,
+                },
+            )
+        logger.info("BPP %s → %s status=%s", on_action, url, resp.status_code)
+        await _finish_bpp_callback(
+            staged,
+            delivered=_bap_acknowledged(resp),
+            error=f"BAP returned HTTP {resp.status_code}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        await _finish_bpp_callback(staged, delivered=False, error=str(exc))
+        logger.exception("BPP %s dispatch failed to %s", on_action, url)
+
+
+async def handle_bpp_igm(
+    request: Request,
+    action: str,
+    body: dict[str, Any],
+    background: BackgroundTasks,
+) -> JSONResponse:
+    if action not in {"issue", "issue_status"}:
+        raise HTTPException(status_code=404, detail=f"unsupported BPP IGM action: {action}")
+    if not getattr(settings, "ondc_enabled", False):
+        raise HTTPException(status_code=503, detail="ONDC_ENABLED=false")
+    context = body.get("context") or {}
+    if context.get("domain") not in {None, "", DEFAULT_DOMAIN}:
+        raise HTTPException(
+            status_code=422,
+            detail="A2 IGM scope is Retail B2C v1.2 (ONDC:RET10) only",
+        )
+    pool, created = await _persist_bpp_inbound(request, action, body)
+    if created:
+        background.add_task(_post_on_issue, action, body, pool)
+    return JSONResponse({"message": {"ack": {"status": "ACK"}}})
+
+
+@router.post("/ondc/np/seller/issue")
+async def np_seller_issue(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_igm(request, "issue", await request.json(), background)
+
+
+@router.post("/ondc/np/seller/issue_status")
+async def np_seller_issue_status(
+    request: Request, background: BackgroundTasks
+) -> JSONResponse:
+    return await handle_bpp_igm(request, "issue_status", await request.json(), background)
+
+
+@router.post("/ondc/issue")
+async def root_issue(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_igm(request, "issue", await request.json(), background)
+
+
+@router.post("/ondc/issue_status")
+async def root_issue_status(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_igm(request, "issue_status", await request.json(), background)

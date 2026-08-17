@@ -5,6 +5,7 @@ Frontends call /api/ondc/* ; PreProd traffic requires ONDC_ENABLED + keys + subs
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import time
@@ -53,6 +54,18 @@ _LOGISTICS_LIFECYCLE_CALLBACKS = {
     "on_update",
     "on_status",
     "on_track",
+}
+_IGM_ACTIONS = frozenset({"issue", "issue_status"})
+_IGM_CALLBACKS = frozenset({"on_issue", "on_issue_status"})
+_IGM_REASON_CATEGORY = {
+    "fulfillment": "FULFILLMENT",
+    "fulfilment": "FULFILLMENT",
+    "payment": "PAYMENT",
+    "cancellation": "ORDER",
+    "post delivery": "FULFILLMENT",
+    "post_delivery": "FULFILLMENT",
+    "other": "OTHER",
+    "buyer_support": "OTHER",
 }
 _LOGISTICS_STATE_TARGETS = {
     "Pending": "preparing",
@@ -588,6 +601,20 @@ class OrderActionBody(BaseModel):
     """select / init / confirm — order + target BPP."""
 
     order: dict[str, Any] = Field(default_factory=dict)
+    message_id: Optional[str] = None
+    transaction_id: Optional[str] = None
+    bpp_id: Optional[str] = None
+    bpp_uri: Optional[str] = None
+    city: Optional[str] = None
+    domain: Optional[str] = None
+
+
+class IgmIssueBody(BaseModel):
+    """Retail IGM issue / issue_status bound to a local commerce issue."""
+
+    issue_id: str
+    issue_type: str = "ISSUE"
+    category: Optional[str] = None
     message_id: Optional[str] = None
     transaction_id: Optional[str] = None
     bpp_id: Optional[str] = None
@@ -1214,6 +1241,411 @@ async def ondc_confirm(body: ConfirmBody, request: Request) -> JSONResponse:
     return await _dispatch_order_action(request, "confirm", body)
 
 
+def _igm_issue_id(envelope: dict[str, Any]) -> str:
+    message = envelope.get("message") or {}
+    issue = message.get("issue") if isinstance(message.get("issue"), dict) else {}
+    return str(issue.get("id") or message.get("issue_id") or "").strip()
+
+
+def _igm_network_status(envelope: dict[str, Any]) -> str:
+    message = envelope.get("message") or {}
+    issue = message.get("issue") if isinstance(message.get("issue"), dict) else {}
+    return str(issue.get("status") or "").strip().upper()
+
+
+def _igm_category(reason: str, override: str | None = None) -> str:
+    if override:
+        return str(override).strip().upper()
+    return _IGM_REASON_CATEGORY.get(str(reason or "").strip().lower(), "OTHER")
+
+
+async def _load_local_issue(request: Request, issue_id: str) -> dict[str, Any]:
+    pool = getattr(request.app.state, "persistence_pool", None)
+    if pool is not None:
+        from app.commerce_compat import CommerceCompatibilityAdapter
+
+        listed = await CommerceCompatibilityAdapter(pool).list_issues()
+        for row in listed.get("issues") or []:
+            if str(row.get("issue_id")) == str(issue_id):
+                return row
+        raise HTTPException(status_code=404, detail="Unknown issue")
+    from app.commerce_demo import load_state
+
+    issue = load_state().issues.get(issue_id)
+    if not issue:
+        raise HTTPException(status_code=404, detail="Unknown issue")
+    return issue
+
+
+async def _record_igm_correlation(
+    envelope: dict[str, Any],
+    *,
+    signature_verified: bool,
+    note: str = "",
+    pool: Any | None = None,
+) -> dict[str, Any] | None:
+    issue_id = _igm_issue_id(envelope)
+    if not issue_id:
+        return None
+    context = envelope.get("context") or {}
+    transaction_id = str(context.get("transaction_id") or "").strip()
+    message_id = str(context.get("message_id") or "").strip()
+    action = str(context.get("action") or "").strip()
+    try:
+        if pool is not None:
+            from app.commerce_compat import CommerceCompatibilityAdapter
+            from uuid import UUID
+
+            try:
+                UUID(issue_id)
+            except ValueError:
+                return None
+            return await CommerceCompatibilityAdapter(pool).record_igm_network_event(
+                issue_id,
+                action=action,
+                transaction_id=transaction_id,
+                message_id=message_id,
+                network_status=_igm_network_status(envelope),
+                note=note,
+                signature_verified=signature_verified,
+            )
+        from app.commerce_demo import record_igm_network_event
+
+        return record_igm_network_event(
+            issue_id,
+            action=action,
+            transaction_id=transaction_id,
+            message_id=message_id,
+            network_status=_igm_network_status(envelope),
+            note=note,
+            signature_verified=signature_verified,
+        )
+    except KeyError:
+        return None
+
+
+def _configured_seller_public_key_b64() -> tuple[str, str] | None:
+    from app.ondc_crypto import load_ed25519_private_pem
+    from cryptography.hazmat.primitives import serialization as _ser
+
+    pem_path: Path | None = None
+    uk = getattr(settings, "ondc_seller_unique_key_id", None)
+    configured = getattr(settings, "ondc_seller_signing_private_key_path", None)
+    if configured:
+        candidate = Path(str(configured)).expanduser()
+        if candidate.is_file():
+            pem_path = candidate
+    if pem_path is None or not uk:
+        try:
+            from app.ondc_onboard_routes import _role_paths
+
+            paths = _role_paths("seller")
+        except Exception:  # noqa: BLE001
+            paths = None
+        if paths is not None:
+            if pem_path is None and paths["signing_pem"].is_file():
+                pem_path = paths["signing_pem"]
+            if not uk and paths["uk_id"].is_file():
+                uk = paths["uk_id"].read_text(encoding="utf-8").strip()
+    if pem_path is None or not pem_path.is_file() or not uk:
+        return None
+    public = load_ed25519_private_pem(pem_path.read_bytes()).public_key()
+    public_b64 = base64.b64encode(
+        public.public_bytes(encoding=_ser.Encoding.Raw, format=_ser.PublicFormat.Raw)
+    ).decode("ascii")
+    return str(uk).strip(), public_b64
+
+
+async def _verify_retail_igm_callback(
+    request: Request,
+    body: dict[str, Any],
+    *,
+    action: str,
+) -> tuple[bool, str]:
+    context = body.get("context") or {}
+    if context.get("domain") != DEFAULT_DOMAIN:
+        return False, "IGM callback domain must be ONDC:RET10"
+    if context.get("action") != action:
+        return False, "IGM callback action does not match the callback route"
+    version = str(context.get("core_version") or "")
+    if version != CORE_VERSION:
+        return False, f"unsupported Retail IGM core_version: {version or 'missing'}"
+    bpp_id = str(context.get("bpp_id") or "").strip()
+    authorization = (request.headers.get("Authorization") or "").strip()
+    if not authorization:
+        return False, "missing ONDC Authorization header"
+
+    local = _configured_seller_public_key_b64()
+    configured_bpp = (
+        getattr(settings, "ondc_bpp_id", None)
+        or getattr(settings, "ondc_seller_subscriber_id", None)
+        or "ondcseller.aadharcha.in"
+    )
+    if local and bpp_id == configured_bpp:
+        unique_key_id, public_key = local
+        if verify_authorization_header(
+            body,
+            authorization,
+            signing_public_key_b64=public_key,
+            expected_subscriber_id=bpp_id,
+            expected_unique_key_id=unique_key_id,
+        ):
+            return True, ""
+
+    query = {
+        "subscriber_id": bpp_id,
+        "domain": DEFAULT_DOMAIN,
+        "type": "BPP",
+        "country": "IND",
+    }
+    try:
+        status, response, _ = await _signed_post(_registry_url(), query, role="buyer")
+    except Exception:  # noqa: BLE001
+        return False, "Retail IGM registry verification unavailable"
+    if status >= 400 or not isinstance(response, list):
+        return False, "Retail IGM BPP registry lookup failed"
+    for record in response:
+        if (
+            record.get("subscriber_id") != bpp_id
+            or record.get("domain") != DEFAULT_DOMAIN
+            or record.get("type") != "BPP"
+            or record.get("status") != "SUBSCRIBED"
+        ):
+            continue
+        unique_key_id = str(record.get("ukId") or "").strip()
+        public_key = str(record.get("signing_public_key") or "").strip()
+        if (
+            unique_key_id
+            and public_key
+            and verify_authorization_header(
+                body,
+                authorization,
+                signing_public_key_b64=public_key,
+                expected_subscriber_id=bpp_id,
+                expected_unique_key_id=unique_key_id,
+            )
+        ):
+            return True, ""
+    return False, "Retail IGM callback signature did not match the registry"
+
+
+async def _dispatch_igm_action(
+    request: Request,
+    action: str,
+    body: IgmIssueBody,
+) -> JSONResponse:
+    """Signed Retail IGM issue / issue_status → bpp_uri/{action}; persist outbox."""
+    if action not in _IGM_ACTIONS:
+        raise HTTPException(status_code=400, detail=f"unsupported IGM action: {action}")
+    if not _ondc_configured("buyer"):
+        raise HTTPException(status_code=503, detail="ONDC adapter not ready.")
+    domain = body.domain or DEFAULT_DOMAIN
+    if domain != DEFAULT_DOMAIN:
+        raise HTTPException(
+            status_code=422,
+            detail="A2 IGM scope is Retail B2C v1.2 (ONDC:RET10) only",
+        )
+    issue_type = str(body.issue_type or "ISSUE").strip().upper()
+    if issue_type not in {"ISSUE", "GRIEVANCE"}:
+        raise HTTPException(status_code=422, detail="issue_type must be ISSUE or GRIEVANCE")
+    local = await _load_local_issue(request, body.issue_id)
+    message_id = body.message_id or str(uuid.uuid4())
+    transaction_id = body.transaction_id or str(uuid.uuid4())
+    bpp_id, bpp_uri = await _resolve_bpp_target(
+        request,
+        OrderActionBody(
+            bpp_id=body.bpp_id,
+            bpp_uri=body.bpp_uri,
+            transaction_id=transaction_id,
+        ),
+        transaction_id=transaction_id,
+    )
+    timestamp = _iso_now()
+    if action == "issue_status":
+        message: dict[str, Any] = {"issue_id": str(local["issue_id"])}
+    else:
+        message = {
+            "issue": {
+                "id": str(local["issue_id"]),
+                "category": _igm_category(str(local.get("reason") or ""), body.category),
+                "complainant_id": str(
+                    local.get("principal_id")
+                    or (await _order_buyer_id(request, str(local.get("order_id") or "")))
+                    or ""
+                ),
+                "order_details": {"id": str(local.get("order_id") or "")},
+                "description": {
+                    "short_desc": str(local.get("reason") or "buyer_support"),
+                    "long_desc": str(local.get("description") or ""),
+                },
+                "source": {
+                    "network_participant_id": _subscriber_id() or "",
+                    "type": "CONSUMER",
+                },
+                "status": "OPEN",
+                "issue_type": issue_type,
+                "created_at": str(local.get("created_at") or timestamp),
+                "updated_at": timestamp,
+            }
+        }
+    bap_id = getattr(settings, "ondc_bap_id", None) or _subscriber_id()
+    envelope = {
+        "context": {
+            "domain": DEFAULT_DOMAIN,
+            "action": action,
+            "country": "IND",
+            "city": body.city or DEFAULT_CITY,
+            "core_version": CORE_VERSION,
+            "bap_id": bap_id,
+            "bap_uri": _bap_uri(),
+            "bpp_id": bpp_id,
+            "bpp_uri": bpp_uri,
+            "transaction_id": transaction_id,
+            "message_id": message_id,
+            "timestamp": timestamp,
+            "ttl": "PT30S",
+        },
+        "message": message,
+    }
+    entry = {
+        "id": f"out_{uuid.uuid4().hex[:12]}",
+        "action": action,
+        "payload": envelope,
+        "created_at": int(time.time()),
+        "status": "queued",
+        "message_id": message_id,
+        "transaction_id": transaction_id,
+        "bpp_id": bpp_id,
+        "bpp_uri": bpp_uri,
+    }
+    target = f"{bpp_uri}/{action}"
+    staged = await _stage_outbox_before_dispatch(request, entry, destination=target)
+    if staged.get("already_delivered"):
+        return JSONResponse(
+            {
+                "success": True,
+                "data": {
+                    "queued": False,
+                    "dispatched": False,
+                    "deduplicated": True,
+                    "outbox_id": staged["public_id"],
+                    "message_id": message_id,
+                    "transaction_id": transaction_id,
+                    "bpp_id": bpp_id,
+                    "bpp_uri": bpp_uri,
+                    "target": target,
+                    "issue_id": str(local["issue_id"]),
+                },
+            }
+        )
+    try:
+        status, data, _ = await _signed_post(target, envelope, role="buyer")
+    except HTTPException:
+        await _complete_outbox_delivery(
+            staged,
+            delivered=False,
+            error="signing/config",
+            file_updates={"status": "error", "error": "signing/config"},
+        )
+        await _record_igm_correlation(
+            envelope,
+            signature_verified=False,
+            note=f"IGM {action} dispatch failed: signing/config",
+            pool=getattr(request.app.state, "persistence_pool", None),
+        )
+        raise
+    except Exception as exc:  # noqa: BLE001
+        await _complete_outbox_delivery(
+            staged,
+            delivered=False,
+            error=str(exc),
+            file_updates={"status": "error", "error": str(exc)},
+        )
+        await _record_igm_correlation(
+            envelope,
+            signature_verified=False,
+            note=f"IGM {action} dispatch failed: {exc}",
+            pool=getattr(request.app.state, "persistence_pool", None),
+        )
+        raise HTTPException(
+            status_code=502, detail=f"ONDC BPP {action} failed: {exc}"
+        ) from exc
+
+    ack = None
+    if isinstance(data, dict):
+        ack = ((data.get("message") or {}).get("ack") or {}).get("status")
+    dispatch_status = "sent" if status < 400 else "nack"
+    if ack == "NACK":
+        dispatch_status = "nack"
+    await _complete_outbox_delivery(
+        staged,
+        delivered=dispatch_status == "sent",
+        error=f"BPP returned HTTP {status} ack={ack}",
+        file_updates={
+            "status": dispatch_status,
+            "http_status": status,
+            "bpp_response": data,
+        },
+    )
+    await _record_igm_correlation(
+        envelope,
+        signature_verified=dispatch_status == "sent",
+        note=(
+            f"IGM {action} dispatched"
+            if dispatch_status == "sent"
+            else f"IGM {action} dispatch nack HTTP {status}"
+        ),
+        pool=getattr(request.app.state, "persistence_pool", None),
+    )
+    return JSONResponse(
+        {
+            "success": dispatch_status == "sent",
+            "data": {
+                "queued": False,
+                "dispatched": True,
+                "outbox_id": staged["public_id"],
+                "message_id": message_id,
+                "transaction_id": transaction_id,
+                "bpp_id": bpp_id,
+                "bpp_uri": bpp_uri,
+                "http_status": status,
+                "ack": ack,
+                "target": target,
+                "issue_id": str(local["issue_id"]),
+                "note": f"Poll GET /api/ondc/inbox?action=on_{action}&transaction_id=…",
+            },
+        }
+    )
+
+
+async def _order_buyer_id(request: Request, order_id: str) -> str | None:
+    if not order_id:
+        return None
+    pool = getattr(request.app.state, "persistence_pool", None)
+    if pool is not None:
+        try:
+            order = await CommerceV1(pool).get_order(order_id)
+        except Exception:  # noqa: BLE001
+            return None
+        return str(order.get("buyer_id") or "") or None
+    from app.commerce_demo import get_order
+
+    try:
+        return str(get_order(order_id)["order"].get("buyer_id") or "") or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@router.post("/api/ondc/issue")
+async def ondc_issue(body: IgmIssueBody, request: Request) -> JSONResponse:
+    return await _dispatch_igm_action(request, "issue", body)
+
+
+@router.post("/api/ondc/issue_status")
+async def ondc_issue_status(body: IgmIssueBody, request: Request) -> JSONResponse:
+    return await _dispatch_igm_action(request, "issue_status", body)
+
+
 @router.post("/api/ondc/logistics/init")
 async def ondc_logistics_init(
     body: LogisticsActionBody, request: Request
@@ -1430,6 +1862,15 @@ async def _reconcile_claimed_inbox(pool: Any, record: dict[str, Any]) -> dict[st
                 event_commitment=str(record["event_commitment"]),
                 update=_normalize_logistics_callback(record),
             )
+        elif record.get("action") in _IGM_CALLBACKS:
+            await _record_igm_correlation(
+                envelope,
+                signature_verified=bool(
+                    (record.get("redacted_payload") or {}).get("signature_verified")
+                ),
+                note=f"IGM {record.get('action')} reconciled",
+                pool=pool,
+            )
         delivered = True
     except Exception as exc:  # noqa: BLE001
         error = str(exc)
@@ -1536,7 +1977,25 @@ async def _ingest_callback(
         )
 
     signature_verified = False
-    if (
+    if normalized_action in _IGM_CALLBACKS:
+        signature_verified, verification_error = await _verify_retail_igm_callback(
+            request,
+            body,
+            action=normalized_action,
+        )
+        if not signature_verified:
+            return JSONResponse(
+                {
+                    "message": {"ack": {"status": "NACK"}},
+                    "error": {
+                        "type": "CORE-ERROR",
+                        "code": "30000",
+                        "message": verification_error,
+                    },
+                },
+                status_code=401,
+            )
+    elif (
         ctx.get("domain") == LOGISTICS_DOMAIN
         or ctx.get("core_version") == LOGISTICS_CORE_VERSION
     ):
@@ -1622,7 +2081,7 @@ async def _ingest_callback(
         if (
             ctx.get("domain") == LOGISTICS_DOMAIN
             and normalized_action in _LOGISTICS_LIFECYCLE_CALLBACKS
-        ):
+        ) or normalized_action in _IGM_CALLBACKS:
             background = BackgroundTask(
                 _process_inbox_record,
                 persistence_pool,
@@ -1644,6 +2103,13 @@ async def _ingest_callback(
         "signature_verified": signature_verified,
     }
     ondc_store.append_inbox(entry)
+    if normalized_action in _IGM_CALLBACKS:
+        await _record_igm_correlation(
+            body,
+            signature_verified=signature_verified,
+            note=f"IGM {normalized_action} received",
+            pool=None,
+        )
     return JSONResponse({"message": {"ack": {"status": "ACK"}}})
 
 
@@ -1665,6 +2131,8 @@ _BECKN_CALLBACK_ACTIONS = (
     "update",
     "rating",
     "support",
+    "issue",
+    "issue_status",
 )
 
 

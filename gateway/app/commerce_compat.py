@@ -6,7 +6,7 @@ durable CommerceV1 tables remain the only state owner in PostgreSQL mode.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -14,13 +14,37 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from app.commerce_v1 import CommerceV1
-from app.domain_state_machines import require_transition
+from app.domain_state_machines import TransitionError, require_transition
 from app.persistence.connection import ConnectionPool
 from app.persistence.transaction import UnitOfWork
 
 
 def _iso(value: Any) -> str:
     return value.isoformat() if isinstance(value, datetime) else str(value)
+
+
+def stamp_fulfilment_sla(
+    fulfilment: dict[str, Any],
+    *,
+    sla_hours: int | None,
+    accepted_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Stamp fulfilment SLA due time once on accept. No-op when already set or hours missing."""
+    if fulfilment.get("sla_due_at"):
+        return fulfilment
+    if sla_hours is None:
+        return fulfilment
+    hours = int(sla_hours)
+    if not 1 <= hours <= 72:
+        return fulfilment
+    stamped_at = accepted_at or datetime.now(timezone.utc)
+    if stamped_at.tzinfo is None:
+        stamped_at = stamped_at.replace(tzinfo=timezone.utc)
+    due_at = stamped_at + timedelta(hours=hours)
+    fulfilment["accepted_at"] = stamped_at.isoformat()
+    fulfilment["sla_hours"] = hours
+    fulfilment["sla_due_at"] = due_at.isoformat()
+    return fulfilment
 
 
 class CommerceCompatibilityAdapter:
@@ -84,12 +108,8 @@ class CommerceCompatibilityAdapter:
                 {
                     "receipt_id": row.get("refund_authorization_receipt_id"),
                     "outcome": row.get("refund_authorization_outcome") or "succeeded",
-                    "amount_inr": int(
-                        row.get("refund_authorization_amount_inr") or 0
-                    ),
-                    "recorded_at": _iso(
-                        row.get("refund_authorization_created_at")
-                    ),
+                    "amount_inr": int(row.get("refund_authorization_amount_inr") or 0),
+                    "recorded_at": _iso(row.get("refund_authorization_created_at")),
                 }
                 if row.get("refund_authorization_receipt_id")
                 else None
@@ -155,6 +175,14 @@ class CommerceCompatibilityAdapter:
             "description": row["description"],
             "response": row.get("response"),
             "remedy": row.get("remedy"),
+            "owner_id": row.get("owner_id"),
+            "response_due_at": _iso(row["response_due_at"])
+            if row.get("response_due_at")
+            else None,
+            "escalation_due_at": _iso(row["escalation_due_at"])
+            if row.get("escalation_due_at")
+            else None,
+            "history": row.get("history") or [],
             "outcome_receipt": row.get("outcome_receipt"),
             "created_at": _iso(row["created_at"]),
             "updated_at": _iso(row["updated_at"]),
@@ -173,6 +201,147 @@ class CommerceCompatibilityAdapter:
             "resolution": row.get("resolution"),
             "created_at": _iso(row["created_at"]),
             "updated_at": _iso(row["updated_at"]),
+        }
+
+    @staticmethod
+    def _store(row: dict[str, Any] | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "seller_id": row["seller_id"],
+            "store_name": row.get("store_name") or "",
+            "city": row.get("city") or "",
+            "state": row.get("state") or "",
+            "pin": row.get("pin") or "",
+            "serviceability_tokens": list(row.get("serviceability_tokens") or []),
+            "fulfilment_sla_hours": row.get("fulfilment_sla_hours"),
+            "return_window_days": row.get("return_window_days"),
+            "support_hours": row.get("support_hours") or "",
+            "status": row.get("status") or "draft",
+            "setup_required": row.get("status") != "ready",
+            "version": row.get("version") or 1,
+            "created_at": _iso(row["created_at"]) if row.get("created_at") else None,
+            "updated_at": _iso(row["updated_at"]) if row.get("updated_at") else None,
+        }
+
+    async def get_store(self, seller_id: str) -> dict[str, Any] | None:
+        row = await self.commerce.get_store(seller_id)
+        return self._store(row)
+
+    async def upsert_store(
+        self, seller_id: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        row = await self.commerce.upsert_store(seller_id=seller_id, body=body)
+        store = self._store(row)
+        assert store is not None
+        return {"store": store}
+
+    def _staff(self, row: dict[str, Any] | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        from app.commerce_v1 import staff_permissions_for
+
+        role = str(row.get("role") or "viewer")
+        return {
+            "staff_id": row.get("staff_id"),
+            "seller_id": row.get("seller_id"),
+            "member_principal_id": row.get("member_principal_id"),
+            "display_name": row.get("display_name") or "",
+            "email": row.get("email") or "",
+            "role": role,
+            "status": row.get("status") or "invited",
+            "version": row.get("version") or 1,
+            "permissions": sorted(staff_permissions_for(role)),
+            "created_at": _iso(row["created_at"]) if row.get("created_at") else None,
+            "updated_at": _iso(row["updated_at"]) if row.get("updated_at") else None,
+        }
+
+    async def list_staff(self, seller_id: str) -> dict[str, Any]:
+        store = await self.get_store(seller_id)
+        if store is None or store.get("status") != "ready":
+            raise ValueError("Complete store setup before managing staff.")
+        rows = await self.commerce.list_staff(seller_id)
+        members = [self._staff(row) for row in rows]
+        return {"members": members, "count": len(members)}
+
+    async def invite_staff(
+        self, seller_id: str, actor_principal_id: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        store = await self.get_store(seller_id)
+        if store is None or store.get("status") != "ready":
+            raise ValueError("Complete store setup before managing staff.")
+        if actor_principal_id != seller_id:
+            raise PermissionError("Staff permission denied.")
+        row = await self.commerce.invite_staff(
+            seller_id=seller_id, actor_principal_id=actor_principal_id, body=body
+        )
+        member = self._staff(row)
+        assert member is not None
+        return {"member": member}
+
+    async def update_staff(
+        self,
+        seller_id: str,
+        staff_id: str,
+        actor_principal_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        store = await self.get_store(seller_id)
+        if store is None or store.get("status") != "ready":
+            raise ValueError("Complete store setup before managing staff.")
+        if actor_principal_id != seller_id:
+            raise PermissionError("Staff permission denied.")
+        row = await self.commerce.update_staff(
+            seller_id=seller_id,
+            staff_id=staff_id,
+            actor_principal_id=actor_principal_id,
+            body=body,
+        )
+        member = self._staff(row)
+        assert member is not None
+        return {"member": member}
+
+    async def find_staff_membership(
+        self, member_principal_id: str
+    ) -> dict[str, Any] | None:
+        row = await self.commerce.find_staff_membership(member_principal_id)
+        return self._staff(row)
+
+    async def import_catalog(
+        self,
+        seller_id: str,
+        *,
+        csv_text: str | None = None,
+        items: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        from app.commerce_v1 import (
+            CommerceValidation,
+            evaluate_catalog_import_row,
+            parse_catalog_csv,
+        )
+
+        store = await self.get_store(seller_id)
+        if store is None or store.get("status") != "ready":
+            raise ValueError("Complete store setup before importing catalog.")
+        rows = list(items or [])
+        if csv_text is not None and str(csv_text).strip():
+            rows = parse_catalog_csv(csv_text) + rows
+        if not rows:
+            raise CommerceValidation("Catalog import requires CSV rows or item objects.")
+        imported: list[dict[str, Any]] = []
+        issues: list[dict[str, Any]] = []
+        for index, row in enumerate(rows, start=1):
+            payload, row_issues = evaluate_catalog_import_row(row, index=index)
+            issues.extend(row_issues)
+            if payload is None:
+                continue
+            created = await self.create_item({**payload, "seller_id": seller_id})
+            imported.append(created["item"])
+        return {
+            "imported": imported,
+            "issues": issues,
+            "imported_count": len(imported),
+            "issue_count": len(issues),
         }
 
     async def create_item(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -377,7 +546,7 @@ class CommerceCompatibilityAdapter:
             async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(
                     """
-                    SELECT status, version, fulfilment FROM commerce_orders
+                    SELECT status, version, fulfilment, seller_id FROM commerce_orders
                     WHERE order_id = %s FOR UPDATE
                     """,
                     (UUID(order_id),),
@@ -394,9 +563,10 @@ class CommerceCompatibilityAdapter:
                 )
                 fulfilment = dict(current.get("fulfilment") or {})
                 history = list(fulfilment.get("history") or [])
+                recorded_at = datetime.now(timezone.utc)
                 event = {
                     "status": status,
-                    "recorded_at": datetime.now().astimezone().isoformat(),
+                    "recorded_at": recorded_at.isoformat(),
                 }
                 if payload.get("tracking_id"):
                     fulfilment["tracking_id"] = str(payload["tracking_id"])
@@ -410,6 +580,25 @@ class CommerceCompatibilityAdapter:
                     logistics = dict(payload["logistics"])
                     fulfilment["logistics"] = logistics
                     event["logistics_transaction_id"] = logistics["transaction_id"]
+                if status in {"confirmed", "accepted"} and not fulfilment.get("sla_due_at"):
+                    await cursor.execute(
+                        """
+                        SELECT fulfilment_sla_hours
+                        FROM commerce_seller_stores
+                        WHERE seller_id = %s
+                        """,
+                        (str(current["seller_id"]),),
+                    )
+                    store = await cursor.fetchone()
+                    sla_hours = (store or {}).get("fulfilment_sla_hours")
+                    stamp_fulfilment_sla(
+                        fulfilment,
+                        sla_hours=int(sla_hours) if sla_hours is not None else None,
+                        accepted_at=recorded_at,
+                    )
+                    if fulfilment.get("sla_due_at"):
+                        event["sla_due_at"] = fulfilment["sla_due_at"]
+                        event["sla_hours"] = fulfilment.get("sla_hours")
                 fulfilment["status"] = status
                 fulfilment["history"] = [*history, event]
                 await cursor.execute(
@@ -446,8 +635,9 @@ class CommerceCompatibilityAdapter:
             await unit_of_work.connection.execute(
                 """
                 INSERT INTO commerce_issues (
-                    issue_id, order_id, principal_id, seller_id, reason, description
-                ) VALUES (%s, %s, %s, %s, %s, %s)
+                    issue_id, order_id, principal_id, seller_id, reason, description,
+                    history
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     issue_id,
@@ -456,6 +646,16 @@ class CommerceCompatibilityAdapter:
                     order["seller_id"],
                     str(body.get("reason") or "other"),
                     str(body.get("description") or body.get("reason") or "Issue"),
+                    Jsonb(
+                        [
+                            {
+                                "status": "open",
+                                "actor_id": order["buyer_id"],
+                                "note": "Customer issue created",
+                                "at": datetime.now(timezone.utc).isoformat(),
+                            }
+                        ]
+                    ),
                 ),
             )
         return {"issue": (await self.list_issues(order_id=order_id))["issues"][0]}
@@ -570,10 +770,31 @@ class CommerceCompatibilityAdapter:
     async def respond_issue(
         self, issue_id: str, body: dict[str, Any]
     ) -> dict[str, Any]:
+        return await self.transition_issue(
+            issue_id,
+            {
+                **body,
+                "status": body.get("status") or "acknowledged",
+                "actor_id": body.get("actor_id") or body.get("owner_id") or "seller",
+                "owner_id": body.get("owner_id") or body.get("actor_id") or "seller",
+                "response_target_minutes": body.get("response_target_minutes") or 240,
+            },
+        )
+
+    async def transition_issue(
+        self, issue_id: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
         return await self._update_issue(
             issue_id,
             response=str(body.get("response") or body.get("message") or ""),
-            status=str(body.get("status") or "acknowledged"),
+            status=str(body.get("status") or ""),
+            actor_id=str(body.get("actor_id") or ""),
+            owner_id=str(body.get("owner_id") or "") or None,
+            response_target_minutes=(
+                int(body["response_target_minutes"])
+                if body.get("response_target_minutes") is not None
+                else None
+            ),
         )
 
     async def remedy_issue(self, issue_id: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -581,6 +802,9 @@ class CommerceCompatibilityAdapter:
             issue_id,
             remedy=body,
             status=str(body.get("status") or "resolution_proposed"),
+            actor_id=str(body.get("actor_id") or "seller"),
+            owner_id=str(body.get("owner_id") or body.get("actor_id") or "seller"),
+            response_target_minutes=int(body.get("response_target_minutes") or 240),
         )
 
     async def accept_remedy(self, issue_id: str) -> dict[str, Any]:
@@ -605,14 +829,39 @@ class CommerceCompatibilityAdapter:
                     "closed",
                     current_version=accepted_version,
                 )
+                actor_id = current["principal_id"]
+                history = list(current.get("history") or [])
+                now = datetime.now(timezone.utc).isoformat()
+                history.extend(
+                    [
+                        {
+                            "status": "accepted",
+                            "actor_id": actor_id,
+                            "note": "Buyer accepted remedy",
+                            "at": now,
+                        },
+                        {
+                            "status": "closed",
+                            "actor_id": actor_id,
+                            "note": "Issue closed",
+                            "at": now,
+                        },
+                    ]
+                )
                 await cursor.execute(
                     """
                     UPDATE commerce_issues
-                    SET status = 'closed', version = %s, updated_at = NOW()
+                    SET status = 'closed', version = %s, history = %s,
+                        updated_at = NOW()
                     WHERE issue_id = %s AND version = %s
                     RETURNING *
                     """,
-                    (closed_version, UUID(issue_id), current["version"]),
+                    (
+                        closed_version,
+                        Jsonb(history),
+                        UUID(issue_id),
+                        current["version"],
+                    ),
                 )
                 row = await cursor.fetchone()
         if row is None:
@@ -800,6 +1049,9 @@ class CommerceCompatibilityAdapter:
         response: str | None = None,
         remedy: dict[str, Any] | None = None,
         status: str,
+        actor_id: str,
+        owner_id: str | None = None,
+        response_target_minutes: int | None = None,
     ) -> dict[str, Any]:
         async with UnitOfWork(self.pool) as unit_of_work:
             async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
@@ -813,8 +1065,15 @@ class CommerceCompatibilityAdapter:
                 current = await cursor.fetchone()
                 if current is None:
                     raise KeyError("issue not found")
+                if not actor_id:
+                    raise ValueError("Issue transition requires actor_id.")
                 current_status = current["status"]
                 current_version = current["version"]
+                effective_owner = owner_id or current.get("owner_id")
+                response_due_at = current.get("response_due_at")
+                escalation_due_at = current.get("escalation_due_at")
+                history = list(current.get("history") or [])
+                now = datetime.now(timezone.utc)
                 if current_status == "open" and status == "resolution_proposed":
                     current_version = require_transition(
                         "issue",
@@ -823,22 +1082,67 @@ class CommerceCompatibilityAdapter:
                         current_version=current_version,
                     )
                     current_status = "acknowledged"
+                    effective_owner = effective_owner or actor_id
+                    response_target_minutes = response_target_minutes or 240
+                    response_due_at = now + timedelta(minutes=response_target_minutes)
+                    escalation_due_at = now + timedelta(
+                        minutes=response_target_minutes * 2
+                    )
+                    history.append(
+                        {
+                            "status": "acknowledged",
+                            "actor_id": actor_id,
+                            "note": "Seller accepted ownership",
+                            "at": now.isoformat(),
+                        }
+                    )
+                if status == "acknowledged":
+                    if not effective_owner:
+                        raise ValueError("Issue acknowledgement requires owner_id.")
+                    if (
+                        response_target_minutes is None
+                        or not 1 <= response_target_minutes <= 10_080
+                    ):
+                        raise ValueError(
+                            "response_target_minutes must be between 1 and 10080."
+                        )
+                    response_due_at = now + timedelta(minutes=response_target_minutes)
+                    escalation_due_at = now + timedelta(
+                        minutes=response_target_minutes * 2
+                    )
+                elif not effective_owner:
+                    raise ValueError(
+                        "Issue escalation or rejection requires an assigned owner."
+                    )
                 next_version = require_transition(
                     "issue",
                     current_status,
                     status,
                     current_version=current_version,
                 )
+                history.append(
+                    {
+                        "status": status,
+                        "actor_id": actor_id,
+                        "note": response or str((remedy or {}).get("message") or ""),
+                        "at": now.isoformat(),
+                    }
+                )
                 await cursor.execute(
                     """
                     UPDATE commerce_issues
                     SET response = COALESCE(%s, response), remedy = COALESCE(%s, remedy),
-                        status = %s, version = %s, updated_at = NOW()
+                        owner_id = %s, response_due_at = %s, escalation_due_at = %s,
+                        history = %s, status = %s, version = %s, updated_at = NOW()
                     WHERE issue_id = %s AND version = %s RETURNING *
                     """,
                     (
                         response,
                         Jsonb(remedy) if remedy is not None else None,
+                        effective_owner,
+                        response_due_at,
+                        escalation_due_at,
+                        Jsonb(history),
                         status,
                         next_version,
                         UUID(issue_id),
@@ -850,5 +1154,92 @@ class CommerceCompatibilityAdapter:
             raise RuntimeError("stale issue transition")
         return {"issue": self._issue(row)}
 
+    async def record_igm_network_event(
+        self,
+        issue_id: str,
+        *,
+        action: str,
+        transaction_id: str,
+        message_id: str,
+        network_status: str = "",
+        note: str = "",
+        signature_verified: bool = False,
+        actor_id: str = "ondc-igm",
+    ) -> dict[str, Any]:
+        """Append a signed IGM correlation event; transition only on a legal edge."""
+        igm_targets = {
+            "PROCESSING": "acknowledged",
+            "RESOLVED": "resolution_proposed",
+            "CLOSED": "closed",
+        }
 
-__all__ = ["CommerceCompatibilityAdapter"]
+        async with UnitOfWork(self.pool) as unit_of_work:
+            async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    "SELECT * FROM commerce_issues WHERE issue_id = %s FOR UPDATE",
+                    (UUID(issue_id),),
+                )
+                current = await cursor.fetchone()
+                if current is None:
+                    raise KeyError("issue not found")
+                current_status = str(current["status"] or "open")
+                current_version = int(current["version"] or 1)
+                target = igm_targets.get(
+                    str(network_status or "").strip().upper()
+                )
+                next_status = current_status
+                next_version = current_version
+                owner_id = current.get("owner_id") or current.get("seller_id")
+                if target and target != current_status:
+                    try:
+                        next_version = require_transition(
+                            "issue",
+                            current_status,
+                            target,
+                            current_version=current_version,
+                        )
+                        next_status = target
+                    except TransitionError:
+                        next_status = current_status
+                        next_version = current_version
+                history = list(current.get("history") or [])
+                history.append(
+                    {
+                        "status": next_status,
+                        "actor_id": actor_id,
+                        "note": note or f"IGM {action}",
+                        "at": datetime.now(timezone.utc).isoformat(),
+                        "network": {
+                            "action": action,
+                            "transaction_id": transaction_id,
+                            "message_id": message_id,
+                            "network_status": (
+                                str(network_status or "").strip().upper() or None
+                            ),
+                            "signature_verified": bool(signature_verified),
+                        },
+                    }
+                )
+                await cursor.execute(
+                    """
+                    UPDATE commerce_issues
+                    SET owner_id = COALESCE(owner_id, %s),
+                        history = %s, status = %s, version = %s, updated_at = NOW()
+                    WHERE issue_id = %s AND version = %s RETURNING *
+                    """,
+                    (
+                        owner_id,
+                        Jsonb(history),
+                        next_status,
+                        next_version,
+                        UUID(issue_id),
+                        current["version"],
+                    ),
+                )
+                row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError("stale IGM issue correlation")
+        return {"issue": self._issue(row)}
+
+
+__all__ = ["CommerceCompatibilityAdapter", "stamp_fulfilment_sla"]

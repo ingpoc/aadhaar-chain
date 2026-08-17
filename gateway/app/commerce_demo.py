@@ -5,13 +5,13 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-from app.domain_state_machines import require_transition
+from app.domain_state_machines import TransitionError, require_transition
 from app.payment_adapter import payment_adapter
 from config import settings
 
@@ -28,6 +28,15 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
 
+def _issue_event(status: str, actor_id: str, note: str = "") -> dict[str, Any]:
+    return {
+        "status": status,
+        "actor_id": actor_id,
+        "note": note,
+        "at": _utcnow(),
+    }
+
+
 class CommerceState(BaseModel):
     version: int = 1
     items: dict[str, dict[str, Any]] = Field(default_factory=dict)
@@ -37,6 +46,8 @@ class CommerceState(BaseModel):
     returns: dict[str, dict[str, Any]] = Field(default_factory=dict)
     issues: dict[str, dict[str, Any]] = Field(default_factory=dict)
     remedies: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    stores: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    staff: dict[str, dict[str, Any]] = Field(default_factory=dict)
     idempotency: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
@@ -85,6 +96,225 @@ def _default_category_id(title: str) -> str:
     return "Grocery"
 
 
+def get_store(seller_id: str) -> dict[str, Any] | None:
+    store = load_state().stores.get(seller_id)
+    if store is None:
+        return None
+    return {**store, "setup_required": store.get("status") != "ready"}
+
+
+def upsert_store(seller_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    from app.commerce_v1 import normalize_store_payload
+
+    payload = normalize_store_payload(seller_id, body)
+    state = load_state()
+    current = state.stores.get(seller_id) or {}
+    payload["version"] = int(current.get("version") or 0) + 1
+    payload["created_at"] = current.get("created_at") or _utcnow()
+    payload["updated_at"] = _utcnow()
+    payload["setup_required"] = payload["status"] != "ready"
+    state.stores[seller_id] = payload
+    save_state(state)
+    return {"store": payload}
+
+
+def require_ready_store(
+    seller_id: str, *, purpose: str = "publishing catalog"
+) -> dict[str, Any]:
+    store = get_store(seller_id)
+    if not store or store.get("status") != "ready":
+        raise ValueError(f"Complete store setup before {purpose}.")
+    return store
+
+
+def _annotate_staff_member(row: dict[str, Any]) -> dict[str, Any]:
+    from app.commerce_v1 import staff_permissions_for
+
+    role = str(row.get("role") or "viewer")
+    return {**row, "permissions": sorted(staff_permissions_for(role))}
+
+
+def _ensure_owner_staff(state: CommerceState, seller_id: str) -> dict[str, Any]:
+    from app.commerce_v1 import owner_staff_row
+
+    for row in state.staff.values():
+        if row.get("seller_id") == seller_id and row.get("role") == "owner":
+            return _annotate_staff_member(row)
+    owner = owner_staff_row(seller_id)
+    owner["created_at"] = _utcnow()
+    owner["updated_at"] = owner["created_at"]
+    state.staff[owner["staff_id"]] = {
+        key: value for key, value in owner.items() if key != "permissions"
+    }
+    return owner
+
+
+def list_staff(seller_id: str) -> dict[str, Any]:
+    require_ready_store(seller_id, purpose="managing staff")
+    state = load_state()
+    owner = _ensure_owner_staff(state, seller_id)
+    save_state(state)
+    members = [
+        _annotate_staff_member(row)
+        for row in state.staff.values()
+        if row.get("seller_id") == seller_id
+    ]
+    members.sort(
+        key=lambda row: (
+            {"owner": 0, "manager": 1, "fulfilment": 2, "support": 3}.get(
+                str(row.get("role")), 4
+            ),
+            str(row.get("created_at") or ""),
+        )
+    )
+    return {"members": members, "count": len(members), "owner_staff_id": owner["staff_id"]}
+
+
+def invite_staff(seller_id: str, actor_principal_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    from app.commerce_v1 import normalize_staff_payload
+
+    require_ready_store(seller_id, purpose="managing staff")
+    if actor_principal_id != seller_id:
+        raise PermissionError("Staff permission denied.")
+    payload = normalize_staff_payload(
+        seller_id, body, actor_principal_id=actor_principal_id
+    )
+    state = load_state()
+    _ensure_owner_staff(state, seller_id)
+    existing = next(
+        (
+            row
+            for row in state.staff.values()
+            if row.get("seller_id") == seller_id
+            and row.get("member_principal_id") == payload["member_principal_id"]
+        ),
+        None,
+    )
+    now = _utcnow()
+    if existing is None:
+        staff_id = _new_id("staff")
+        row = {
+            "staff_id": staff_id,
+            "seller_id": seller_id,
+            "member_principal_id": payload["member_principal_id"],
+            "display_name": payload["display_name"],
+            "email": payload["email"],
+            "role": payload["role"],
+            "status": payload["status"],
+            "version": 1,
+            "created_at": now,
+            "updated_at": now,
+        }
+    else:
+        if existing.get("role") == "owner":
+            from app.commerce_v1 import CommerceValidation
+
+            raise CommerceValidation("Cannot modify the store owner row")
+        row = {
+            **existing,
+            "display_name": payload["display_name"],
+            "email": payload["email"],
+            "role": payload["role"],
+            "status": payload["status"],
+            "version": int(existing.get("version") or 0) + 1,
+            "updated_at": now,
+        }
+        staff_id = row["staff_id"]
+    state.staff[staff_id] = row
+    save_state(state)
+    return {"member": _annotate_staff_member(row)}
+
+
+def update_staff(
+    seller_id: str, staff_id: str, actor_principal_id: str, body: dict[str, Any]
+) -> dict[str, Any]:
+    from app.commerce_v1 import CommerceValidation, normalize_staff_payload
+
+    require_ready_store(seller_id, purpose="managing staff")
+    if actor_principal_id != seller_id:
+        raise PermissionError("Staff permission denied.")
+    state = load_state()
+    _ensure_owner_staff(state, seller_id)
+    current = state.staff.get(staff_id)
+    if current is None or current.get("seller_id") != seller_id:
+        raise KeyError("Staff member not found")
+    if current.get("role") == "owner":
+        raise CommerceValidation("Cannot modify the store owner row")
+    merged = {
+        "member_principal_id": current["member_principal_id"],
+        "display_name": body.get("display_name", current.get("display_name")),
+        "email": body.get("email", current.get("email")),
+        "role": body.get("role", current.get("role")),
+        "status": body.get("status", current.get("status")),
+    }
+    payload = normalize_staff_payload(
+        seller_id, merged, actor_principal_id=actor_principal_id
+    )
+    row = {
+        **current,
+        "display_name": payload["display_name"],
+        "email": payload["email"],
+        "role": payload["role"],
+        "status": payload["status"],
+        "version": int(current.get("version") or 0) + 1,
+        "updated_at": _utcnow(),
+    }
+    state.staff[staff_id] = row
+    save_state(state)
+    return {"member": _annotate_staff_member(row)}
+
+
+def find_staff_membership(member_principal_id: str) -> dict[str, Any] | None:
+    state = load_state()
+    matches = [
+        row
+        for row in state.staff.values()
+        if row.get("member_principal_id") == member_principal_id
+        and row.get("status") in {"active", "invited"}
+        and row.get("role") != "owner"
+    ]
+    if not matches:
+        return None
+    matches.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
+    return _annotate_staff_member(matches[0])
+
+
+def import_catalog(
+    seller_id: str,
+    *,
+    csv_text: str | None = None,
+    items: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    from app.commerce_v1 import (
+        evaluate_catalog_import_row,
+        parse_catalog_csv,
+    )
+
+    require_ready_store(seller_id)
+    rows = list(items or [])
+    if csv_text is not None and str(csv_text).strip():
+        rows = parse_catalog_csv(csv_text) + rows
+    if not rows:
+        from app.commerce_v1 import CommerceValidation
+
+        raise CommerceValidation("Catalog import requires CSV rows or item objects.")
+    imported: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+    for index, row in enumerate(rows, start=1):
+        payload, row_issues = evaluate_catalog_import_row(row, index=index)
+        issues.extend(row_issues)
+        if payload is None:
+            continue
+        created = create_item({**payload, "seller_id": seller_id})
+        imported.append(created["item"])
+    return {
+        "imported": imported,
+        "issues": issues,
+        "imported_count": len(imported),
+        "issue_count": len(issues),
+    }
+
+
 def create_item(
     payload: dict[str, Any], *, idempotency_key: Optional[str] = None
 ) -> dict[str, Any]:
@@ -93,7 +323,10 @@ def create_item(
     if idem and idem in state.idempotency:
         return state.idempotency[idem]
 
-    item_id = _new_id("item")
+    requested_id = str(payload.get("item_id") or "").strip()
+    item_id = requested_id or _new_id("item")
+    if requested_id and requested_id in state.items:
+        raise ValueError(f"Item already exists: {item_id}")
     quantity = int(payload.get("inventory") or payload.get("quantity") or 0)
     title = str(payload.get("title") or payload.get("name") or "Catalog item")
     item = {
@@ -643,9 +876,10 @@ def transition_order(
         current_version=int(order.get("version") or 1),
     )
     fulfilment = dict(order.get("fulfilment") or {})
+    history = list(fulfilment.get("history") or [])
+    recorded_at = _utcnow()
+    event = {"status": status, "recorded_at": recorded_at}
     if payload:
-        history = list(fulfilment.get("history") or [])
-        event = {"status": status, "recorded_at": _utcnow()}
         if payload.get("tracking_id"):
             fulfilment["tracking_id"] = str(payload["tracking_id"])
             event["tracking_id"] = str(payload["tracking_id"])
@@ -654,14 +888,29 @@ def transition_order(
         if payload.get("status_message"):
             fulfilment["status_message"] = str(payload["status_message"])
             event["status_message"] = str(payload["status_message"])
-        fulfilment["status"] = status
-        fulfilment["history"] = [*history, event]
+    if status in {"confirmed", "accepted"} and not fulfilment.get("sla_due_at"):
+        from app.commerce_compat import stamp_fulfilment_sla
+
+        store = get_store(str(order.get("seller_id") or ""))
+        sla_hours = (store or {}).get("fulfilment_sla_hours")
+        stamp_fulfilment_sla(
+            fulfilment,
+            sla_hours=int(sla_hours) if sla_hours is not None else None,
+            accepted_at=datetime.fromisoformat(recorded_at.replace("Z", "+00:00"))
+            if isinstance(recorded_at, str)
+            else None,
+        )
+        if fulfilment.get("sla_due_at"):
+            event["sla_due_at"] = fulfilment["sla_due_at"]
+            event["sla_hours"] = fulfilment.get("sla_hours")
+    fulfilment["status"] = status
+    fulfilment["history"] = [*history, event]
     updated = {
         **order,
         "status": status,
         "version": next_version,
         "fulfilment": fulfilment,
-        "updated_at": _utcnow(),
+        "updated_at": recorded_at,
     }
     state.orders[order_id] = updated
     response = {"order": updated, "message_id": _new_id("msg")}
@@ -730,7 +979,8 @@ def create_issue(
     idem = _idempotency_key(f"buyer.issues.create.{order_id}", idempotency_key)
     if idem and idem in state.idempotency:
         return state.idempotency[idem]
-    if order_id not in state.orders:
+    order = state.orders.get(order_id)
+    if not order:
         raise KeyError(f"Unknown order: {order_id}")
     issue_id = _new_id("issue")
     issue = {
@@ -740,6 +990,16 @@ def create_issue(
         "version": 1,
         "reason": payload.get("reason") or "buyer_support",
         "description": payload.get("description") or "",
+        "owner_id": None,
+        "response_due_at": None,
+        "escalation_due_at": None,
+        "history": [
+            _issue_event(
+                "open",
+                str(order.get("buyer_id") or "buyer"),
+                "Customer issue created",
+            )
+        ],
         "created_at": _utcnow(),
         "updated_at": _utcnow(),
     }
@@ -769,22 +1029,136 @@ def respond_issue(issue_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     issue = state.issues.get(issue_id)
     if not issue:
         raise KeyError(f"Unknown issue: {issue_id}")
+    order = state.orders.get(str(issue.get("order_id"))) or {}
+    return transition_issue(
+        issue_id,
+        {
+            **payload,
+            "status": "acknowledged",
+            "actor_id": payload.get("actor_id") or order.get("seller_id") or "seller",
+            "owner_id": payload.get("owner_id") or order.get("seller_id") or "seller",
+            "response_target_minutes": payload.get("response_target_minutes") or 240,
+        },
+    )
+
+
+def transition_issue(issue_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    state = load_state()
+    issue = state.issues.get(issue_id)
+    if not issue:
+        raise KeyError(f"Unknown issue: {issue_id}")
+    target = str(payload.get("status") or "").strip()
+    if target not in {"acknowledged", "escalated", "rejected"}:
+        raise ValueError(f"Unsupported issue status: {target or 'missing'}")
+    actor_id = str(payload.get("actor_id") or "").strip()
+    if not actor_id:
+        raise ValueError("Issue transition requires actor_id.")
+    owner_id = str(payload.get("owner_id") or issue.get("owner_id") or "").strip()
+    now = datetime.now(timezone.utc)
+    response_due_at = issue.get("response_due_at")
+    escalation_due_at = issue.get("escalation_due_at")
+    if target == "acknowledged":
+        if not owner_id:
+            raise ValueError("Issue acknowledgement requires owner_id.")
+        response_minutes = int(payload.get("response_target_minutes") or 0)
+        if not 1 <= response_minutes <= 10_080:
+            raise ValueError("response_target_minutes must be between 1 and 10080.")
+        response_due_at = (now + timedelta(minutes=response_minutes)).isoformat()
+        escalation_due_at = (now + timedelta(minutes=response_minutes * 2)).isoformat()
+    elif not owner_id:
+        raise ValueError("Issue escalation or rejection requires an assigned owner.")
     next_version = require_transition(
         "issue",
         issue["status"],
-        "acknowledged",
+        target,
         current_version=int(issue.get("version") or 1),
     )
     updated = {
         **issue,
-        "status": "acknowledged",
+        "status": target,
         "version": next_version,
-        "response": payload.get("response") or payload.get("message") or "",
-        "updated_at": _utcnow(),
+        "owner_id": owner_id,
+        "response_due_at": response_due_at,
+        "escalation_due_at": escalation_due_at,
+        "response": payload.get("response")
+        or payload.get("message")
+        or issue.get("response")
+        or "",
+        "history": [
+            *list(issue.get("history") or []),
+            _issue_event(
+                target,
+                actor_id,
+                str(payload.get("message") or payload.get("response") or ""),
+            ),
+        ],
+        "updated_at": now.isoformat(),
     }
     state.issues[issue_id] = updated
     save_state(state)
     return {"issue": updated, "message_id": _new_id("msg")}
+
+
+_IGM_NETWORK_TARGETS = {
+    "PROCESSING": "acknowledged",
+    "RESOLVED": "resolution_proposed",
+    "CLOSED": "closed",
+}
+
+
+def record_igm_network_event(
+    issue_id: str,
+    *,
+    action: str,
+    transaction_id: str,
+    message_id: str,
+    network_status: str = "",
+    note: str = "",
+    signature_verified: bool = False,
+    actor_id: str = "ondc-igm",
+) -> dict[str, Any]:
+    """Append a signed IGM correlation event; transition only on a legal edge."""
+    state = load_state()
+    issue = state.issues.get(issue_id)
+    if not issue:
+        raise KeyError(f"Unknown issue: {issue_id}")
+    order = state.orders.get(str(issue.get("order_id"))) or {}
+    current = str(issue.get("status") or "open")
+    target = _IGM_NETWORK_TARGETS.get(str(network_status or "").strip().upper())
+    next_status = current
+    next_version = int(issue.get("version") or 1)
+    owner_id = str(issue.get("owner_id") or order.get("seller_id") or "").strip() or None
+    if target and target != current:
+        try:
+            kwargs: dict[str, Any] = {
+                "current_version": next_version,
+            }
+            next_version = require_transition("issue", current, target, **kwargs)
+            next_status = target
+            if target == "acknowledged" and owner_id:
+                issue = {**issue, "owner_id": owner_id}
+        except TransitionError:
+            next_status = current
+    event = _issue_event(next_status, actor_id, note or f"IGM {action}")
+    event["network"] = {
+        "action": action,
+        "transaction_id": transaction_id,
+        "message_id": message_id,
+        "network_status": str(network_status or "").strip().upper() or None,
+        "signature_verified": bool(signature_verified),
+    }
+    updated = {
+        **issue,
+        "status": next_status,
+        "version": next_version,
+        "owner_id": issue.get("owner_id") or owner_id,
+        "igm_transaction_id": transaction_id,
+        "history": [*list(issue.get("history") or []), event],
+        "updated_at": _utcnow(),
+    }
+    state.issues[issue_id] = updated
+    save_state(state)
+    return {"issue": updated}
 
 
 def propose_remedy(
@@ -797,6 +1171,12 @@ def propose_remedy(
     issue = state.issues.get(issue_id)
     if not issue:
         raise KeyError(f"Unknown issue: {issue_id}")
+    order = state.orders.get(str(issue.get("order_id"))) or {}
+    actor_id = str(payload.get("actor_id") or order.get("seller_id") or "seller")
+    history = list(issue.get("history") or [])
+    owner_id = str(issue.get("owner_id") or actor_id)
+    response_due_at = issue.get("response_due_at")
+    escalation_due_at = issue.get("escalation_due_at")
     current_status = issue["status"]
     current_version = int(issue.get("version") or 1)
     if current_status == "open":
@@ -807,6 +1187,13 @@ def propose_remedy(
             current_version=current_version,
         )
         current_status = "acknowledged"
+        now = datetime.now(timezone.utc)
+        response_minutes = int(payload.get("response_target_minutes") or 240)
+        response_due_at = (now + timedelta(minutes=response_minutes)).isoformat()
+        escalation_due_at = (now + timedelta(minutes=response_minutes * 2)).isoformat()
+        history.append(
+            _issue_event("acknowledged", actor_id, "Seller accepted ownership")
+        )
     next_version = require_transition(
         "issue",
         current_status,
@@ -821,6 +1208,7 @@ def propose_remedy(
         "status": "promised",
         "type": payload.get("type") or "refund",
         "amount_inr": int(payload.get("amount_inr") or 0),
+        "message": str(payload.get("message") or ""),
         "created_at": _utcnow(),
     }
     state.remedies[remedy_id] = remedy
@@ -828,7 +1216,19 @@ def propose_remedy(
         **issue,
         "status": "resolution_proposed",
         "version": next_version,
+        "owner_id": owner_id,
+        "response_due_at": response_due_at,
+        "escalation_due_at": escalation_due_at,
         "remedy_id": remedy_id,
+        "remedy": remedy,
+        "history": [
+            *history,
+            _issue_event(
+                "resolution_proposed",
+                actor_id,
+                str(payload.get("message") or payload.get("type") or "Remedy proposed"),
+            ),
+        ],
         "updated_at": _utcnow(),
     }
     response = {"remedy": remedy, "message_id": _new_id("msg")}
@@ -855,6 +1255,8 @@ def accept_remedy(
     issue = state.issues.get(issue_id)
     if not issue:
         raise KeyError(f"Unknown issue: {issue_id}")
+    order = state.orders.get(str(issue.get("order_id"))) or {}
+    actor_id = str(order.get("buyer_id") or "buyer")
     accepted_version = require_transition(
         "issue",
         issue["status"],
@@ -873,6 +1275,11 @@ def accept_remedy(
         **issue,
         "status": "closed",
         "version": closed_version,
+        "history": [
+            *list(issue.get("history") or []),
+            _issue_event("accepted", actor_id, "Buyer accepted remedy"),
+            _issue_event("closed", actor_id, "Issue closed"),
+        ],
         "updated_at": _utcnow(),
     }
     response = {
@@ -918,6 +1325,19 @@ def _require_issue_seller(issue_id: str, principal_id: str) -> dict[str, Any]:
     return issue
 
 
+def _require_issue_buyer(issue_id: str, principal_id: str) -> dict[str, Any]:
+    state = load_state()
+    issue = state.issues.get(issue_id)
+    if not issue:
+        raise KeyError(f"Unknown issue: {issue_id}")
+    order = state.orders.get(str(issue.get("order_id") or ""))
+    if not order:
+        raise KeyError(f"Unknown order: {issue.get('order_id')}")
+    if order.get("buyer_id") != principal_id:
+        raise PermissionError("Issue belongs to another principal.")
+    return issue
+
+
 def _require_remedy_buyer(remedy_id: str, principal_id: str) -> dict[str, Any]:
     state = load_state()
     remedy = state.remedies.get(remedy_id)
@@ -952,6 +1372,7 @@ def publish_item_from_payload(
     resource_id: str,
     idempotency_key: str,
 ) -> dict[str, Any]:
+    require_ready_store(principal_id)
     item_id = payload.get("item_id")
     effective_payload = {**payload, "seller_id": principal_id}
     if not item_id:
@@ -1070,6 +1491,41 @@ def remedy_from_payload(
     issue_id = _require_bound_resource(payload, "issue_id", resource_id)
     _require_issue_seller(issue_id, principal_id)
     return propose_remedy(issue_id, payload, idempotency_key=idempotency_key)
+
+
+def transition_issue_from_payload(
+    action: str,
+    payload: dict[str, Any],
+    *,
+    principal_id: str,
+    resource_id: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    issue_id = _require_bound_resource(payload, "issue_id", resource_id)
+    if action.startswith("seller."):
+        _require_issue_seller(issue_id, principal_id)
+    else:
+        _require_issue_buyer(issue_id, principal_id)
+    target = {
+        "seller.issue.acknowledge": "acknowledged",
+        "seller.issue.escalate": "escalated",
+        "buyer.remedy.reject": "rejected",
+        "buyer.issue.escalate": "escalated",
+    }.get(action)
+    if target is None:
+        raise ValueError("Unsupported protected issue transition.")
+    state = load_state()
+    idem = _idempotency_key(f"{action}.{issue_id}", idempotency_key)
+    if idem and idem in state.idempotency:
+        return state.idempotency[idem]
+    result = transition_issue(
+        issue_id,
+        {**payload, "status": target, "actor_id": principal_id},
+    )
+    state = load_state()
+    _remember(state, idem, result)
+    save_state(state)
+    return result
 
 
 def refund_from_payload(
