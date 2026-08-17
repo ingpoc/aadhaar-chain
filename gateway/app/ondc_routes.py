@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import time
 import uuid
 from copy import deepcopy
@@ -39,6 +40,8 @@ from app.persistence.ondc_repository import (
 from app.persistence.transaction import UnitOfWork
 from config import settings
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(tags=["ondc"])
 
 PREPROD_GATEWAY = "https://preprod.gateway.ondc.org/search"
@@ -58,7 +61,20 @@ _LOGISTICS_LIFECYCLE_CALLBACKS = {
 _IGM_ACTIONS = frozenset({"issue", "issue_status"})
 _IGM_CALLBACKS = frozenset({"on_issue", "on_issue_status"})
 _RETAIL_SIGNED_CALLBACKS = _IGM_CALLBACKS | frozenset({"on_track"})
-_PAIRED_CONFIRM_CALLBACK = "on_confirm"
+# Workbench mock BPP mints a new callback message_id. Correlate by transaction
+# outbox, ACK, persist the callback message_id, and log the mismatch. Our BPP
+# still echoes the request message_id on outbound on_confirm / on_issue.
+_INBOUND_CALLBACK_REQUESTS = {
+    "on_select": ("select",),
+    "on_init": ("init",),
+    "on_confirm": ("confirm",),
+    "on_status": ("status", "confirm"),
+    "on_track": ("track",),
+    "on_update": ("update",),
+    "on_cancel": ("cancel",),
+    "on_issue": ("issue",),
+    "on_issue_status": ("issue_status", "issue"),
+}
 _IGM_REASON_CATEGORY = {
     "fulfillment": "FULFILLMENT",
     "fulfilment": "FULFILLMENT",
@@ -1996,28 +2012,29 @@ async def ondc_orders(
     )
 
 
-async def _confirm_message_id(
-    request: Request, transaction_id: str
+async def _lifecycle_outbox_message_id(
+    request: Request, transaction_id: str, actions: tuple[str, ...]
 ) -> str | None:
-    records = await _persistent_records(
-        request,
-        "outbox",
-        transaction_id=transaction_id,
-        action="confirm",
-        limit=100,
-    )
-    if records is not None:
-        for record in records:
-            if record.get("action") == "confirm" and record.get("message_id"):
-                return str(record["message_id"])
-        return None
-    for item in ondc_store.list_outbox(limit=500):
-        if (
-            item.get("action") == "confirm"
-            and item.get("transaction_id") == transaction_id
-            and item.get("message_id")
-        ):
-            return str(item["message_id"])
+    for action in actions:
+        records = await _persistent_records(
+            request,
+            "outbox",
+            transaction_id=transaction_id,
+            action=action,
+            limit=100,
+        )
+        if records is not None:
+            for record in records:
+                if record.get("action") == action and record.get("message_id"):
+                    return str(record["message_id"])
+            continue
+        for item in ondc_store.list_outbox(limit=500):
+            if (
+                item.get("action") == action
+                and item.get("transaction_id") == transaction_id
+                and item.get("message_id")
+            ):
+                return str(item["message_id"])
     return None
 
 
@@ -2045,22 +2062,19 @@ async def _ingest_callback(
             status_code=400,
         )
 
-    if normalized_action == _PAIRED_CONFIRM_CALLBACK:
-        expected = await _confirm_message_id(request, transaction_id)
+    request_actions = _INBOUND_CALLBACK_REQUESTS.get(normalized_action)
+    if request_actions:
+        expected = await _lifecycle_outbox_message_id(
+            request, transaction_id, request_actions
+        )
         if expected and expected != message_id:
-            return JSONResponse(
-                {
-                    "message": {"ack": {"status": "NACK"}},
-                    "error": {
-                        "type": "CORE-ERROR",
-                        "code": "30000",
-                        "message": (
-                            "message_id mismatch between confirm and on_confirm "
-                            f"expected {expected} but found {message_id}"
-                        ),
-                    },
-                },
-                status_code=409,
+            logger.warning(
+                "BAP %s message_id mismatch transaction_id=%s expected=%s "
+                "found=%s; ACK and persist callback",
+                normalized_action,
+                transaction_id,
+                expected,
+                message_id,
             )
 
     signature_verified = False

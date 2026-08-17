@@ -194,7 +194,7 @@ def test_on_track_verifies_signature_like_issue(
     assert tampered.json()["message"]["ack"]["status"] == "NACK"
 
 
-def test_on_confirm_requires_confirm_message_id(
+def test_on_confirm_acks_workbench_new_message_id(
     tmp_path: Path, ed25519_pem: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _enable_retail(tmp_path, ed25519_pem, monkeypatch)
@@ -208,6 +208,7 @@ def test_on_confirm_requires_confirm_message_id(
     mock_client.post = AsyncMock(return_value=mock_resp)
 
     from main import app
+    from app import ondc_store
 
     app.state.persistence_pool = None
     with patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client):
@@ -240,11 +241,27 @@ def test_on_confirm_requires_confirm_message_id(
             message_id="b4905f64-3064-49f9-8465-95f024d47a76",
             message={"order": {"id": "B5d77ff31", "state": "Accepted"}},
         )
-        nack = client.post("/ondc/on_confirm", json=mismatched)
-        assert nack.status_code == 409
-        assert nack.json()["message"]["ack"]["status"] == "NACK"
-        assert "72b2829c-25b8-49ff-8edf-6cc9bfd334b0" in nack.json()["error"]["message"]
-        assert "b4905f64-3064-49f9-8465-95f024d47a76" in nack.json()["error"]["message"]
+        workbench = client.post("/ondc/on_confirm", json=mismatched)
+        assert workbench.status_code == 200, workbench.text
+        assert workbench.json()["message"]["ack"]["status"] == "ACK"
+
+        status_mismatch = _retail_envelope(
+            action="on_status",
+            transaction_id="txn-confirm-corr",
+            message_id="54816c38-e7c5-446b-a6e6-503d19a662a1",
+            message={"order": {"id": "B5d77ff31", "state": "In-progress"}},
+        )
+        status_ack = client.post("/ondc/on_status", json=status_mismatch)
+        assert status_ack.status_code == 200, status_ack.text
+        assert status_ack.json()["message"]["ack"]["status"] == "ACK"
+
+    inbox = ondc_store.callbacks_for_transaction(
+        "txn-confirm-corr", action="on_confirm"
+    )
+    assert any(
+        item.get("message_id") == "b4905f64-3064-49f9-8465-95f024d47a76"
+        for item in inbox
+    )
 
 
 def test_on_status_accepts_camelcase_and_authorization_subscriber(
