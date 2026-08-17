@@ -183,6 +183,13 @@ def test_bpp_select_init_confirm_ack_and_callback(tmp_path: Path, seller_keys: P
     assert callback_orders["on_init"]["payment"]["status"] == "NOT-PAID"
     assert callback_orders["on_confirm"]["payment"]["status"] == "PAID"
     assert callback_orders["on_confirm"]["state"] == "Accepted"
+    callback_ids = {}
+    for call in mock_client.post.await_args_list:
+        payload = json.loads(call.kwargs["content"].decode("utf-8"))
+        callback_ids[payload["context"]["action"]] = payload["context"]["message_id"]
+    assert callback_ids["on_select"] == "msg-select"
+    assert callback_ids["on_init"] == "msg-init"
+    assert callback_ids["on_confirm"] == "msg-confirm"
 
     from app import ondc_store
 

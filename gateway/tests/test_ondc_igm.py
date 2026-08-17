@@ -356,5 +356,6 @@ def test_seller_bpp_issue_acks_and_posts_signed_on_issue(
     sent = json.loads(call.kwargs["content"].decode("utf-8"))
     assert sent["context"]["action"] == "on_issue"
     assert sent["context"]["domain"] == "ONDC:RET10"
+    assert sent["context"]["message_id"] == "msg-bpp-igm"
     assert sent["message"]["issue"]["id"] == "issue_from_buyer"
     assert sent["message"]["issue"]["status"] == "PROCESSING"

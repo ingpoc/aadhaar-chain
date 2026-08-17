@@ -177,6 +177,10 @@ def _seller_uk_id() -> Optional[str]:
     return None
 
 
+def _paired_callback_message_id(ctx: dict[str, Any]) -> str:
+    return str(ctx.get("message_id") or "").strip()
+
+
 def _bpp_id() -> str:
     return (
         getattr(settings, "ondc_bpp_id", None)
@@ -366,12 +370,10 @@ async def _post_on_search(search_body: dict[str, Any], pool: Any | None = None) 
     providers = await _durable_catalog_providers(pool, query=query)
     if not providers:
         logger.info("BPP on_search — no published items; sending empty catalog")
-    message_id = str(
-        uuid.uuid5(
-            uuid.NAMESPACE_URL,
-            f"{ctx.get('transaction_id')}:{ctx.get('message_id')}:on_search",
-        )
-    )
+    message_id = _paired_callback_message_id(ctx)
+    if not message_id:
+        logger.warning("BPP on_search skipped — missing request message_id")
+        return
     envelope = {
         "context": {
             "domain": ctx.get("domain") or DEFAULT_DOMAIN,
@@ -610,12 +612,10 @@ async def _post_on_action(
             )
     elif action == "init":
         order = {**order, "payment": {**(order.get("payment") or {}), "status": "NOT-PAID"}}
-    message_id = str(
-        uuid.uuid5(
-            uuid.NAMESPACE_URL,
-            f"{ctx.get('transaction_id')}:{ctx.get('message_id')}:on_{action}",
-        )
-    )
+    message_id = _paired_callback_message_id(ctx)
+    if not message_id:
+        logger.warning("BPP on_%s skipped — missing request message_id", action)
+        return
     on_action = f"on_{action}"
     envelope = {
         "context": {
@@ -743,12 +743,10 @@ async def _post_on_issue(
         "status": "PROCESSING" if action == "issue" else inbound_issue.get("status") or "PROCESSING",
         "updated_at": _iso_now(),
     }
-    message_id = str(
-        uuid.uuid5(
-            uuid.NAMESPACE_URL,
-            f"{ctx.get('transaction_id')}:{ctx.get('message_id')}:on_{action}",
-        )
-    )
+    message_id = _paired_callback_message_id(ctx)
+    if not message_id:
+        logger.warning("BPP on_%s skipped — missing request message_id", action)
+        return
     on_action = f"on_{action}"
     envelope = {
         "context": {

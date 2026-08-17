@@ -57,6 +57,8 @@ _LOGISTICS_LIFECYCLE_CALLBACKS = {
 }
 _IGM_ACTIONS = frozenset({"issue", "issue_status"})
 _IGM_CALLBACKS = frozenset({"on_issue", "on_issue_status"})
+_RETAIL_SIGNED_CALLBACKS = _IGM_CALLBACKS | frozenset({"on_track"})
+_PAIRED_CONFIRM_CALLBACK = "on_confirm"
 _IGM_REASON_CATEGORY = {
     "fulfillment": "FULFILLMENT",
     "fulfilment": "FULFILLMENT",
@@ -484,6 +486,26 @@ def _buyer_uk_id() -> Optional[str]:
     return _unique_key_id("buyer")
 
 
+def _authorization_subscriber_id(header: str) -> str:
+    marker = 'keyId="'
+    start = header.find(marker)
+    if start < 0:
+        return ""
+    rest = header[start + len(marker) :]
+    end = rest.find("|")
+    if end < 0:
+        end = rest.find('"')
+    return rest[:end].strip() if end >= 0 else ""
+
+
+def _callback_subscriber_id(ctx: dict[str, Any], request: Request) -> str:
+    for key in ("bpp_id", "bap_id", "subscriber_id", "subscriberID"):
+        value = str(ctx.get(key) or "").strip()
+        if value:
+            return value
+    return _authorization_subscriber_id(request.headers.get("Authorization") or "")
+
+
 def _subscriber_id(role: str = "buyer") -> Optional[str]:
     if role == "lbnp":
         from app.ondc_onboard_routes import _subscriber_id as onboard_subscriber_id
@@ -598,9 +620,10 @@ class OutboxDrainBody(BaseModel):
 
 
 class OrderActionBody(BaseModel):
-    """select / init / confirm — order + target BPP."""
+    """select / init / confirm / track — order or order_id + target BPP."""
 
     order: dict[str, Any] = Field(default_factory=dict)
+    order_id: Optional[str] = None
     message_id: Optional[str] = None
     transaction_id: Optional[str] = None
     bpp_id: Optional[str] = None
@@ -1056,9 +1079,9 @@ async def _dispatch_order_action(
     *,
     role: str = "buyer",
 ) -> JSONResponse:
-    """Signed select/init/confirm → bpp_uri/{action}; persist outbox."""
+    """Signed select/init/confirm/track → bpp_uri/{action}; persist outbox."""
     allowed_actions = (
-        {"select", "init", "confirm"}
+        {"select", "init", "confirm", "track"}
         if role == "buyer"
         else {"init", "confirm", "update", "status", "track"}
     )
@@ -1107,6 +1130,15 @@ async def _dispatch_order_action(
                 status_code=422,
                 detail=f"LOG10 {action} requires message.order_id",
             )
+    elif action == "track":
+        order_id = str(
+            getattr(body, "order_id", None)
+            or ((getattr(body, "order", None) or {}).get("id"))
+            or ""
+        ).strip()
+        if not order_id:
+            raise HTTPException(status_code=422, detail="track requires order_id")
+        message = {"order_id": order_id}
     else:
         message = {"order": body.order or {}}  # type: ignore[union-attr]
     bap_id = (
@@ -1241,6 +1273,11 @@ async def ondc_confirm(body: ConfirmBody, request: Request) -> JSONResponse:
     return await _dispatch_order_action(request, "confirm", body)
 
 
+@router.post("/api/ondc/track")
+async def ondc_track(body: OrderActionBody, request: Request) -> JSONResponse:
+    return await _dispatch_order_action(request, "track", body)
+
+
 def _igm_issue_id(envelope: dict[str, Any]) -> str:
     message = envelope.get("message") or {}
     issue = message.get("issue") if isinstance(message.get("issue"), dict) else {}
@@ -1356,7 +1393,7 @@ def _configured_seller_public_key_b64() -> tuple[str, str] | None:
     return str(uk).strip(), public_b64
 
 
-async def _verify_retail_igm_callback(
+async def _verify_retail_callback(
     request: Request,
     body: dict[str, Any],
     *,
@@ -1364,12 +1401,12 @@ async def _verify_retail_igm_callback(
 ) -> tuple[bool, str]:
     context = body.get("context") or {}
     if context.get("domain") != DEFAULT_DOMAIN:
-        return False, "IGM callback domain must be ONDC:RET10"
+        return False, "callback domain must be ONDC:RET10"
     if context.get("action") != action:
-        return False, "IGM callback action does not match the callback route"
+        return False, "callback action does not match the callback route"
     version = str(context.get("core_version") or "")
     if version != CORE_VERSION:
-        return False, f"unsupported Retail IGM core_version: {version or 'missing'}"
+        return False, f"unsupported Retail core_version: {version or 'missing'}"
     bpp_id = str(context.get("bpp_id") or "").strip()
     authorization = (request.headers.get("Authorization") or "").strip()
     if not authorization:
@@ -1401,9 +1438,9 @@ async def _verify_retail_igm_callback(
     try:
         status, response, _ = await _signed_post(_registry_url(), query, role="buyer")
     except Exception:  # noqa: BLE001
-        return False, "Retail IGM registry verification unavailable"
+        return False, "Retail registry verification unavailable"
     if status >= 400 or not isinstance(response, list):
-        return False, "Retail IGM BPP registry lookup failed"
+        return False, "Retail BPP registry lookup failed"
     for record in response:
         if (
             record.get("subscriber_id") != bpp_id
@@ -1426,7 +1463,16 @@ async def _verify_retail_igm_callback(
             )
         ):
             return True, ""
-    return False, "Retail IGM callback signature did not match the registry"
+    return False, "Retail callback signature did not match the registry"
+
+
+async def _verify_retail_igm_callback(
+    request: Request,
+    body: dict[str, Any],
+    *,
+    action: str,
+) -> tuple[bool, str]:
+    return await _verify_retail_callback(request, body, action=action)
 
 
 async def _dispatch_igm_action(
@@ -1950,6 +1996,31 @@ async def ondc_orders(
     )
 
 
+async def _confirm_message_id(
+    request: Request, transaction_id: str
+) -> str | None:
+    records = await _persistent_records(
+        request,
+        "outbox",
+        transaction_id=transaction_id,
+        action="confirm",
+        limit=100,
+    )
+    if records is not None:
+        for record in records:
+            if record.get("action") == "confirm" and record.get("message_id"):
+                return str(record["message_id"])
+        return None
+    for item in ondc_store.list_outbox(limit=500):
+        if (
+            item.get("action") == "confirm"
+            and item.get("transaction_id") == transaction_id
+            and item.get("message_id")
+        ):
+            return str(item["message_id"])
+    return None
+
+
 async def _ingest_callback(
     request: Request, action: str, body: dict[str, Any]
 ) -> JSONResponse:
@@ -1957,9 +2028,7 @@ async def _ingest_callback(
     normalized_action = action if action.startswith("on_") else f"on_{action}"
     transaction_id = str(ctx.get("transaction_id") or "").strip()
     message_id = str(ctx.get("message_id") or "").strip()
-    subscriber_id = str(
-        ctx.get("bpp_id") or ctx.get("bap_id") or ctx.get("subscriber_id") or ""
-    ).strip()
+    subscriber_id = _callback_subscriber_id(ctx, request)
     if not transaction_id or not message_id or not subscriber_id:
         return JSONResponse(
             {
@@ -1976,9 +2045,27 @@ async def _ingest_callback(
             status_code=400,
         )
 
+    if normalized_action == _PAIRED_CONFIRM_CALLBACK:
+        expected = await _confirm_message_id(request, transaction_id)
+        if expected and expected != message_id:
+            return JSONResponse(
+                {
+                    "message": {"ack": {"status": "NACK"}},
+                    "error": {
+                        "type": "CORE-ERROR",
+                        "code": "30000",
+                        "message": (
+                            "message_id mismatch between confirm and on_confirm "
+                            f"expected {expected} but found {message_id}"
+                        ),
+                    },
+                },
+                status_code=409,
+            )
+
     signature_verified = False
-    if normalized_action in _IGM_CALLBACKS:
-        signature_verified, verification_error = await _verify_retail_igm_callback(
+    if normalized_action in _RETAIL_SIGNED_CALLBACKS:
+        signature_verified, verification_error = await _verify_retail_callback(
             request,
             body,
             action=normalized_action,
