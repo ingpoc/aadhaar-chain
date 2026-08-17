@@ -14,6 +14,7 @@ from typing import Any, Optional
 import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse
+from psycopg.rows import dict_row
 
 from app.commerce_demo import load_state, search_items
 from app.commerce_compat import CommerceCompatibilityAdapter
@@ -34,6 +35,9 @@ router = APIRouter(tags=["ondc-bpp"])
 CORE_VERSION = "1.2.0"
 DEFAULT_DOMAIN = "ONDC:RET10"
 PROVIDER_ID = "aadhaar-seller-isn"
+_COMMERCE_RESOLVED_STATUSES = frozenset(
+    {"closed", "accepted", "resolution_proposed", "resolved"}
+)
 
 
 async def _persist_bpp_inbound(
@@ -227,11 +231,68 @@ def _igm_respondent_actor() -> dict[str, Any]:
     }
 
 
+def _inbound_igm_resolved(
+    inbound_issue: dict[str, Any],
+    *,
+    complainant_actions: list[Any],
+    respondent_actions: list[dict[str, Any]],
+    commerce_status: str = "",
+) -> bool:
+    inbound_status = str(inbound_issue.get("status") or "").strip().upper()
+    last_complainant = ""
+    if complainant_actions:
+        last = complainant_actions[-1]
+        if isinstance(last, dict):
+            last_complainant = str(last.get("complainant_action") or "").strip().upper()
+        else:
+            last_complainant = str(last or "").strip().upper()
+    last_respondent = (
+        str(respondent_actions[-1].get("respondent_action") or "").strip().upper()
+        if respondent_actions
+        else ""
+    )
+    return (
+        inbound_status in {"RESOLVED", "CLOSED"}
+        or last_complainant == "CLOSE"
+        or last_respondent == "RESOLVED"
+        or str(commerce_status or "").strip().lower() in _COMMERCE_RESOLVED_STATUSES
+    )
+
+
+async def _commerce_issue_status(issue_id: str, pool: Any | None) -> str:
+    """Local commerce terminal state is the source for native issue_status."""
+    issue_id = str(issue_id or "").strip()
+    if not issue_id:
+        return ""
+    memory = load_state().issues.get(issue_id)
+    if memory:
+        return str(memory.get("status") or "")
+    if pool is None:
+        return ""
+    try:
+        issue_uuid = uuid.UUID(issue_id)
+    except ValueError:
+        return ""
+    try:
+        async with UnitOfWork(pool) as unit_of_work:
+            async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    "SELECT status FROM commerce_issues WHERE issue_id = %s",
+                    (issue_uuid,),
+                )
+                row = await cursor.fetchone()
+        return str((row or {}).get("status") or "")
+    except Exception:  # noqa: BLE001
+        logger.warning("BPP commerce issue lookup failed", exc_info=True)
+        return ""
+
+
 def _with_respondent_issue_actions(
     inbound_issue: dict[str, Any],
     *,
     action: str,
     timestamp: str,
+    commerce_status: str = "",
 ) -> dict[str, Any]:
     """Workbench on_issue / on_issue_status require issue_actions.respondent_actions."""
     inbound_actions = (
@@ -246,13 +307,16 @@ def _with_respondent_issue_actions(
         if isinstance(item, dict)
     ]
     inbound_status = str(inbound_issue.get("status") or "").strip().upper()
-    if action == "issue":
+    resolved = _inbound_igm_resolved(
+        inbound_issue,
+        complainant_actions=complainant_actions,
+        respondent_actions=respondent_actions,
+        commerce_status=commerce_status,
+    )
+    if action == "issue" and not resolved:
         respondent_action = "PROCESSING"
         status = "PROCESSING"
-    elif inbound_status == "RESOLVED" or (
-        respondent_actions
-        and respondent_actions[-1].get("respondent_action") == "RESOLVED"
-    ):
+    elif resolved:
         respondent_action = "RESOLVED"
         status = "RESOLVED"
     else:
@@ -815,7 +879,15 @@ async def _post_on_issue(
         inbound_id = (request_body.get("message") or {}).get("issue_id") or inbound_issue.get("id")
         inbound_issue = {**inbound_issue, "id": inbound_id}
     timestamp = _iso_now()
-    issue = _with_respondent_issue_actions(inbound_issue, action=action, timestamp=timestamp)
+    commerce_status = await _commerce_issue_status(
+        str(inbound_issue.get("id") or ""), pool
+    )
+    issue = _with_respondent_issue_actions(
+        inbound_issue,
+        action=action,
+        timestamp=timestamp,
+        commerce_status=commerce_status,
+    )
     message_id = _paired_callback_message_id(ctx)
     if not message_id:
         logger.warning("BPP on_%s skipped — missing request message_id", action)

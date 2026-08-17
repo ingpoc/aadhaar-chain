@@ -1271,6 +1271,14 @@ class CommerceCompatibilityAdapter:
                     current_version=current_version,
                 )
                 owner_id = current.get("owner_id") or current.get("seller_id")
+                now = datetime.now(timezone.utc)
+                response_due_at = current.get("response_due_at")
+                escalation_due_at = current.get("escalation_due_at")
+                if next_status != "open":
+                    if not response_due_at:
+                        response_due_at = now + timedelta(minutes=240)
+                    if not escalation_due_at:
+                        escalation_due_at = now + timedelta(minutes=480)
                 history = list(current.get("history") or [])
                 history.append(
                     {
@@ -1293,11 +1301,15 @@ class CommerceCompatibilityAdapter:
                     """
                     UPDATE commerce_issues
                     SET owner_id = COALESCE(owner_id, %s),
+                        response_due_at = COALESCE(response_due_at, %s),
+                        escalation_due_at = COALESCE(escalation_due_at, %s),
                         history = %s, status = %s, version = %s, updated_at = NOW()
                     WHERE issue_id = %s AND version = %s RETURNING *
                     """,
                     (
                         owner_id,
+                        response_due_at,
+                        escalation_due_at,
                         Jsonb(history),
                         next_status,
                         next_version,

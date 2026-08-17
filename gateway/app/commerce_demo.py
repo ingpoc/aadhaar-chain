@@ -1193,6 +1193,14 @@ def record_igm_network_event(
     )
     if next_status == "acknowledged" and owner_id:
         issue = {**issue, "owner_id": owner_id}
+    now = datetime.now(timezone.utc)
+    response_due_at = issue.get("response_due_at")
+    escalation_due_at = issue.get("escalation_due_at")
+    if next_status != "open":
+        if not response_due_at:
+            response_due_at = (now + timedelta(minutes=240)).isoformat()
+        if not escalation_due_at:
+            escalation_due_at = (now + timedelta(minutes=480)).isoformat()
     event = _issue_event(next_status, actor_id, note or f"IGM {action}")
     event["network"] = {
         "action": action,
@@ -1206,6 +1214,8 @@ def record_igm_network_event(
         "status": next_status,
         "version": next_version,
         "owner_id": issue.get("owner_id") or owner_id,
+        "response_due_at": response_due_at,
+        "escalation_due_at": escalation_due_at,
         "igm_transaction_id": transaction_id,
         "history": [*list(issue.get("history") or []), event],
         "updated_at": _utcnow(),

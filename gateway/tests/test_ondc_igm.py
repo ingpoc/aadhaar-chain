@@ -543,6 +543,85 @@ def test_seller_bpp_issue_status_posts_resolved_actions(
     assert sent["message"]["issue"]["resolution"]["action_triggered"] == "NO-ACTION"
 
 
+def test_seller_bpp_issue_status_follows_closed_commerce(
+    tmp_path: Path, ed25519_pem: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native issue_status is issue_id-only; BPP must emit RESOLVED from commerce."""
+    _enable_retail_igm(tmp_path, ed25519_pem, monkeypatch)
+    mock_resp = AsyncMock()
+    mock_resp.status_code = 200
+    mock_resp.json = lambda: {"message": {"ack": {"status": "ACK"}}}
+    mock_resp.text = '{"message":{"ack":{"status":"ACK"}}}'
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = None
+    mock_client.post = AsyncMock(return_value=mock_resp)
+
+    from main import app
+
+    app.state.persistence_pool = None
+    client = TestClient(app)
+    created = _create_local_issue(client)
+    closed = _on_issue_envelope(
+        issue_id=created["issue_id"],
+        transaction_id="txn-bpp-igm-closed",
+        message_id="msg-bpp-igm-closed",
+    )
+    closed["message"]["issue"]["status"] = "CLOSED"
+    closed["message"]["issue"]["issue_actions"] = {
+        "complainant_actions": [{"complainant_action": "CLOSE", "updated_at": "t"}]
+    }
+    closed_auth = create_authorization_header(
+        closed,
+        subscriber_id="ondcseller.aadharcha.in",
+        unique_key_id="seller-uk",
+        private_key=_seller_key(ed25519_pem),
+    )
+    ack = client.post(
+        "/ondc/on_issue",
+        json=closed,
+        headers={"Authorization": closed_auth},
+    )
+    assert ack.status_code == 200
+    issue = _issue_lookup(client, created["issue_id"])
+    assert issue["status"] == "closed"
+    assert issue["response_due_at"]
+    assert issue["escalation_due_at"]
+
+    inbound = {
+        "context": {
+            "domain": "ONDC:RET10",
+            "action": "issue_status",
+            "country": "IND",
+            "city": "std:080",
+            "core_version": "1.2.0",
+            "bap_id": "ondcbuyer.aadharcha.in",
+            "bap_uri": "https://ondcbuyer.aadharcha.in/ondc",
+            "bpp_id": "ondcseller.aadharcha.in",
+            "bpp_uri": "https://ondcseller.aadharcha.in/ondc",
+            "transaction_id": "txn-bpp-igm-closed",
+            "message_id": "msg-bpp-igm-status-only",
+            "timestamp": "2026-08-17T14:00:00.000Z",
+            "ttl": "PT30S",
+        },
+        "message": {"issue_id": created["issue_id"]},
+    }
+    with patch("app.ondc_bpp.httpx.AsyncClient", return_value=mock_client):
+        status_ack = client.post("/ondc/issue_status", json=inbound)
+
+    assert status_ack.status_code == 200
+    sent = json.loads(mock_client.post.await_args.kwargs["content"].decode("utf-8"))
+    assert sent["context"]["action"] == "on_issue_status"
+    assert sent["message"]["issue"]["id"] == created["issue_id"]
+    assert sent["message"]["issue"]["status"] == "RESOLVED"
+    assert (
+        sent["message"]["issue"]["issue_actions"]["respondent_actions"][-1][
+            "respondent_action"
+        ]
+        == "RESOLVED"
+    )
+
+
 def _issue_lookup(client: TestClient, issue_id: str) -> dict:
     issues = client.get(
         "/api/demo-commerce/test-fixtures/buyer/issues"
@@ -582,6 +661,10 @@ def test_on_issue_maps_resolved_from_issue_actions_when_status_null(
     )
     assert ack.status_code == 200
     assert _issue_lookup(client, created["issue_id"])["status"] == "acknowledged"
+    processing_issue = _issue_lookup(client, created["issue_id"])
+    assert processing_issue["response_due_at"]
+    assert processing_issue["escalation_due_at"]
+    assert processing_issue["owner_id"]
 
     resolved = _on_issue_envelope(
         issue_id=created["issue_id"],
