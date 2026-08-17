@@ -46,7 +46,10 @@ async def _owned_order(
             if owner_field == "buyer_id"
             else {"seller_id": principal_id}
         )
-        return {"order": await compat.get_order(order_id, **filters)}
+        try:
+            return {"order": await compat.get_order(order_id, **filters)}
+        except Exception as exc:
+            _handle_error(exc)
     try:
         result = commerce_demo.get_order(order_id)
     except Exception as exc:

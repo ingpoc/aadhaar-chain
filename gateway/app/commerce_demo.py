@@ -11,7 +11,11 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-from app.domain_state_machines import TransitionError, require_transition
+from app.domain_state_machines import (
+    TransitionError,
+    apply_igm_legal_path,
+    require_transition,
+)
 from app.payment_adapter import payment_adapter
 from config import settings
 
@@ -1162,13 +1166,6 @@ def transition_issue(issue_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {"issue": updated, "message_id": _new_id("msg")}
 
 
-_IGM_NETWORK_TARGETS = {
-    "PROCESSING": "acknowledged",
-    "RESOLVED": "resolution_proposed",
-    "CLOSED": "closed",
-}
-
-
 def record_igm_network_event(
     issue_id: str,
     *,
@@ -1180,28 +1177,22 @@ def record_igm_network_event(
     signature_verified: bool = False,
     actor_id: str = "ondc-igm",
 ) -> dict[str, Any]:
-    """Append a signed IGM correlation event; transition only on a legal edge."""
+    """Append a signed IGM correlation event; transition only on a legal path."""
     state = load_state()
     issue = state.issues.get(issue_id)
     if not issue:
         raise KeyError(f"Unknown issue: {issue_id}")
     order = state.orders.get(str(issue.get("order_id"))) or {}
     current = str(issue.get("status") or "open")
-    target = _IGM_NETWORK_TARGETS.get(str(network_status or "").strip().upper())
-    next_status = current
     next_version = int(issue.get("version") or 1)
     owner_id = str(issue.get("owner_id") or order.get("seller_id") or "").strip() or None
-    if target and target != current:
-        try:
-            kwargs: dict[str, Any] = {
-                "current_version": next_version,
-            }
-            next_version = require_transition("issue", current, target, **kwargs)
-            next_status = target
-            if target == "acknowledged" and owner_id:
-                issue = {**issue, "owner_id": owner_id}
-        except TransitionError:
-            next_status = current
+    next_status, next_version = apply_igm_legal_path(
+        current,
+        network_status,
+        current_version=next_version,
+    )
+    if next_status == "acknowledged" and owner_id:
+        issue = {**issue, "owner_id": owner_id}
     event = _issue_event(next_status, actor_id, note or f"IGM {action}")
     event["network"] = {
         "action": action,

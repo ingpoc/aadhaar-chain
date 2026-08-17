@@ -8,6 +8,7 @@ from app.domain_state_machines import (
     STATE_MACHINES,
     StaleTransition,
     TransitionError,
+    apply_igm_legal_path,
     require_transition,
     transition_manifest,
 )
@@ -134,3 +135,32 @@ def test_manifest_is_versioned_and_serializable() -> None:
         "expired",
         "revoked",
     ]
+
+
+@pytest.mark.parametrize(
+    ("current", "network_status", "expected"),
+    [
+        ("open", "PROCESSING", "acknowledged"),
+        ("open", "RESOLVED", "resolution_proposed"),
+        ("open", "CLOSED", "closed"),
+        ("acknowledged", "RESOLVED", "resolution_proposed"),
+        ("acknowledged", "CLOSED", "closed"),
+        ("resolution_proposed", "CLOSED", "closed"),
+        ("accepted", "CLOSED", "closed"),
+        ("escalated", "RESOLVED", "resolution_proposed"),
+        ("closed", "CLOSED", "closed"),
+        ("resolution_proposed", "PROCESSING", "resolution_proposed"),
+        ("open", "", "open"),
+    ],
+)
+def test_igm_legal_path_reaches_commerce_target(
+    current: str, network_status: str, expected: str
+) -> None:
+    status, version = apply_igm_legal_path(
+        current, network_status, current_version=1
+    )
+    assert status == expected
+    if status == current:
+        assert version == 1
+    else:
+        assert version > 1

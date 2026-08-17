@@ -160,6 +160,18 @@ def _signed_in_client(
     return client, str(login.json()["data"]["principal_id"])
 
 
+def test_buyer_protocol_order_url_is_404_not_500() -> None:
+    from app.commerce_compat import _as_uuid
+    from main import app as gateway_app
+
+    assert _as_uuid("B5091e6b53") is None
+    gateway_app.state.persistence_pool = None
+    client, _principal = _signed_in_client("ondcbuyer")
+    response = client.get("/api/demo-commerce/buyer/orders/B5091e6b53")
+    assert response.status_code == 404
+    assert response.status_code != 500
+
+
 def test_buyer_issue_creation_requires_the_authenticated_order_owner() -> None:
     buyer, buyer_id = _signed_in_client("ondcbuyer")
     other_buyer, _ = _signed_in_client(

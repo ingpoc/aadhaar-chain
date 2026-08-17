@@ -158,6 +158,18 @@ PAYMENT_ORDER_TARGETS: Mapping[str, str] = MappingProxyType(
     }
 )
 
+# IGM network codes → unique happy-path hops on the issue machine.
+# Workbench often omits issue.status; RESOLVED/CLOSED still arrive in
+# issue_actions. Do not add illegal edges (open→closed, resolution_proposed→closed).
+IGM_NETWORK_CODES = frozenset({"PROCESSING", "RESOLVED", "CLOSED"})
+IGM_LEGAL_PATHS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "PROCESSING": ("acknowledged",),
+        "RESOLVED": ("acknowledged", "resolution_proposed"),
+        "CLOSED": ("acknowledged", "resolution_proposed", "accepted", "closed"),
+    }
+)
+
 
 def require_transition(
     machine_name: str,
@@ -201,6 +213,33 @@ def require_transition(
     return None if current_version is None else current_version + 1
 
 
+def apply_igm_legal_path(
+    current: str,
+    network_status: str,
+    *,
+    current_version: int,
+) -> tuple[str, int]:
+    """Walk unique legal hops toward the IGM network target. Never invent edges."""
+    chain = IGM_LEGAL_PATHS.get(str(network_status or "").strip().upper(), ())
+    next_status = str(current or "open")
+    next_version = int(current_version)
+    for target in chain:
+        if next_status == target:
+            continue
+        if target not in STATE_MACHINES["issue"].transitions.get(
+            next_status, frozenset()
+        ):
+            continue
+        next_version = require_transition(
+            "issue",
+            next_status,
+            target,
+            current_version=next_version,
+        )
+        next_status = target
+    return next_status, next_version
+
+
 def transition_manifest() -> dict[str, object]:
     """Serializable contract evidence for docs, inventories, and tests."""
     return {
@@ -225,11 +264,14 @@ def transition_manifest() -> dict[str, object]:
 __all__ = [
     "CONTRACT_VERSION",
     "DuplicateTransition",
+    "IGM_LEGAL_PATHS",
+    "IGM_NETWORK_CODES",
     "PAYMENT_ORDER_TARGETS",
     "STATE_MACHINES",
     "StaleTransition",
     "StateMachine",
     "TransitionError",
+    "apply_igm_legal_path",
     "require_transition",
     "transition_manifest",
 ]

@@ -1309,10 +1309,42 @@ def _igm_issue_id(envelope: dict[str, Any]) -> str:
     return str(issue.get("id") or message.get("issue_id") or "").strip()
 
 
+def _igm_action_status(issue: dict[str, Any]) -> str:
+    """Derive PROCESSING/RESOLVED/CLOSED from issue_actions when status is absent."""
+    from app.domain_state_machines import IGM_NETWORK_CODES
+
+    actions = (
+        issue.get("issue_actions")
+        if isinstance(issue.get("issue_actions"), dict)
+        else {}
+    )
+    complainant = [
+        str(item.get("complainant_action") or "").strip().upper()
+        for item in (actions.get("complainant_actions") or [])
+        if isinstance(item, dict)
+    ]
+    respondent = [
+        str(item.get("respondent_action") or "").strip().upper()
+        for item in (actions.get("respondent_actions") or [])
+        if isinstance(item, dict)
+    ]
+    if complainant and complainant[-1] == "CLOSE":
+        return "CLOSED"
+    for code in reversed(respondent):
+        if code in IGM_NETWORK_CODES:
+            return code
+    return ""
+
+
 def _igm_network_status(envelope: dict[str, Any]) -> str:
+    from app.domain_state_machines import IGM_NETWORK_CODES
+
     message = envelope.get("message") or {}
     issue = message.get("issue") if isinstance(message.get("issue"), dict) else {}
-    return str(issue.get("status") or "").strip().upper()
+    status = str(issue.get("status") or "").strip().upper()
+    if status in IGM_NETWORK_CODES:
+        return status
+    return _igm_action_status(issue)
 
 
 def _igm_category(reason: str, override: str | None = None) -> str:

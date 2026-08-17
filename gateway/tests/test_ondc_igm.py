@@ -541,3 +541,143 @@ def test_seller_bpp_issue_status_posts_resolved_actions(
     assert call_actions[-1] == "RESOLVED"
     assert sent["message"]["issue"]["status"] == "RESOLVED"
     assert sent["message"]["issue"]["resolution"]["action_triggered"] == "NO-ACTION"
+
+
+def _issue_lookup(client: TestClient, issue_id: str) -> dict:
+    issues = client.get(
+        "/api/demo-commerce/test-fixtures/buyer/issues"
+    ).json()["data"]["issues"]
+    return next(row for row in issues if row["issue_id"] == issue_id)
+
+
+def test_on_issue_maps_resolved_from_issue_actions_when_status_null(
+    tmp_path: Path, ed25519_pem: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_retail_igm(tmp_path, ed25519_pem, monkeypatch)
+    from main import app
+
+    app.state.persistence_pool = None
+    client = TestClient(app)
+    created = _create_local_issue(client)
+
+    processing = _on_issue_envelope(
+        issue_id=created["issue_id"],
+        transaction_id="txn-igm-actions",
+        message_id="msg-igm-processing",
+    )
+    processing["message"]["issue"].pop("status", None)
+    processing["message"]["issue"]["issue_actions"] = {
+        "respondent_actions": [{"respondent_action": "PROCESSING", "cascaded_level": 1}]
+    }
+    processing_auth = create_authorization_header(
+        processing,
+        subscriber_id="ondcseller.aadharcha.in",
+        unique_key_id="seller-uk",
+        private_key=_seller_key(ed25519_pem),
+    )
+    ack = client.post(
+        "/ondc/on_issue",
+        json=processing,
+        headers={"Authorization": processing_auth},
+    )
+    assert ack.status_code == 200
+    assert _issue_lookup(client, created["issue_id"])["status"] == "acknowledged"
+
+    resolved = _on_issue_envelope(
+        issue_id=created["issue_id"],
+        transaction_id="txn-igm-actions",
+        message_id="msg-igm-resolved",
+    )
+    resolved["context"]["action"] = "on_issue_status"
+    resolved["message"]["issue"].pop("status", None)
+    resolved["message"]["issue"]["issue_actions"] = {
+        "respondent_actions": [
+            {"respondent_action": "PROCESSING", "cascaded_level": 1},
+            {"respondent_action": "RESOLVED", "cascaded_level": 1},
+        ]
+    }
+    resolved_auth = create_authorization_header(
+        resolved,
+        subscriber_id="ondcseller.aadharcha.in",
+        unique_key_id="seller-uk",
+        private_key=_seller_key(ed25519_pem),
+    )
+    ack = client.post(
+        "/ondc/on_issue_status",
+        json=resolved,
+        headers={"Authorization": resolved_auth},
+    )
+    assert ack.status_code == 200
+    assert (
+        _issue_lookup(client, created["issue_id"])["status"] == "resolution_proposed"
+    )
+
+    closed = _on_issue_envelope(
+        issue_id=created["issue_id"],
+        transaction_id="txn-igm-actions",
+        message_id="msg-igm-closed",
+    )
+    closed["message"]["issue"].pop("status", None)
+    closed["message"]["issue"]["issue_actions"] = {
+        "complainant_actions": [
+            {"complainant_action": "OPEN"},
+            {"complainant_action": "CLOSE"},
+        ],
+        "respondent_actions": [
+            {"respondent_action": "PROCESSING"},
+            {"respondent_action": "RESOLVED"},
+        ],
+    }
+    closed_auth = create_authorization_header(
+        closed,
+        subscriber_id="ondcseller.aadharcha.in",
+        unique_key_id="seller-uk",
+        private_key=_seller_key(ed25519_pem),
+    )
+    ack = client.post(
+        "/ondc/on_issue",
+        json=closed,
+        headers={"Authorization": closed_auth},
+    )
+    assert ack.status_code == 200
+    issue = _issue_lookup(client, created["issue_id"])
+    assert issue["status"] == "closed"
+    assert any(
+        (event.get("network") or {}).get("network_status") == "CLOSED"
+        for event in issue["history"]
+    )
+
+
+def test_on_issue_resolved_from_open_walks_legal_path(
+    tmp_path: Path, ed25519_pem: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_retail_igm(tmp_path, ed25519_pem, monkeypatch)
+    from main import app
+
+    app.state.persistence_pool = None
+    client = TestClient(app)
+    created = _create_local_issue(client)
+    envelope = _on_issue_envelope(
+        issue_id=created["issue_id"],
+        transaction_id="txn-igm-jump",
+        message_id="msg-igm-jump",
+    )
+    envelope["message"]["issue"].pop("status", None)
+    envelope["message"]["issue"]["issue_actions"] = {
+        "respondent_actions": [{"respondent_action": "RESOLVED"}]
+    }
+    authorization = create_authorization_header(
+        envelope,
+        subscriber_id="ondcseller.aadharcha.in",
+        unique_key_id="seller-uk",
+        private_key=_seller_key(ed25519_pem),
+    )
+    ack = client.post(
+        "/ondc/on_issue",
+        json=envelope,
+        headers={"Authorization": authorization},
+    )
+    assert ack.status_code == 200
+    assert (
+        _issue_lookup(client, created["issue_id"])["status"] == "resolution_proposed"
+    )

@@ -14,13 +14,22 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from app.commerce_v1 import CommerceV1
-from app.domain_state_machines import TransitionError, require_transition
+from app.domain_state_machines import apply_igm_legal_path, require_transition
 from app.persistence.connection import ConnectionPool
 from app.persistence.transaction import UnitOfWork
 
 
 def _iso(value: Any) -> str:
     return value.isoformat() if isinstance(value, datetime) else str(value)
+
+
+def _as_uuid(value: str | None) -> UUID | None:
+    if not value:
+        return None
+    try:
+        return UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 def stamp_fulfilment_sla(
@@ -1031,8 +1040,11 @@ class CommerceCompatibilityAdapter:
         clauses: list[str] = []
         parameters: list[Any] = []
         if order_id is not None:
+            parsed = _as_uuid(order_id)
+            if parsed is None:
+                return []
             clauses.append("o.order_id = %s")
-            parameters.append(UUID(order_id))
+            parameters.append(parsed)
         if principal_id is not None:
             clauses.append("o.principal_id = %s")
             parameters.append(principal_id)
@@ -1241,13 +1253,7 @@ class CommerceCompatibilityAdapter:
         signature_verified: bool = False,
         actor_id: str = "ondc-igm",
     ) -> dict[str, Any]:
-        """Append a signed IGM correlation event; transition only on a legal edge."""
-        igm_targets = {
-            "PROCESSING": "acknowledged",
-            "RESOLVED": "resolution_proposed",
-            "CLOSED": "closed",
-        }
-
+        """Append a signed IGM correlation event; transition only on a legal path."""
         async with UnitOfWork(self.pool) as unit_of_work:
             async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(
@@ -1259,24 +1265,12 @@ class CommerceCompatibilityAdapter:
                     raise KeyError("issue not found")
                 current_status = str(current["status"] or "open")
                 current_version = int(current["version"] or 1)
-                target = igm_targets.get(
-                    str(network_status or "").strip().upper()
+                next_status, next_version = apply_igm_legal_path(
+                    current_status,
+                    network_status,
+                    current_version=current_version,
                 )
-                next_status = current_status
-                next_version = current_version
                 owner_id = current.get("owner_id") or current.get("seller_id")
-                if target and target != current_status:
-                    try:
-                        next_version = require_transition(
-                            "issue",
-                            current_status,
-                            target,
-                            current_version=current_version,
-                        )
-                        next_status = target
-                    except TransitionError:
-                        next_status = current_status
-                        next_version = current_version
                 history = list(current.get("history") or [])
                 history.append(
                     {
