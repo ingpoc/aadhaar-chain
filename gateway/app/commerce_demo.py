@@ -1010,6 +1010,69 @@ def create_issue(
     return response
 
 
+def find_issue_for_protocol_order(order_id: str) -> dict[str, Any] | None:
+    order_id = str(order_id or "").strip()
+    if not order_id:
+        return None
+    for issue in load_state().issues.values():
+        if (
+            str(issue.get("order_id") or "") == order_id
+            or str(issue.get("protocol_order_id") or "") == order_id
+        ):
+            return issue
+    return None
+
+
+def bind_protocol_issue(
+    order_id: str,
+    payload: dict[str, Any],
+    *,
+    transaction_id: str | None = None,
+    idempotency_key: Optional[str] = None,
+) -> dict[str, Any]:
+    """Create or reuse a local issue bound to an ONDC confirm order_id."""
+    order_id = str(order_id or "").strip()
+    if not order_id:
+        raise ValueError("protocol issue bind requires order_id")
+    existing = find_issue_for_protocol_order(order_id)
+    if existing is not None:
+        return {"issue": existing, "created": False, "message_id": _new_id("msg")}
+    state = load_state()
+    idem = _idempotency_key(f"protocol.issues.bind.{order_id}", idempotency_key)
+    if idem and idem in state.idempotency:
+        return state.idempotency[idem]
+    issue_id = _new_id("issue")
+    principal_id = str(payload.get("principal_id") or "ondc-protocol")
+    issue = {
+        "issue_id": issue_id,
+        "order_id": order_id,
+        "protocol_order_id": order_id,
+        "protocol_transaction_id": str(transaction_id or "").strip() or None,
+        "principal_id": principal_id,
+        "status": "open",
+        "version": 1,
+        "reason": payload.get("reason") or "fulfillment",
+        "description": payload.get("description") or "Protocol IGM issue",
+        "owner_id": None,
+        "response_due_at": None,
+        "escalation_due_at": None,
+        "history": [
+            _issue_event(
+                "open",
+                principal_id,
+                "Protocol-bound IGM issue from confirmed ONDC order",
+            )
+        ],
+        "created_at": _utcnow(),
+        "updated_at": _utcnow(),
+    }
+    state.issues[issue_id] = issue
+    response = {"issue": issue, "created": True, "message_id": _new_id("msg")}
+    _remember(state, idem, response)
+    save_state(state)
+    return response
+
+
 def list_seller_issues() -> dict[str, Any]:
     state = load_state()
     issues = list(state.issues.values())

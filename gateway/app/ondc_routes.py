@@ -649,9 +649,10 @@ class OrderActionBody(BaseModel):
 
 
 class IgmIssueBody(BaseModel):
-    """Retail IGM issue / issue_status bound to a local commerce issue."""
+    """Retail IGM issue / issue_status bound to a local or protocol-confirmed order."""
 
-    issue_id: str
+    issue_id: Optional[str] = None
+    order_id: Optional[str] = None
     issue_type: str = "ISSUE"
     category: Optional[str] = None
     message_id: Optional[str] = None
@@ -1312,22 +1313,164 @@ def _igm_category(reason: str, override: str | None = None) -> str:
     return _IGM_REASON_CATEGORY.get(str(reason or "").strip().lower(), "OTHER")
 
 
-async def _load_local_issue(request: Request, issue_id: str) -> dict[str, Any]:
+def _confirm_order_id(envelope: dict[str, Any]) -> str:
+    message = envelope.get("message") or {}
+    order = message.get("order") if isinstance(message.get("order"), dict) else {}
+    return str(order.get("id") or message.get("order_id") or "").strip()
+
+
+async def _find_confirmed_ondc_order(
+    request: Request,
+    *,
+    order_id: str = "",
+    transaction_id: str = "",
+) -> dict[str, Any] | None:
+    """Resolve an ONDC order from confirm outbox. Does not require on_confirm."""
+    order_id = str(order_id or "").strip()
+    transaction_id = str(transaction_id or "").strip()
+    if not order_id and not transaction_id:
+        return None
+    records = await _persistent_records(
+        request,
+        "outbox",
+        transaction_id=transaction_id or None,
+        action="confirm",
+        limit=100,
+    )
+    if records is None:
+        records = []
+        for item in ondc_store.list_outbox(limit=500):
+            if item.get("action") != "confirm":
+                continue
+            if transaction_id and str(item.get("transaction_id") or "") != transaction_id:
+                continue
+            records.append(item)
+    for record in records:
+        envelope = record.get("envelope") or record.get("payload") or {}
+        found_id = _confirm_order_id(envelope)
+        found_txn = str(
+            (envelope.get("context") or {}).get("transaction_id")
+            or record.get("transaction_id")
+            or ""
+        ).strip()
+        if order_id and found_id == order_id:
+            return {
+                "order_id": found_id,
+                "transaction_id": found_txn,
+                "envelope": envelope,
+            }
+        if not order_id and transaction_id and found_txn == transaction_id and found_id:
+            return {
+                "order_id": found_id,
+                "transaction_id": found_txn,
+                "envelope": envelope,
+            }
+    return None
+
+
+async def _load_local_issue(request: Request, issue_id: str) -> dict[str, Any] | None:
+    issue_id = str(issue_id or "").strip()
+    if not issue_id:
+        return None
     pool = getattr(request.app.state, "persistence_pool", None)
     if pool is not None:
         from app.commerce_compat import CommerceCompatibilityAdapter
 
         listed = await CommerceCompatibilityAdapter(pool).list_issues()
         for row in listed.get("issues") or []:
-            if str(row.get("issue_id")) == str(issue_id):
+            if str(row.get("issue_id")) == issue_id:
                 return row
-        raise HTTPException(status_code=404, detail="Unknown issue")
+        return None
     from app.commerce_demo import load_state
 
-    issue = load_state().issues.get(issue_id)
-    if not issue:
+    return load_state().issues.get(issue_id)
+
+
+async def _find_issue_for_order(
+    request: Request, order_id: str
+) -> dict[str, Any] | None:
+    order_id = str(order_id or "").strip()
+    if not order_id:
+        return None
+    pool = getattr(request.app.state, "persistence_pool", None)
+    if pool is not None:
+        from app.commerce_compat import CommerceCompatibilityAdapter
+
+        return await CommerceCompatibilityAdapter(pool).find_issue_for_protocol_order(
+            order_id
+        )
+    from app.commerce_demo import find_issue_for_protocol_order
+
+    return find_issue_for_protocol_order(order_id)
+
+
+async def _bind_protocol_issue(
+    request: Request,
+    *,
+    order_id: str,
+    transaction_id: str,
+    bpp_id: str | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "principal_id": _subscriber_id() or "ondc-protocol",
+        "seller_id": str(bpp_id or "").strip() or "ondc-bpp",
+        "reason": "fulfillment",
+        "description": "Protocol IGM issue",
+    }
+    pool = getattr(request.app.state, "persistence_pool", None)
+    if pool is not None:
+        from app.commerce_compat import CommerceCompatibilityAdapter
+
+        bound = await CommerceCompatibilityAdapter(pool).bind_protocol_issue(
+            order_id,
+            payload,
+            transaction_id=transaction_id,
+        )
+        return bound["issue"]
+    from app.commerce_demo import bind_protocol_issue
+
+    return bind_protocol_issue(
+        order_id,
+        payload,
+        transaction_id=transaction_id,
+    )["issue"]
+
+
+async def _resolve_or_bind_local_issue(
+    request: Request, body: IgmIssueBody
+) -> dict[str, Any]:
+    """Load an existing issue, or bind one from a confirm-outbox ONDC order."""
+    issue_id = str(body.issue_id or "").strip()
+    order_id = str(body.order_id or "").strip()
+    transaction_id = str(body.transaction_id or "").strip()
+    if not issue_id and not order_id:
+        raise HTTPException(
+            status_code=422,
+            detail="issue requires issue_id or a confirmed order_id",
+        )
+    if issue_id:
+        existing = await _load_local_issue(request, issue_id)
+        if existing is not None:
+            return existing
+    lookup_order_id = order_id or issue_id
+    existing_for_order = await _find_issue_for_order(request, lookup_order_id)
+    if existing_for_order is not None:
+        return existing_for_order
+    confirmed = await _find_confirmed_ondc_order(
+        request,
+        order_id=lookup_order_id,
+        transaction_id=transaction_id,
+    )
+    if confirmed is None:
+        if order_id and not issue_id:
+            raise HTTPException(status_code=404, detail="Unknown order")
         raise HTTPException(status_code=404, detail="Unknown issue")
-    return issue
+    return await _bind_protocol_issue(
+        request,
+        order_id=confirmed["order_id"],
+        transaction_id=confirmed["transaction_id"] or transaction_id,
+        bpp_id=body.bpp_id,
+    )
 
 
 async def _record_igm_correlation(
@@ -1510,7 +1653,7 @@ async def _dispatch_igm_action(
     issue_type = str(body.issue_type or "ISSUE").strip().upper()
     if issue_type not in {"ISSUE", "GRIEVANCE"}:
         raise HTTPException(status_code=422, detail="issue_type must be ISSUE or GRIEVANCE")
-    local = await _load_local_issue(request, body.issue_id)
+    local = await _resolve_or_bind_local_issue(request, body)
     message_id = body.message_id or str(uuid.uuid4())
     transaction_id = body.transaction_id or str(uuid.uuid4())
     bpp_id, bpp_uri = await _resolve_bpp_target(

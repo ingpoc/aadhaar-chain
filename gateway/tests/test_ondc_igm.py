@@ -359,3 +359,89 @@ def test_seller_bpp_issue_acks_and_posts_signed_on_issue(
     assert sent["context"]["message_id"] == "msg-bpp-igm"
     assert sent["message"]["issue"]["id"] == "issue_from_buyer"
     assert sent["message"]["issue"]["status"] == "PROCESSING"
+
+
+def test_igm_dispatch_binds_confirmed_order_without_local_issue(
+    tmp_path: Path, ed25519_pem: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_retail_igm(tmp_path, ed25519_pem, monkeypatch)
+    mock_resp = AsyncMock()
+    mock_resp.status_code = 200
+    mock_resp.json = lambda: {"message": {"ack": {"status": "ACK"}}}
+    mock_resp.text = '{"message":{"ack":{"status":"ACK"}}}'
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = None
+    mock_client.post = AsyncMock(return_value=mock_resp)
+
+    from main import app
+
+    app.state.persistence_pool = None
+    order_id = "B5f876d453"
+    transaction_id = "f876d453-6c33-4297-952e-7ee54ed50551"
+    with patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client):
+        client = TestClient(app)
+        confirm = client.post(
+            "/api/ondc/confirm",
+            json={
+                "order": {"id": order_id},
+                "bpp_id": "ondcseller.aadharcha.in",
+                "bpp_uri": "https://ondcseller.aadharcha.in/ondc",
+                "transaction_id": transaction_id,
+                "message_id": "msg-confirm-igm-bind",
+            },
+        )
+        assert confirm.status_code == 200, confirm.text
+        unknown_order = client.post(
+            "/api/ondc/issue",
+            json={
+                "order_id": "B5missing",
+                "bpp_uri": "https://ondcseller.aadharcha.in/ondc",
+                "transaction_id": "txn-unknown-order",
+            },
+        )
+        unknown_issue = client.post(
+            "/api/ondc/issue",
+            json={
+                "issue_id": "issue_missing",
+                "bpp_uri": "https://ondcseller.aadharcha.in/ondc",
+            },
+        )
+        created = client.post(
+            "/api/ondc/issue",
+            json={
+                "issue_id": order_id,
+                "order_id": order_id,
+                "bpp_id": "ondcseller.aadharcha.in",
+                "bpp_uri": "https://ondcseller.aadharcha.in/ondc",
+                "transaction_id": transaction_id,
+                "message_id": "msg-igm-bind",
+            },
+        )
+        assert created.status_code == 200, created.text
+        bound_id = created.json()["data"]["issue_id"]
+        correlated = client.post(
+            "/api/ondc/issue",
+            json={
+                "issue_id": bound_id,
+                "bpp_id": "ondcseller.aadharcha.in",
+                "bpp_uri": "https://ondcseller.aadharcha.in/ondc",
+                "transaction_id": transaction_id,
+                "message_id": "msg-igm-bind-existing",
+            },
+        )
+
+    assert unknown_order.status_code == 404
+    assert unknown_order.json()["detail"] == "Unknown order"
+    assert unknown_issue.status_code == 404
+    assert unknown_issue.json()["detail"] == "Unknown issue"
+    assert bound_id != order_id
+    sent = json.loads(mock_client.post.await_args_list[-2].kwargs["content"].decode("utf-8"))
+    assert sent["message"]["issue"]["id"] == bound_id
+    assert sent["message"]["issue"]["order_details"]["id"] == order_id
+    assert correlated.status_code == 200, correlated.text
+    assert correlated.json()["data"]["issue_id"] == bound_id
+    issues = client.get("/api/demo-commerce/test-fixtures/buyer/issues").json()["data"]["issues"]
+    matching = [row for row in issues if row["issue_id"] == bound_id]
+    assert len(matching) == 1
+    assert matching[0]["order_id"] == order_id

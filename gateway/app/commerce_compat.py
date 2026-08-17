@@ -166,9 +166,16 @@ class CommerceCompatibilityAdapter:
 
     @staticmethod
     def _issue(row: dict[str, Any]) -> dict[str, Any]:
+        protocol_order_id = str(row.get("protocol_order_id") or "").strip() or None
+        local_order_id = row.get("order_id")
         return {
             "issue_id": str(row["issue_id"]),
-            "order_id": str(row["order_id"]),
+            "order_id": str(local_order_id) if local_order_id else protocol_order_id,
+            "protocol_order_id": protocol_order_id,
+            "protocol_transaction_id": str(row.get("protocol_transaction_id") or "").strip()
+            or None,
+            "principal_id": row.get("principal_id"),
+            "seller_id": row.get("seller_id"),
             "status": row["status"],
             "version": row["version"],
             "reason": row["reason"],
@@ -659,6 +666,74 @@ class CommerceCompatibilityAdapter:
                 ),
             )
         return {"issue": (await self.list_issues(order_id=order_id))["issues"][0]}
+
+    async def bind_protocol_issue(
+        self,
+        order_id: str,
+        body: dict[str, Any],
+        *,
+        transaction_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create or reuse a commerce issue bound to an ONDC confirm order_id."""
+        existing = await self.find_issue_for_protocol_order(order_id)
+        if existing is not None:
+            return {"issue": existing, "created": False}
+        issue_id = uuid4()
+        principal_id = str(body.get("principal_id") or "ondc-protocol").strip()
+        seller_id = str(body.get("seller_id") or "ondc-bpp").strip()
+        async with UnitOfWork(self.pool) as unit_of_work:
+            await unit_of_work.connection.execute(
+                """
+                INSERT INTO commerce_issues (
+                    issue_id, order_id, principal_id, seller_id, reason, description,
+                    history, protocol_order_id, protocol_transaction_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    issue_id,
+                    None,
+                    principal_id,
+                    seller_id,
+                    str(body.get("reason") or "fulfillment"),
+                    str(body.get("description") or "Protocol IGM issue"),
+                    Jsonb(
+                        [
+                            {
+                                "status": "open",
+                                "actor_id": principal_id,
+                                "note": "Protocol-bound IGM issue from confirmed ONDC order",
+                                "at": datetime.now(timezone.utc).isoformat(),
+                            }
+                        ]
+                    ),
+                    order_id,
+                    str(transaction_id or "").strip() or None,
+                ),
+            )
+        bound = await self.find_issue_for_protocol_order(order_id)
+        if bound is None:
+            raise RuntimeError("protocol issue bind failed")
+        return {"issue": bound, "created": True}
+
+    async def find_issue_for_protocol_order(
+        self, order_id: str
+    ) -> dict[str, Any] | None:
+        order_id = str(order_id or "").strip()
+        if not order_id:
+            return None
+        async with UnitOfWork(self.pool) as unit_of_work:
+            async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    """
+                    SELECT * FROM commerce_issues
+                    WHERE protocol_order_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (order_id,),
+                )
+                row = await cursor.fetchone()
+        return self._issue(row) if row else None
 
     async def create_return(
         self, order_id: str, *, principal_id: str, body: dict[str, Any]
