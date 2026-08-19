@@ -54,3 +54,14 @@ def test_migration_number_ranges_are_reserved_by_owner() -> None:
         "commerce_payment_ledger": (20, 29),
         "ondc": (30, 39),
     }
+
+
+def test_checked_in_migrations_do_not_reuse_live_025_026() -> None:
+    migrations = discover_migrations(Path(__file__).parents[1] / "migrations")
+    numbers = [migration.number for migration in migrations]
+    names = {migration.number: migration.name for migration in migrations}
+
+    assert 25 not in numbers
+    assert 26 not in numbers
+    assert 27 in numbers
+    assert names[27] == "seller_stores"

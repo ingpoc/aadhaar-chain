@@ -643,7 +643,7 @@ class CommerceRepository:
                     payload["city"],
                     payload["state"],
                     payload["pin"],
-                    Jsonb(payload["serviceability_tokens"]),
+                    payload["serviceability_tokens"],
                     payload["fulfilment_sla_hours"],
                     payload["return_window_days"],
                     payload["support_hours"],
