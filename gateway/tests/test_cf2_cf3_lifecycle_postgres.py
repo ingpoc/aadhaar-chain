@@ -17,6 +17,7 @@ from app.agentguard_routes import router as agentguard_router
 from app.commerce_routes import router as commerce_router
 from app.persistence import ConnectionPool, MigrationRunner
 from app.session_auth import SESSION_COOKIE_NAME, create_principal_session_token
+from config import settings
 
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -105,7 +106,9 @@ async def _execute(
 
 async def test_two_sided_fulfilment_return_and_remedy_slice(
     postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(settings, "aadhaar_chain_env", "demo")
     pool = ConnectionPool(postgres_url, min_size=0, max_size=8)
     await pool.open()
     await MigrationRunner(pool, MIGRATIONS).apply()

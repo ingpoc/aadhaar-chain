@@ -777,7 +777,7 @@ async def test_seller_refund_over_limit_and_missing_order_are_server_enforced(
         amount_inr=6000,
         resource_id=order_id,
         idempotency_key="refund-pg-approved",
-        correlation_id="corr-refund-pg-approved",
+        correlation_id="corr-refund-pg-step",
         payload={"order_id": order_id},
     )
     assert approved["decision"] == "allow"
@@ -789,7 +789,7 @@ async def test_seller_refund_over_limit_and_missing_order_are_server_enforced(
         amount_inr=6000,
         resource_id=order_id,
         idempotency_key="refund-pg-approved",
-        correlation_id="corr-refund-pg-approved",
+        correlation_id="corr-refund-pg-step",
         payload={"order_id": order_id},
     )
     assert replay["receipt"]["receipt_id"] == approved["receipt"]["receipt_id"]

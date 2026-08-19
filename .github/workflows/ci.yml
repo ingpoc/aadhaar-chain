@@ -31,6 +31,7 @@ jobs:
         working-directory: gateway
     env:
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/agentguard_test
+      AADHAAR_CHAIN_ENV: demo
     services:
       postgres:
         image: postgres:17
