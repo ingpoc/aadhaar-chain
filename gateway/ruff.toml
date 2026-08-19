@@ -1,0 +1,11 @@
+# Bug/undefined-name lint only. Do not enable format or pycodestyle style.
+target-version = "py312"
+
+[lint]
+select = [
+    "F",    # pyflakes
+    "E9",   # runtime syntax errors
+    "E722", # bare except
+]
+# Unused imports/locals are widespread in this tree; do not mass-clean them here.
+ignore = ["F401", "F841"]
