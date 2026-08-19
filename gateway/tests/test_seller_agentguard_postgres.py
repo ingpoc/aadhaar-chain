@@ -702,7 +702,7 @@ async def test_seller_refund_over_limit_and_missing_order_are_server_enforced(
         seller_id=seller_id,
         sku="refund-pg-item",
         title="Refund item",
-        unit_price_paise=80_000,
+        unit_price_paise=800_000,
         available_quantity=2,
     )
     cart = await commerce.create_cart(
