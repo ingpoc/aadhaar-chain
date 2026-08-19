@@ -65,3 +65,5 @@ def test_checked_in_migrations_do_not_reuse_live_025_026() -> None:
     assert 26 not in numbers
     assert 27 in numbers
     assert names[27] == "seller_stores"
+    assert 28 in numbers
+    assert names[28] == "seller_staff"

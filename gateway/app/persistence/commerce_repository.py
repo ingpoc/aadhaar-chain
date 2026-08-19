@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from hashlib import sha256
 from typing import Any, Iterable
 from uuid import UUID, uuid5
 
@@ -654,6 +655,117 @@ class CommerceRepository:
         if row is None:
             raise RuntimeError("store upsert returned no row")
         return row
+
+    async def get_staff(self, seller_id: str, staff_id: str) -> dict[str, Any] | None:
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                """
+                SELECT * FROM commerce_seller_staff
+                WHERE seller_id = %s AND staff_id = %s
+                """,
+                (seller_id, staff_id),
+            )
+            return await cursor.fetchone()
+
+    async def list_staff(self, seller_id: str) -> list[dict[str, Any]]:
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                """
+                SELECT * FROM commerce_seller_staff
+                WHERE seller_id = %s
+                ORDER BY
+                    CASE role
+                        WHEN 'owner' THEN 0
+                        WHEN 'manager' THEN 1
+                        WHEN 'fulfilment' THEN 2
+                        WHEN 'support' THEN 3
+                        ELSE 4
+                    END,
+                    updated_at DESC
+                """,
+                (seller_id,),
+            )
+            return list(await cursor.fetchall())
+
+    async def list_staff_memberships(
+        self, member_principal_id: str
+    ) -> list[dict[str, Any]]:
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                """
+                SELECT * FROM commerce_seller_staff
+                WHERE member_principal_id = %s
+                  AND status IN ('active', 'invited')
+                ORDER BY updated_at DESC
+                """,
+                (member_principal_id,),
+            )
+            return list(await cursor.fetchall())
+
+    async def upsert_staff_member(
+        self, payload: dict[str, Any], *, staff_id: str | None = None
+    ) -> dict[str, Any]:
+        assigned_id = str(
+            staff_id
+            or payload.get("staff_id")
+            or "staff_"
+            + sha256(
+                f"{payload['seller_id']}:{payload['member_principal_id']}".encode()
+            ).hexdigest()[:16]
+        )
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO commerce_seller_staff (
+                    staff_id, seller_id, member_principal_id, display_name, email,
+                    role, status
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (seller_id, member_principal_id) DO UPDATE SET
+                    display_name = EXCLUDED.display_name,
+                    email = EXCLUDED.email,
+                    role = CASE
+                        WHEN commerce_seller_staff.role = 'owner'
+                            THEN commerce_seller_staff.role
+                        ELSE EXCLUDED.role
+                    END,
+                    status = CASE
+                        WHEN commerce_seller_staff.role = 'owner'
+                            THEN commerce_seller_staff.status
+                        ELSE EXCLUDED.status
+                    END,
+                    version = commerce_seller_staff.version + 1,
+                    updated_at = NOW()
+                RETURNING *
+                """,
+                (
+                    assigned_id,
+                    payload["seller_id"],
+                    payload["member_principal_id"],
+                    payload.get("display_name") or "",
+                    payload.get("email") or "",
+                    payload.get("role") or "viewer",
+                    payload.get("status") or "invited",
+                ),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError("staff upsert returned no row")
+        return row
+
+    async def ensure_owner_staff(self, seller_id: str) -> dict[str, Any]:
+        digest = sha256(seller_id.encode("utf-8")).hexdigest()[:16]
+        return await self.upsert_staff_member(
+            {
+                "staff_id": f"staff_owner_{digest}",
+                "seller_id": seller_id,
+                "member_principal_id": seller_id,
+                "display_name": "Store owner",
+                "email": "",
+                "role": "owner",
+                "status": "active",
+            },
+            staff_id=f"staff_owner_{digest}",
+        )
 
     async def _dict_row(
         self,

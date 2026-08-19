@@ -108,6 +108,9 @@ class Settings(BaseSettings):
     google_client_secret: Optional[str] = None
     google_redirect_uri: Optional[str] = None
     auth_demo_continue: bool = True
+    # Extra merchant ids every authenticated seller session may operate.
+    # Live demo bind for AgentMail operator vs Google-published catalog.
+    commerce_shared_seller_ids: str = ""
 
     # ONDC / Beckn (server-side only — never Vite secrets)
     ondc_enabled: bool = False

@@ -269,18 +269,32 @@ def update_staff(
 
 
 def find_staff_membership(member_principal_id: str) -> dict[str, Any] | None:
-    state = load_state()
     matches = [
         row
-        for row in state.staff.values()
-        if row.get("member_principal_id") == member_principal_id
-        and row.get("status") in {"active", "invited"}
-        and row.get("role") != "owner"
+        for row in list_staff_memberships(member_principal_id)
+        if row.get("role") != "owner"
     ]
     if not matches:
         return None
+    return matches[0]
+
+
+def list_staff_memberships(member_principal_id: str) -> list[dict[str, Any]]:
+    state = load_state()
+    matches = [
+        _annotate_staff_member(row)
+        for row in state.staff.values()
+        if row.get("member_principal_id") == member_principal_id
+        and row.get("status") in {"active", "invited"}
+    ]
     matches.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
-    return _annotate_staff_member(matches[0])
+    return matches
+
+
+def list_operated_seller_ids(principal_id: str) -> list[str]:
+    from app.commerce_v1 import operated_seller_ids
+
+    return operated_seller_ids(principal_id, list_staff_memberships(principal_id))
 
 
 def import_catalog(
@@ -670,12 +684,16 @@ def get_item(item_id: str) -> dict[str, Any]:
     return {"item": item, "inventory": state.inventory.get(item_id, 0)}
 
 
-def list_seller_items(seller_id: str) -> dict[str, Any]:
+def list_seller_items(
+    seller_id: Optional[str] = None,
+    seller_ids: Optional[list[str]] = None,
+) -> dict[str, Any]:
     state = load_state()
+    allowed = {item for item in (*(seller_ids or ()), seller_id) if item}
     rows = [
         {**item, "inventory": state.inventory.get(item_id, 0)}
         for item_id, item in state.items.items()
-        if item.get("seller_id") == seller_id
+        if not allowed or item.get("seller_id") in allowed
     ]
     return {"items": rows, "count": len(rows)}
 
@@ -823,16 +841,32 @@ def record_order_authorization(
 def get_order(order_id: str) -> dict[str, Any]:
     state = load_state()
     order = state.orders.get(order_id)
-    if not order:
-        raise KeyError(f"Unknown order: {order_id}")
-    return {"order": order}
+    if order:
+        return {"order": order}
+    from app.commerce_compat import _order_hex_prefix
+
+    prefix = _order_hex_prefix(order_id)
+    if prefix is None:
+        raise KeyError("order not found")
+    matches = [
+        row
+        for row in state.orders.values()
+        if str(row.get("order_id") or "").replace("-", "").lower().startswith(prefix)
+    ]
+    if len(matches) != 1:
+        raise KeyError("order not found")
+    return {"order": matches[0]}
 
 
-def list_seller_orders(seller_id: Optional[str] = None) -> dict[str, Any]:
+def list_seller_orders(
+    seller_id: Optional[str] = None,
+    seller_ids: Optional[list[str]] = None,
+) -> dict[str, Any]:
     state = load_state()
     orders = list(state.orders.values())
-    if seller_id:
-        orders = [order for order in orders if order.get("seller_id") == seller_id]
+    allowed = {item for item in (*(seller_ids or ()), seller_id) if item}
+    if allowed:
+        orders = [order for order in orders if order.get("seller_id") in allowed]
     return {"orders": orders, "count": len(orders)}
 
 
@@ -964,13 +998,15 @@ def list_returns(
     *,
     principal_id: Optional[str] = None,
     seller_id: Optional[str] = None,
+    seller_ids: Optional[list[str]] = None,
     order_id: Optional[str] = None,
 ) -> dict[str, Any]:
     rows = list(load_state().returns.values())
     if principal_id:
         rows = [row for row in rows if row.get("principal_id") == principal_id]
-    if seller_id:
-        rows = [row for row in rows if row.get("seller_id") == seller_id]
+    allowed = {item for item in (*(seller_ids or ()), seller_id) if item}
+    if allowed:
+        rows = [row for row in rows if row.get("seller_id") in allowed]
     if order_id:
         rows = [row for row in rows if row.get("order_id") == order_id]
     return {"returns": rows, "count": len(rows)}

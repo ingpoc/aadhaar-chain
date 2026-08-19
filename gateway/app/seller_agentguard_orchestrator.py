@@ -694,6 +694,17 @@ class SellerAgentGuardOrchestrator:
             )
         return response
 
+    async def _operated_seller_ids(self, principal_id: str) -> list[str]:
+        listing = getattr(self.commerce, "list_operated_seller_ids", None)
+        if not callable(listing):
+            return [principal_id]
+        result = listing(principal_id)
+        if hasattr(result, "__await__"):
+            result = await result
+        if isinstance(result, (list, tuple, set)) and result:
+            return [str(item) for item in result]
+        return [principal_id]
+
     async def _execute_effect(
         self,
         *,
@@ -706,10 +717,9 @@ class SellerAgentGuardOrchestrator:
         correlation_id: str,
     ) -> dict[str, Any]:
         if action in {"seller.catalog.publish", "seller.catalog.archive"}:
+            operated = await self._operated_seller_ids(principal_id)
             try:
-                current = await self.commerce.get_item(
-                    resource_id, seller_id=principal_id
-                )
+                current = await self.commerce.get_item(resource_id)
             except KeyError:
                 if action == "seller.catalog.archive":
                     raise AgentGuardNotFound("Seller catalog item not found") from None
@@ -717,7 +727,7 @@ class SellerAgentGuardOrchestrator:
                     {**payload, "item_id": resource_id, "seller_id": principal_id}
                 )
             item = current.get("item", current)
-            if item["seller_id"] != principal_id:
+            if item["seller_id"] not in operated:
                 raise AgentGuardConflict("Seller does not own catalog item")
             return await self.commerce.publish_item(
                 resource_id,
@@ -726,14 +736,13 @@ class SellerAgentGuardOrchestrator:
                 else "archived",
             )
         if action in {"seller.price.change", "seller.inventory.commit"}:
+            operated = await self._operated_seller_ids(principal_id)
             try:
-                current = await self.commerce.get_item(
-                    resource_id, seller_id=principal_id
-                )
+                current = await self.commerce.get_item(resource_id)
             except KeyError:
                 raise AgentGuardNotFound("Seller catalog item not found") from None
             item = current.get("item", current)
-            if item["seller_id"] != principal_id:
+            if item["seller_id"] not in operated:
                 raise AgentGuardConflict("Seller does not own catalog item")
             return await self.commerce.update_item(resource_id, payload)
         if action in {
@@ -741,11 +750,12 @@ class SellerAgentGuardOrchestrator:
             "seller.order.reject",
             "seller.fulfilment.commit",
         }:
+            operated = await self._operated_seller_ids(principal_id)
             try:
                 current = await self.commerce.get_order(resource_id)
             except KeyError:
                 raise AgentGuardNotFound("Seller order not found") from None
-            if current["seller_id"] != principal_id:
+            if current["seller_id"] not in operated:
                 raise AgentGuardConflict("Seller does not own order")
             if action == "seller.fulfilment.commit":
                 payload = await self._bind_logistics_offer(payload)
@@ -766,15 +776,23 @@ class SellerAgentGuardOrchestrator:
                 resource_id, status, payload=payload
             )
         if action == "seller.remedy.promise":
-            issues = await self.commerce.list_issues(seller_id=principal_id)
+            operated = await self._operated_seller_ids(principal_id)
+            issues = await self.commerce.list_issues(seller_ids=operated)
             if resource_id not in {issue["issue_id"] for issue in issues["issues"]}:
                 raise AgentGuardNotFound("Seller issue not found")
             return await self.commerce.remedy_issue(resource_id, payload)
         if action == "seller.refund.issue":
+            operated = await self._operated_seller_ids(principal_id)
+            try:
+                current = await self.commerce.get_order(resource_id)
+            except (KeyError, CommerceNotFound):
+                raise AgentGuardNotFound("Seller order not found") from None
+            if current["seller_id"] not in operated:
+                raise AgentGuardConflict("Seller does not own order")
             try:
                 return await self.commerce.issue_refund(
                     resource_id,
-                    seller_id=principal_id,
+                    seller_id=current["seller_id"],
                     amount_inr=amount_inr,
                     idempotency_key=idempotency_key,
                     correlation_id=correlation_id,

@@ -1012,6 +1012,70 @@ def test_same_principal_buyer_checkout_is_listed_on_seller_orders() -> None:
     assert detail.json()["data"]["order"]["order_id"] == order_id
 
 
+def test_staff_operator_lists_and_fetches_buyer_order() -> None:
+    from app.commerce_demo import invite_staff
+    from main import app as gateway_app
+
+    gateway_app.state.persistence_pool = None
+    merchant, merchant_id = _signed_in_client(
+        "ondcseller", "principal:auth0:merchant-loop"
+    )
+    operator, operator_id = _signed_in_client(
+        "ondcseller", "principal:auth0:hermes-loop"
+    )
+    stranger, _ = _signed_in_client("ondcseller", "principal:auth0:stranger-loop")
+    buyer, buyer_id = _signed_in_client("ondcbuyer", "principal:auth0:buyer-loop")
+    fixtures = TestClient(app)
+
+    store = merchant.put(
+        "/api/demo-commerce/seller/store",
+        json={"store_name": "Loop Store", "city": "Bengaluru", "pin": "560001"},
+    )
+    assert store.status_code == 200, store.text
+    invited = invite_staff(
+        merchant_id,
+        merchant_id,
+        {
+            "member_principal_id": operator_id,
+            "role": "manager",
+            "status": "active",
+        },
+    )
+    assert invited["member"]["member_principal_id"] == operator_id
+
+    item = fixtures.post(
+        "/api/demo-commerce/test-fixtures/seller/items",
+        json={
+            "title": "Sampoorna Whole Wheat Atta 1kg",
+            "price_inr": 89,
+            "inventory": 6,
+            "seller_id": merchant_id,
+        },
+    ).json()["data"]["item"]
+    fixtures.post(
+        f"/api/demo-commerce/test-fixtures/seller/items/{item['item_id']}/publish"
+    )
+    order = fixtures.post(
+        "/api/demo-commerce/test-fixtures/buyer/orders",
+        json={"item_id": item["item_id"], "quantity": 2, "buyer_id": buyer_id},
+    ).json()["data"]["order"]
+    order_id = order["order_id"]
+
+    for client in (merchant, operator):
+        listed = client.get("/api/demo-commerce/seller/orders")
+        assert listed.status_code == 200, listed.text
+        assert order_id in {row["order_id"] for row in listed.json()["data"]["orders"]}
+        detail = client.get(f"/api/demo-commerce/seller/orders/{order_id}")
+        assert detail.status_code == 200, detail.text
+        catalog = client.get("/api/demo-commerce/seller/items")
+        assert catalog.json()["data"]["count"] == 1
+
+    assert stranger.get("/api/demo-commerce/seller/orders").json()["data"]["count"] == 0
+    assert (
+        stranger.get(f"/api/demo-commerce/seller/orders/{order_id}").status_code == 404
+    )
+
+
 def test_seller_refund_over_limit_needs_approval_and_missing_order_is_not_executed() -> None:
     from main import app as gateway_app
 
