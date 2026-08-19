@@ -69,8 +69,12 @@ STAFF_PERMISSIONS = {
         "refund.issue",
     ),
     "manager": ("catalog.write", "order.write", "refund.issue"),
+    "fulfilment": ("catalog.read", "order.write"),
+    "support": ("catalog.read", "order.read"),
     "viewer": ("catalog.read", "order.read"),
 }
+
+ACTIVE_STAFF_STATUSES = frozenset({"active", "invited"})
 
 
 def staff_permissions_for(role: str) -> set[str]:
@@ -138,7 +142,9 @@ def normalize_staff_payload(
     if not member:
         raise CommerceValidation("member_principal_id is required")
     status = str(body.get("status") or "invited").strip().lower()
-    if status not in {"invited", "active", "disabled"}:
+    if status == "disabled":
+        status = "revoked"
+    if status not in {"invited", "active", "revoked"}:
         raise CommerceValidation("unsupported staff status")
     return {
         "seller_id": seller_id,
@@ -187,6 +193,33 @@ def evaluate_catalog_import_row(
         "delivery_estimate": str(row.get("delivery_estimate") or "").strip() or None,
         "return_policy": str(row.get("return_policy") or "").strip() or None,
     }, issues
+
+
+def shared_seller_ids_from_settings() -> list[str]:
+    from config import settings
+
+    raw = getattr(settings, "commerce_shared_seller_ids", "") or ""
+    return [part.strip() for part in str(raw).split(",") if part.strip()]
+
+
+def operated_seller_ids(
+    principal_id: str,
+    memberships: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+    *,
+    extra: list[str] | tuple[str, ...] = (),
+) -> list[str]:
+    """Session principal plus merchants this principal is staff of."""
+    ids: list[str] = []
+    for candidate in (
+        principal_id,
+        *extra,
+        *shared_seller_ids_from_settings(),
+        *(str(row.get("seller_id") or "") for row in memberships),
+    ):
+        text = str(candidate or "").strip()
+        if text and text not in ids:
+            ids.append(text)
+    return ids
 
 
 def empty_store(seller_id: str) -> dict[str, Any]:
@@ -956,12 +989,15 @@ class CommerceV1:
     ) -> dict[str, Any]:
         payload = normalize_store_payload(seller_id, body)
         async with UnitOfWork(self.pool) as unit_of_work:
-            row = await CommerceRepository(unit_of_work).upsert_store(payload)
+            repository = CommerceRepository(unit_of_work)
+            row = await repository.upsert_store(payload)
+            await repository.ensure_owner_staff(seller_id)
         return _jsonable(row)
 
     async def list_staff(self, seller_id: str) -> list[dict[str, Any]]:
-        del seller_id
-        return []
+        async with UnitOfWork(self.pool) as unit_of_work:
+            rows = await CommerceRepository(unit_of_work).list_staff(seller_id)
+        return [_jsonable(row) for row in rows]
 
     async def invite_staff(
         self,
@@ -970,8 +1006,16 @@ class CommerceV1:
         actor_principal_id: str,
         body: dict[str, Any],
     ) -> dict[str, Any]:
-        del seller_id, actor_principal_id, body
-        raise CommerceValidation("Staff invitations are not available yet.")
+        if actor_principal_id != seller_id:
+            raise CommerceValidation("Staff permission denied.")
+        payload = normalize_staff_payload(
+            seller_id, body, actor_principal_id=actor_principal_id
+        )
+        async with UnitOfWork(self.pool) as unit_of_work:
+            repository = CommerceRepository(unit_of_work)
+            await repository.ensure_owner_staff(seller_id)
+            row = await repository.upsert_staff_member(payload)
+        return _jsonable(row)
 
     async def update_staff(
         self,
@@ -981,14 +1025,47 @@ class CommerceV1:
         actor_principal_id: str,
         body: dict[str, Any],
     ) -> dict[str, Any]:
-        del seller_id, staff_id, actor_principal_id, body
-        raise CommerceValidation("Staff updates are not available yet.")
+        if actor_principal_id != seller_id:
+            raise CommerceValidation("Staff permission denied.")
+        async with UnitOfWork(self.pool) as unit_of_work:
+            repository = CommerceRepository(unit_of_work)
+            current = await repository.get_staff(seller_id, staff_id)
+            if current is None:
+                raise CommerceNotFound("Staff member not found")
+            if current.get("role") == "owner":
+                raise CommerceValidation("Cannot modify the store owner row")
+            merged = {
+                "member_principal_id": current["member_principal_id"],
+                "display_name": body.get("display_name", current.get("display_name")),
+                "email": body.get("email", current.get("email")),
+                "role": body.get("role", current.get("role")),
+                "status": body.get("status", current.get("status")),
+            }
+            payload = normalize_staff_payload(
+                seller_id, merged, actor_principal_id=actor_principal_id
+            )
+            row = await repository.upsert_staff_member(payload, staff_id=staff_id)
+        return _jsonable(row)
 
     async def find_staff_membership(
         self, member_principal_id: str
     ) -> dict[str, Any] | None:
-        del member_principal_id
-        return None
+        rows = await self.list_staff_memberships(member_principal_id)
+        non_owners = [row for row in rows if row.get("role") != "owner"]
+        return non_owners[0] if non_owners else None
+
+    async def list_staff_memberships(
+        self, member_principal_id: str
+    ) -> list[dict[str, Any]]:
+        async with UnitOfWork(self.pool) as unit_of_work:
+            rows = await CommerceRepository(unit_of_work).list_staff_memberships(
+                member_principal_id
+            )
+        return [_jsonable(row) for row in rows]
+
+    async def list_operated_seller_ids(self, principal_id: str) -> list[str]:
+        memberships = await self.list_staff_memberships(principal_id)
+        return operated_seller_ids(principal_id, memberships)
 
     async def _post_payment(
         self,
@@ -1018,11 +1095,14 @@ __all__ = [
     "CommerceV1",
     "CommerceValidation",
     "IdempotencyConflict",
+    "ACTIVE_STAFF_STATUSES",
     "empty_store",
     "evaluate_catalog_import_row",
     "normalize_staff_payload",
     "normalize_store_payload",
+    "operated_seller_ids",
     "owner_staff_row",
     "parse_catalog_csv",
+    "shared_seller_ids_from_settings",
     "staff_permissions_for",
 ]

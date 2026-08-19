@@ -6,6 +6,7 @@ durable CommerceV1 tables remain the only state owner in PostgreSQL mode.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -359,6 +360,9 @@ class CommerceCompatibilityAdapter:
         row = await self.commerce.find_staff_membership(member_principal_id)
         return self._staff(row)
 
+    async def list_operated_seller_ids(self, principal_id: str) -> list[str]:
+        return await self.commerce.list_operated_seller_ids(principal_id)
+
     async def import_catalog(
         self,
         seller_id: str,
@@ -464,14 +468,19 @@ class CommerceCompatibilityAdapter:
         self,
         *,
         seller_id: str | None = None,
+        seller_ids: Sequence[str] | None = None,
         query: str | None = None,
         published_only: bool = False,
     ) -> dict[str, Any]:
         clauses: list[str] = []
         parameters: list[Any] = []
-        if seller_id is not None:
+        allowed = [item for item in (*(seller_ids or ()), seller_id) if item]
+        if len(allowed) == 1:
             clauses.append("i.seller_id = %s")
-            parameters.append(seller_id)
+            parameters.append(allowed[0])
+        elif allowed:
+            clauses.append("i.seller_id = ANY(%s)")
+            parameters.append(allowed)
         if published_only:
             clauses.append("i.status = 'published'")
         if query and query.strip():
@@ -556,13 +565,18 @@ class CommerceCompatibilityAdapter:
         *,
         principal_id: str | None = None,
         seller_id: str | None = None,
+        seller_ids: Sequence[str] | None = None,
     ) -> dict[str, Any]:
+        allowed = [item for item in (*(seller_ids or ()), seller_id) if item]
         rows = await self._orders(
-            order_id=order_id, principal_id=principal_id, seller_id=seller_id
+            order_id=order_id, principal_id=principal_id
         )
         if len(rows) != 1:
             raise KeyError("order not found")
-        return self._order(rows[0])
+        order = self._order(rows[0])
+        if allowed and order.get("seller_id") not in allowed:
+            raise KeyError("order not found")
+        return order
 
     async def issue_refund(
         self,
@@ -583,12 +597,18 @@ class CommerceCompatibilityAdapter:
         )
 
     async def list_orders(
-        self, *, principal_id: str | None = None, seller_id: str | None = None
+        self,
+        *,
+        principal_id: str | None = None,
+        seller_id: str | None = None,
+        seller_ids: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         orders = [
             self._order(row)
             for row in await self._orders(
-                principal_id=principal_id, seller_id=seller_id
+                principal_id=principal_id,
+                seller_id=seller_id,
+                seller_ids=seller_ids,
             )
         ]
         return {"orders": orders, "count": len(orders)}
@@ -828,18 +848,24 @@ class CommerceCompatibilityAdapter:
         *,
         principal_id: str | None = None,
         seller_id: str | None = None,
+        seller_ids: Sequence[str] | None = None,
         order_id: str | None = None,
     ) -> dict[str, Any]:
         clauses: list[str] = []
         parameters: list[Any] = []
-        for column, value in (
-            ("principal_id", principal_id),
-            ("seller_id", seller_id),
-            ("order_id", UUID(order_id) if order_id else None),
-        ):
-            if value is not None:
-                clauses.append(f"{column} = %s")
-                parameters.append(value)
+        if principal_id is not None:
+            clauses.append("principal_id = %s")
+            parameters.append(principal_id)
+        allowed = [item for item in (*(seller_ids or ()), seller_id) if item]
+        if len(allowed) == 1:
+            clauses.append("seller_id = %s")
+            parameters.append(allowed[0])
+        elif allowed:
+            clauses.append("seller_id = ANY(%s)")
+            parameters.append(allowed)
+        if order_id:
+            clauses.append("order_id = %s")
+            parameters.append(UUID(order_id))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         async with UnitOfWork(self.pool) as unit_of_work:
             async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
@@ -856,18 +882,24 @@ class CommerceCompatibilityAdapter:
         *,
         principal_id: str | None = None,
         seller_id: str | None = None,
+        seller_ids: Sequence[str] | None = None,
         order_id: str | None = None,
     ) -> dict[str, Any]:
         clauses: list[str] = []
         parameters: list[Any] = []
-        for column, value in (
-            ("principal_id", principal_id),
-            ("seller_id", seller_id),
-            ("order_id", UUID(order_id) if order_id else None),
-        ):
-            if value is not None:
-                clauses.append(f"{column} = %s")
-                parameters.append(value)
+        if principal_id is not None:
+            clauses.append("issue.principal_id = %s")
+            parameters.append(principal_id)
+        allowed = [item for item in (*(seller_ids or ()), seller_id) if item]
+        if len(allowed) == 1:
+            clauses.append("issue.seller_id = %s")
+            parameters.append(allowed[0])
+        elif allowed:
+            clauses.append("issue.seller_id = ANY(%s)")
+            parameters.append(allowed)
+        if order_id:
+            clauses.append("issue.order_id = %s")
+            parameters.append(UUID(order_id))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         async with UnitOfWork(self.pool) as unit_of_work:
             async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
@@ -1086,6 +1118,7 @@ class CommerceCompatibilityAdapter:
         order_id: str | None = None,
         principal_id: str | None = None,
         seller_id: str | None = None,
+        seller_ids: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         parameters: list[Any] = []
@@ -1103,9 +1136,13 @@ class CommerceCompatibilityAdapter:
         if principal_id is not None:
             clauses.append("o.principal_id = %s")
             parameters.append(principal_id)
-        if seller_id is not None:
+        allowed = [item for item in (*(seller_ids or ()), seller_id) if item]
+        if len(allowed) == 1:
             clauses.append("o.seller_id = %s")
-            parameters.append(seller_id)
+            parameters.append(allowed[0])
+        elif allowed:
+            clauses.append("o.seller_id = ANY(%s)")
+            parameters.append(allowed)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         async with UnitOfWork(self.pool) as unit_of_work:
             async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:

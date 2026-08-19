@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from app import commerce_demo
 from app.commerce_compat import CommerceCompatibilityAdapter
-from app.commerce_v1 import CommerceValidation, empty_store
+from app.commerce_v1 import CommerceValidation, empty_store, operated_seller_ids
 from app.models import ApiResponse
 from app.persistence.connection import live_connection_pool
 from app.session_auth import SESSION_COOKIE_NAME, parse_session_token
@@ -38,15 +38,28 @@ def _compat(request: Request) -> CommerceCompatibilityAdapter | None:
     return CommerceCompatibilityAdapter(pool) if pool is not None else None
 
 
+async def _operated_seller_ids(request: Request, principal_id: str) -> list[str]:
+    compat = _compat(request)
+    if compat is not None:
+        return await compat.list_operated_seller_ids(principal_id)
+    return operated_seller_ids(
+        principal_id, commerce_demo.list_staff_memberships(principal_id)
+    )
+
+
 async def _owned_order(
     request: Request, order_id: str, principal_id: str, owner_field: str
 ) -> dict[str, Any]:
     compat = _compat(request)
+    if owner_field == "seller_id":
+        allowed = await _operated_seller_ids(request, principal_id)
+    else:
+        allowed = [principal_id]
     if compat is not None:
         filters = (
             {"principal_id": principal_id}
             if owner_field == "buyer_id"
-            else {"seller_id": principal_id}
+            else {"seller_ids": allowed}
         )
         try:
             return {"order": await compat.get_order(order_id, **filters)}
@@ -57,7 +70,7 @@ async def _owned_order(
     except Exception as exc:
         _handle_error(exc)
     order = result["order"]
-    if order.get(owner_field) != principal_id:
+    if order.get(owner_field) not in allowed:
         raise HTTPException(status_code=404, detail="Order not found.")
     return result
 
@@ -65,15 +78,21 @@ async def _owned_order(
 async def _owned_item(
     request: Request, item_id: str, principal_id: str
 ) -> dict[str, Any]:
+    allowed = await _operated_seller_ids(request, principal_id)
     compat = _compat(request)
     if compat is not None:
-        item = await compat.get_item(item_id, seller_id=principal_id)
+        try:
+            item = await compat.get_item(item_id)
+        except Exception as exc:
+            _handle_error(exc)
+        if item.get("seller_id") not in allowed:
+            raise HTTPException(status_code=404, detail="Item not found.")
         return {"item": item, "inventory": item["inventory"]}
     try:
         result = commerce_demo.get_item(item_id)
     except Exception as exc:
         _handle_error(exc)
-    if result["item"].get("seller_id") != principal_id:
+    if result["item"].get("seller_id") not in allowed:
         raise HTTPException(status_code=404, detail="Item not found.")
     return result
 
@@ -146,7 +165,10 @@ def _idem(body_key: Optional[str], header_key: Optional[str]) -> Optional[str]:
 
 def _handle_error(exc: Exception) -> None:
     if isinstance(exc, KeyError):
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        detail = exc.args[0] if exc.args else "not found"
+        if not isinstance(detail, str):
+            detail = str(detail)
+        raise HTTPException(status_code=404, detail=detail) from exc
     if isinstance(exc, CommerceValidation):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if isinstance(exc, ValueError):
@@ -272,11 +294,12 @@ async def get_item(item_id: str, request: Request) -> ApiResponse:
 @router.get("/seller/items", response_model=ApiResponse)
 async def list_seller_items(request: Request) -> ApiResponse:
     principal_id = _session_principal(request, "ondcseller")
+    allowed = await _operated_seller_ids(request, principal_id)
     compat = _compat(request)
     data = (
-        await compat.list_items(seller_id=principal_id)
+        await compat.list_items(seller_ids=allowed)
         if compat is not None
-        else commerce_demo.list_seller_items(principal_id)
+        else commerce_demo.list_seller_items(seller_ids=allowed)
     )
     return ApiResponse(success=True, message="Items", data=data)
 
@@ -360,11 +383,12 @@ async def get_buyer_order(order_id: str, request: Request) -> ApiResponse:
 @router.get("/seller/orders", response_model=ApiResponse)
 async def list_seller_orders(request: Request) -> ApiResponse:
     principal_id = _session_principal(request, "ondcseller")
+    allowed = await _operated_seller_ids(request, principal_id)
     compat = _compat(request)
     data = (
-        await compat.list_orders(seller_id=principal_id)
+        await compat.list_orders(seller_ids=allowed)
         if compat is not None
-        else commerce_demo.list_seller_orders(principal_id)
+        else commerce_demo.list_seller_orders(seller_ids=allowed)
     )
     return ApiResponse(success=True, message="Orders", data=data)
 
@@ -481,18 +505,19 @@ async def list_buyer_issues(
 @router.get("/seller/issues", response_model=ApiResponse)
 async def list_seller_issues(request: Request) -> ApiResponse:
     principal_id = _session_principal(request, "ondcseller")
+    allowed = await _operated_seller_ids(request, principal_id)
     compat = _compat(request)
     if compat is not None:
         return ApiResponse(
             success=True,
             message="Issues",
-            data=await compat.list_issues(seller_id=principal_id),
+            data=await compat.list_issues(seller_ids=allowed),
         )
     rows = [
         issue
         for issue in commerce_demo.list_seller_issues()["issues"]
         if commerce_demo.get_order(str(issue["order_id"]))["order"].get("seller_id")
-        == principal_id
+        in allowed
     ]
     return ApiResponse(
         success=True, message="Issues", data={"issues": rows, "count": len(rows)}
@@ -518,11 +543,12 @@ async def list_seller_returns(
     request: Request, order_id: Optional[str] = None
 ) -> ApiResponse:
     principal_id = _session_principal(request, "ondcseller")
+    allowed = await _operated_seller_ids(request, principal_id)
     compat = _compat(request)
     data = (
-        await compat.list_returns(seller_id=principal_id, order_id=order_id)
+        await compat.list_returns(seller_ids=allowed, order_id=order_id)
         if compat is not None
-        else commerce_demo.list_returns(seller_id=principal_id, order_id=order_id)
+        else commerce_demo.list_returns(seller_ids=allowed, order_id=order_id)
     )
     return ApiResponse(success=True, message="Returns", data=data)
 
