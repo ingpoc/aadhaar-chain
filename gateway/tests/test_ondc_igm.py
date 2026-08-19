@@ -35,6 +35,7 @@ def _enable_retail_igm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "data_dir", str(tmp_path / "data"))
+    monkeypatch.setattr(settings, "aadhaar_chain_env", "demo")
     monkeypatch.setattr(settings, "ondc_enabled", True)
     monkeypatch.setattr(settings, "ondc_subscriber_id", "ondcbuyer.aadharcha.in")
     monkeypatch.setattr(settings, "ondc_bap_id", "ondcbuyer.aadharcha.in")
@@ -60,19 +61,28 @@ def _enable_retail_igm(
 
 
 def _create_local_issue(client: TestClient) -> dict[str, str]:
-    item = client.post(
+    created_item = client.post(
         "/api/demo-commerce/test-fixtures/seller/items",
         json={"title": "IGM item", "price_inr": 50, "inventory": 1},
-    ).json()["data"]["item"]
+    )
+    item_body = created_item.json()
+    assert created_item.status_code == 200, item_body
+    item = item_body["data"]["item"]
     client.post(f"/api/demo-commerce/test-fixtures/seller/items/{item['item_id']}/publish")
-    order = client.post(
+    created_order = client.post(
         "/api/demo-commerce/test-fixtures/buyer/orders",
         json={"item_id": item["item_id"], "quantity": 1, "buyer_id": "igm-buyer"},
-    ).json()["data"]["order"]
-    issue = client.post(
+    )
+    order_body = created_order.json()
+    assert created_order.status_code == 200, order_body
+    order = order_body["data"]["order"]
+    created_issue = client.post(
         f"/api/demo-commerce/test-fixtures/buyer/orders/{order['order_id']}/issues",
         json={"reason": "fulfillment", "description": "Package stalled"},
-    ).json()["data"]["issue"]
+    )
+    issue_body = created_issue.json()
+    assert created_issue.status_code == 200, issue_body
+    issue = issue_body["data"]["issue"]
     return {
         "order_id": order["order_id"],
         "issue_id": issue["issue_id"],

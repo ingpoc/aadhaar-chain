@@ -11,6 +11,7 @@ from app import commerce_demo
 from app.commerce_compat import CommerceCompatibilityAdapter
 from app.commerce_v1 import CommerceValidation, empty_store
 from app.models import ApiResponse
+from app.persistence.connection import live_connection_pool
 from app.session_auth import SESSION_COOKIE_NAME, parse_session_token
 from config import get_runtime_mode
 
@@ -33,7 +34,7 @@ def _session_principal(request: Request, audience: str) -> str:
 
 
 def _compat(request: Request) -> CommerceCompatibilityAdapter | None:
-    pool = getattr(request.app.state, "persistence_pool", None)
+    pool = live_connection_pool(getattr(request.app.state, "persistence_pool", None))
     return CommerceCompatibilityAdapter(pool) if pool is not None else None
 
 
