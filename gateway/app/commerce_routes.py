@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from app import commerce_demo
 from app.commerce_compat import CommerceCompatibilityAdapter
+from app.commerce_v1 import CommerceValidation, empty_store
 from app.models import ApiResponse
 from app.session_auth import SESSION_COOKIE_NAME, parse_session_token
 from config import get_runtime_mode
@@ -126,6 +127,18 @@ class IssueBody(BaseModel):
     description: Optional[str] = None
 
 
+class StoreBody(BaseModel):
+    store_name: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    pin: Optional[str] = None
+    pincode: Optional[str] = None
+    serviceability_tokens: Optional[Any] = None
+    fulfilment_sla_hours: Optional[int] = None
+    return_window_days: Optional[int] = None
+    support_hours: Optional[str] = None
+
+
 def _idem(body_key: Optional[str], header_key: Optional[str]) -> Optional[str]:
     return body_key or header_key
 
@@ -133,6 +146,8 @@ def _idem(body_key: Optional[str], header_key: Optional[str]) -> Optional[str]:
 def _handle_error(exc: Exception) -> None:
     if isinstance(exc, KeyError):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if isinstance(exc, CommerceValidation):
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if isinstance(exc, ValueError):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     raise exc
@@ -263,6 +278,33 @@ async def list_seller_items(request: Request) -> ApiResponse:
         else commerce_demo.list_seller_items(principal_id)
     )
     return ApiResponse(success=True, message="Items", data=data)
+
+
+@router.get("/seller/store", response_model=ApiResponse)
+async def get_seller_store(request: Request) -> ApiResponse:
+    principal_id = _session_principal(request, "ondcseller")
+    compat = _compat(request)
+    if compat is not None:
+        store = await compat.get_store_or_empty(principal_id)
+    else:
+        store = commerce_demo.get_store(principal_id) or empty_store(principal_id)
+    return ApiResponse(success=True, message="Store", data={"store": store})
+
+
+@router.put("/seller/store", response_model=ApiResponse)
+async def put_seller_store(request: Request, body: StoreBody) -> ApiResponse:
+    principal_id = _session_principal(request, "ondcseller")
+    payload = body.model_dump(exclude_none=True)
+    compat = _compat(request)
+    try:
+        result = (
+            await compat.upsert_store(principal_id, payload)
+            if compat is not None
+            else commerce_demo.upsert_store(principal_id, payload)
+        )
+    except Exception as exc:
+        _handle_error(exc)
+    return ApiResponse(success=True, message="Store saved", data=result)
 
 
 @router.get("/seller/items/{item_id}", response_model=ApiResponse)

@@ -881,3 +881,276 @@ def test_buyer_accepts_local_remedy_by_issue_contract() -> None:
 
     assert accepted["remedy"]["status"] == "accepted"
     assert accepted["issue"]["status"] == "closed"
+
+
+def test_order_short_id_is_a_hex_prefix_not_a_uuid() -> None:
+    from app.commerce_compat import _as_uuid, _order_hex_prefix
+
+    assert _as_uuid("7BA6FE24") is None
+    assert _order_hex_prefix("7BA6FE24") == "7ba6fe24"
+    assert _order_hex_prefix("B5091e6b53") == "b5091e6b53"
+    assert _order_hex_prefix("order_missing") is None
+
+
+def _execute(
+    client,
+    *,
+    action: str,
+    resource_id: str,
+    amount_inr: int,
+    payload: dict,
+    key: str,
+    approval_id: str | None = None,
+    correlation: str | None = None,
+):
+    body = {
+        "action": action,
+        "amount_inr": amount_inr,
+        "resource_id": resource_id,
+        "payload": payload,
+        "idempotency_key": key,
+    }
+    if approval_id:
+        body["approval_id"] = approval_id
+    correlation_id = correlation or f"corr:{key}"
+    return client.post(
+        "/api/agentguard/actions/execute",
+        headers={"Idempotency-Key": key, "X-Correlation-ID": correlation_id},
+        json=body,
+    )
+
+
+def test_seller_store_get_empty_is_200_not_404() -> None:
+    from main import app as gateway_app
+
+    gateway_app.state.persistence_pool = None
+    seller, _principal = _signed_in_client(
+        "ondcseller", "principal:auth0:store-empty"
+    )
+    missing = seller.get("/api/demo-commerce/seller/store")
+    assert missing.status_code == 200, missing.text
+    store = missing.json()["data"]["store"]
+    assert store["status"] == "draft"
+    assert store["setup_required"] is True
+    assert store["store_name"] == ""
+
+    saved = seller.put(
+        "/api/demo-commerce/seller/store",
+        json={
+            "store_name": "Sampoorna Groceries",
+            "city": "Bengaluru",
+            "pin": "560001",
+            "fulfilment_sla_hours": 24,
+            "return_window_days": 7,
+            "serviceability_tokens": ["560001"],
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["data"]["store"]["status"] == "ready"
+    loaded = seller.get("/api/demo-commerce/seller/store")
+    assert loaded.status_code == 200
+    assert loaded.json()["data"]["store"]["store_name"] == "Sampoorna Groceries"
+    assert loaded.json()["data"]["store"]["fulfilment_sla_hours"] == 24
+
+
+def test_same_principal_buyer_checkout_is_listed_on_seller_orders() -> None:
+    from main import app as gateway_app
+
+    gateway_app.state.persistence_pool = None
+    principal = "principal:auth0:two-sided-loop"
+    seller, seller_id = _signed_in_client("ondcseller", principal)
+    buyer, buyer_id = _signed_in_client("ondcbuyer", principal)
+    assert seller_id == buyer_id == principal
+
+    assert seller.post("/api/agentguard/agents/ensure", json={"role": "seller"}).status_code == 200
+    assert buyer.post("/api/agentguard/agents/ensure", json={"role": "buyer"}).status_code == 200
+    store = seller.put(
+        "/api/demo-commerce/seller/store",
+        json={"store_name": "Loop Store", "city": "Bengaluru", "pin": "560001"},
+    )
+    assert store.status_code == 200, store.text
+
+    item_id = "loop-atta-1kg"
+    published = _execute(
+        seller,
+        action="seller.catalog.publish",
+        resource_id=item_id,
+        amount_inr=0,
+        payload={
+            "title": "Sampoorna Whole Wheat Atta 1kg",
+            "price_inr": 89,
+            "inventory": 6,
+            "seller_name": "Sampoorna Groceries",
+        },
+        key="loop-publish",
+    )
+    assert published.status_code == 200, published.text
+    assert published.json()["data"]["decision"] == "allow"
+    item_id = published.json()["data"]["result"]["item"]["item_id"]
+
+    checkout = _execute(
+        buyer,
+        action="buyer.checkout.commit",
+        resource_id=item_id,
+        amount_inr=178,
+        payload={"item_id": item_id, "quantity": 2, "amount_inr": 178},
+        key="loop-checkout",
+    )
+    assert checkout.status_code == 200, checkout.text
+    assert checkout.json()["data"]["decision"] == "allow"
+    order = checkout.json()["data"]["result"]["order"]
+    order_id = order["order_id"]
+    assert order["seller_id"] == principal
+    assert order["buyer_id"] == principal
+
+    listed = seller.get("/api/demo-commerce/seller/orders")
+    assert listed.status_code == 200, listed.text
+    seller_orders = listed.json()["data"]["orders"]
+    assert order_id in {row["order_id"] for row in seller_orders}
+    detail = seller.get(f"/api/demo-commerce/seller/orders/{order_id}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["data"]["order"]["order_id"] == order_id
+
+
+def test_seller_refund_over_limit_needs_approval_and_missing_order_is_not_executed() -> None:
+    from main import app as gateway_app
+
+    gateway_app.state.persistence_pool = None
+    principal = "principal:auth0:refund-guard"
+    seller, _ = _signed_in_client("ondcseller", principal)
+    buyer, _ = _signed_in_client("ondcbuyer", principal)
+    seller.post("/api/agentguard/agents/ensure", json={"role": "seller"})
+    buyer.post("/api/agentguard/agents/ensure", json={"role": "buyer"})
+    assert (
+        seller.put(
+            "/api/demo-commerce/seller/store",
+            json={"store_name": "Refund Store", "city": "Pune", "pin": "411001"},
+        ).status_code
+        == 200
+    )
+
+    item_id = "refund-guard-atta"
+    published = _execute(
+        seller,
+        action="seller.catalog.publish",
+        resource_id=item_id,
+        amount_inr=0,
+        payload={
+            "title": "Refund Atta 1kg",
+            "price_inr": 8000,
+            "inventory": 2,
+            "seller_name": "Refund Store",
+        },
+        key="refund-guard-publish",
+    )
+    assert published.status_code == 200, published.text
+    item_id = published.json()["data"]["result"]["item"]["item_id"]
+    checkout = _execute(
+        buyer,
+        action="buyer.checkout.commit",
+        resource_id=item_id,
+        amount_inr=8000,
+        payload={"item_id": item_id, "quantity": 1, "amount_inr": 8000},
+        key="refund-guard-checkout",
+    )
+    assert checkout.status_code == 200, checkout.text
+    order_id = checkout.json()["data"]["result"]["order"]["order_id"]
+
+    over_missing = _execute(
+        seller,
+        action="seller.refund.issue",
+        resource_id="7BA6FE24",
+        amount_inr=9000,
+        payload={"order_id": "7BA6FE24"},
+        key="refund-guard-over-missing",
+    )
+    assert over_missing.status_code == 200, over_missing.text
+    over_data = over_missing.json()["data"]
+    assert over_data["decision"] == "need_approval"
+    assert over_data.get("reason_code") == "approval_required_amount"
+    assert over_data.get("result") in (None, {})
+
+    over_real = _execute(
+        seller,
+        action="seller.refund.issue",
+        resource_id=order_id,
+        amount_inr=6000,
+        payload={"order_id": order_id},
+        key="refund-guard-over-real",
+    )
+    assert over_real.status_code == 200, over_real.text
+    over_real_data = over_real.json()["data"]
+    assert over_real_data["decision"] == "need_approval"
+    assert seller.get(f"/api/demo-commerce/seller/orders/{order_id}").json()["data"][
+        "order"
+    ].get("refunded_amount_inr", 0) in (0, None)
+
+    approved = _execute(
+        seller,
+        action="seller.refund.issue",
+        resource_id=order_id,
+        amount_inr=6000,
+        payload={"order_id": order_id},
+        key="refund-guard-over-approved",
+        approval_id=over_real_data["approval"]["approval_id"],
+        correlation="corr:refund-guard-over-real",
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["data"]["decision"] == "allow"
+    replay = _execute(
+        seller,
+        action="seller.refund.issue",
+        resource_id=order_id,
+        amount_inr=6000,
+        payload={"order_id": order_id},
+        key="refund-guard-over-approved",
+        approval_id=over_real_data["approval"]["approval_id"],
+    )
+    assert replay.status_code in {200, 409}
+
+    missing = _execute(
+        seller,
+        action="seller.refund.issue",
+        resource_id="order_does_not_exist",
+        amount_inr=1000,
+        payload={"order_id": "order_does_not_exist"},
+        key="refund-guard-missing",
+    )
+    assert missing.status_code == 200, missing.text
+    missing_data = missing.json()["data"]
+    assert missing_data["decision"] == "deny"
+    assert missing_data["reason_code"] == "resource_not_found"
+    assert missing_data.get("result") is None
+    assert missing_data["receipt"]["outcome"] == "denied"
+
+    activity = seller.get("/api/agentguard/agents/current", params={"role": "seller"})
+    assert activity.status_code == 200, activity.text
+    receipts = activity.json()["data"]["receipts"]
+    refund_receipts = [
+        row for row in receipts if row.get("action") == "seller.refund.issue"
+    ]
+    assert any(row.get("outcome") == "denied" for row in refund_receipts)
+
+    agent_id = activity.json()["data"]["agent"]["agent_id"]
+    assert seller.post(f"/api/agentguard/agents/{agent_id}/pause", json={}).status_code == 200
+    paused = _execute(
+        seller,
+        action="seller.refund.issue",
+        resource_id=order_id,
+        amount_inr=100,
+        payload={"order_id": order_id},
+        key="refund-guard-paused",
+    )
+    assert paused.status_code == 200, paused.text
+    paused_data = paused.json()["data"]
+    assert paused_data["decision"] == "deny"
+    assert paused_data["receipt"]["outcome"] == "paused"
+    activity_after = seller.get(
+        "/api/agentguard/agents/current", params={"role": "seller"}
+    )
+    pause_receipts = [
+        row
+        for row in activity_after.json()["data"]["receipts"]
+        if row.get("action") == "seller.refund.issue" and row.get("outcome") == "paused"
+    ]
+    assert pause_receipts

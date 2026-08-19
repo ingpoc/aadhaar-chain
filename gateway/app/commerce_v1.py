@@ -7,7 +7,9 @@ separate durable operations.
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -56,6 +58,154 @@ def _jsonable(value: Any) -> Any:
 def _request_hash(payload: dict[str, Any]) -> str:
     encoded = json.dumps(_jsonable(payload), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+STAFF_PERMISSIONS = {
+    "owner": (
+        "store.write",
+        "staff.manage",
+        "catalog.write",
+        "order.write",
+        "refund.issue",
+    ),
+    "manager": ("catalog.write", "order.write", "refund.issue"),
+    "viewer": ("catalog.read", "order.read"),
+}
+
+
+def staff_permissions_for(role: str) -> set[str]:
+    return set(STAFF_PERMISSIONS.get(str(role or "viewer"), STAFF_PERMISSIONS["viewer"]))
+
+
+def owner_staff_row(seller_id: str) -> dict[str, Any]:
+    digest = hashlib.sha256(seller_id.encode("utf-8")).hexdigest()[:16]
+    return {
+        "staff_id": f"staff_owner_{digest}",
+        "seller_id": seller_id,
+        "member_principal_id": seller_id,
+        "display_name": "Store owner",
+        "email": "",
+        "role": "owner",
+        "status": "active",
+        "version": 1,
+    }
+
+
+def normalize_store_payload(seller_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Validate Seller /business fields. Empty store is a draft, not an error."""
+    tokens = body.get("serviceability_tokens") or []
+    if isinstance(tokens, str):
+        tokens = [token.strip() for token in tokens.split(",") if token.strip()]
+    elif not isinstance(tokens, list):
+        tokens = []
+    sla = body.get("fulfilment_sla_hours")
+    returns = body.get("return_window_days")
+    sla_hours = None if sla in (None, "") else int(sla)
+    return_days = None if returns in (None, "") else int(returns)
+    if sla_hours is not None and not 1 <= sla_hours <= 72:
+        raise CommerceValidation("fulfilment SLA must be between 1 and 72 hours")
+    if return_days is not None and not 0 <= return_days <= 30:
+        raise CommerceValidation("return window must be between 0 and 30 days")
+    store_name = str(body.get("store_name") or "").strip()
+    city = str(body.get("city") or "").strip()
+    pin = str(body.get("pin") or body.get("pincode") or "").strip()
+    ready = bool(store_name and city and pin)
+    return {
+        "seller_id": seller_id,
+        "store_name": store_name,
+        "city": city,
+        "state": str(body.get("state") or "").strip(),
+        "pin": pin,
+        "serviceability_tokens": [str(token).strip() for token in tokens if str(token).strip()],
+        "fulfilment_sla_hours": sla_hours,
+        "return_window_days": return_days,
+        "support_hours": str(body.get("support_hours") or "").strip(),
+        "status": "ready" if ready else "draft",
+    }
+
+
+def normalize_staff_payload(
+    seller_id: str,
+    body: dict[str, Any],
+    *,
+    actor_principal_id: str,
+) -> dict[str, Any]:
+    del actor_principal_id
+    role = str(body.get("role") or "viewer").strip().lower()
+    if role not in STAFF_PERMISSIONS:
+        raise CommerceValidation("unsupported staff role")
+    member = str(body.get("member_principal_id") or "").strip()
+    if not member:
+        raise CommerceValidation("member_principal_id is required")
+    status = str(body.get("status") or "invited").strip().lower()
+    if status not in {"invited", "active", "disabled"}:
+        raise CommerceValidation("unsupported staff status")
+    return {
+        "seller_id": seller_id,
+        "member_principal_id": member,
+        "display_name": str(body.get("display_name") or "").strip(),
+        "email": str(body.get("email") or "").strip(),
+        "role": role,
+        "status": status,
+    }
+
+
+def parse_catalog_csv(csv_text: str) -> list[dict[str, Any]]:
+    reader = csv.DictReader(io.StringIO(csv_text))
+    return [dict(row) for row in reader]
+
+
+def evaluate_catalog_import_row(
+    row: dict[str, Any], *, index: int
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    title = str(row.get("title") or row.get("name") or "").strip()
+    issues: list[dict[str, Any]] = []
+    if not title:
+        issues.append({"row": index, "field": "title", "message": "title is required"})
+        return None, issues
+    try:
+        price_inr = int(row.get("price_inr") or 0)
+        inventory = int(row.get("inventory") or row.get("quantity") or 0)
+    except (TypeError, ValueError):
+        issues.append(
+            {"row": index, "field": "price_inr", "message": "price and inventory must be integers"}
+        )
+        return None, issues
+    if price_inr < 0 or inventory < 0:
+        issues.append(
+            {"row": index, "field": "price_inr", "message": "price and inventory must be non-negative"}
+        )
+        return None, issues
+    return {
+        "item_id": str(row.get("item_id") or row.get("sku") or "").strip() or None,
+        "title": title,
+        "description": str(row.get("description") or "").strip(),
+        "price_inr": price_inr,
+        "inventory": inventory,
+        "seller_name": str(row.get("seller_name") or "").strip() or None,
+        "category_id": str(row.get("category_id") or "").strip() or None,
+        "delivery_estimate": str(row.get("delivery_estimate") or "").strip() or None,
+        "return_policy": str(row.get("return_policy") or "").strip() or None,
+    }, issues
+
+
+def empty_store(seller_id: str) -> dict[str, Any]:
+    return {
+        "seller_id": seller_id,
+        "store_name": "",
+        "city": "",
+        "state": "",
+        "pin": "",
+        "serviceability_tokens": [],
+        "fulfilment_sla_hours": None,
+        "return_window_days": None,
+        "support_hours": "",
+        "status": "draft",
+        "setup_required": True,
+        "version": 0,
+        "created_at": None,
+        "updated_at": None,
+    }
 
 
 class CommerceV1:
@@ -747,7 +897,10 @@ class CommerceV1:
             raise CommerceValidation("refund amount must be positive")
         if not idempotency_key or not correlation_id:
             raise CommerceValidation("refund idempotency and correlation are required")
-        order_uuid = UUID(str(order_id))
+        try:
+            order_uuid = UUID(str(order_id))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise CommerceNotFound("order not found") from exc
         async with UnitOfWork(self.pool) as unit_of_work:
             repository = CommerceRepository(unit_of_work)
             try:
@@ -794,6 +947,49 @@ class CommerceV1:
                 raise CommerceConflict(str(exc)) from exc
         return _jsonable({"refund": refund, "order": order})
 
+    async def get_store(self, seller_id: str) -> dict[str, Any] | None:
+        async with UnitOfWork(self.pool) as unit_of_work:
+            return await CommerceRepository(unit_of_work).get_store(seller_id)
+
+    async def upsert_store(
+        self, *, seller_id: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        payload = normalize_store_payload(seller_id, body)
+        async with UnitOfWork(self.pool) as unit_of_work:
+            row = await CommerceRepository(unit_of_work).upsert_store(payload)
+        return _jsonable(row)
+
+    async def list_staff(self, seller_id: str) -> list[dict[str, Any]]:
+        del seller_id
+        return []
+
+    async def invite_staff(
+        self,
+        *,
+        seller_id: str,
+        actor_principal_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        del seller_id, actor_principal_id, body
+        raise CommerceValidation("Staff invitations are not available yet.")
+
+    async def update_staff(
+        self,
+        *,
+        seller_id: str,
+        staff_id: str,
+        actor_principal_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        del seller_id, staff_id, actor_principal_id, body
+        raise CommerceValidation("Staff updates are not available yet.")
+
+    async def find_staff_membership(
+        self, member_principal_id: str
+    ) -> dict[str, Any] | None:
+        del member_principal_id
+        return None
+
     async def _post_payment(
         self,
         repository: CommerceRepository,
@@ -822,4 +1018,11 @@ __all__ = [
     "CommerceV1",
     "CommerceValidation",
     "IdempotencyConflict",
+    "empty_store",
+    "evaluate_catalog_import_row",
+    "normalize_staff_payload",
+    "normalize_store_payload",
+    "owner_staff_row",
+    "parse_catalog_csv",
+    "staff_permissions_for",
 ]

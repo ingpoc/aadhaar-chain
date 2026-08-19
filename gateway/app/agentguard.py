@@ -1136,6 +1136,32 @@ def execute_action(
             actor=actor,
         )
         if decision["decision"] != "allow":
+            if (
+                normalized == "seller.refund.issue"
+                and decision["decision"] == "deny"
+                and not decision.get("receipt")
+            ):
+                agent = AgentRecord.model_validate(decision["agent"])
+                mandate = MandateRecord.model_validate(decision["mandate"])
+                receipt = _write_receipt(
+                    principal_id=principal_id or agent.principal_id,
+                    wallet_address=wallet_address or agent.wallet_address,
+                    agent_id=agent.agent_id,
+                    policy_id=agent.policy_id,
+                    mandate_id=mandate.mandate_id,
+                    mandate_version=mandate.version,
+                    action=normalized,
+                    amount_inr=amount_inr,
+                    resource_id=resource_id,
+                    outcome=(
+                        "paused"
+                        if decision.get("reason_code") == "agent_paused"
+                        else "denied"
+                    ),
+                    reason_code=decision.get("reason_code"),
+                    request_hash=decision.get("request_hash"),
+                )
+                decision = {**decision, "receipt": receipt.model_dump()}
             return decision
         agent = AgentRecord.model_validate(decision["agent"])
         mandate = MandateRecord.model_validate(decision["mandate"])
@@ -1152,7 +1178,43 @@ def execute_action(
         "idempotency_key": idempotency_key or request_hash or uuid.uuid4().hex,
         "payload": payload or {},
     }
-    result = _EXECUTORS[normalized](context)
+    try:
+        result = _EXECUTORS[normalized](context)
+    except KeyError:
+        if normalized != "seller.refund.issue":
+            raise
+        receipt = _write_receipt(
+            principal_id=principal_id or "",
+            wallet_address=context["wallet_address"],
+            agent_id=agent.agent_id if agent else "",
+            policy_id=agent.policy_id if agent else None,
+            mandate_id=mandate.mandate_id if mandate else None,
+            mandate_version=mandate.version if mandate else None,
+            action=normalized,
+            amount_inr=amount_inr,
+            resource_id=resource_id,
+            outcome="denied",
+            reason_code="resource_not_found",
+            approval_id=approval_id,
+            request_hash=request_hash,
+        )
+        reason = "Seller order not found"
+        return {
+            **_decision_v2_fields(
+                decision="deny",
+                reason_code="resource_not_found",
+                action=normalized,
+                human_reason=reason,
+                policy_id=agent.policy_id or "agentguard.system",
+                policy_version=mandate.version if mandate else 1,
+            ),
+            "decision": "deny",
+            "reason": reason,
+            "reason_code": "resource_not_found",
+            "human_reason": reason,
+            "result": None,
+            "receipt": receipt.model_dump(),
+        }
     receipt = _write_receipt(
         principal_id=principal_id or "",
         wallet_address=context["wallet_address"],

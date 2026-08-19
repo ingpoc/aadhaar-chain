@@ -607,6 +607,54 @@ class CommerceRepository:
             raise RuntimeError("stale refund transition")
         return refund
 
+    async def get_store(self, seller_id: str) -> dict[str, Any] | None:
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                "SELECT * FROM commerce_seller_stores WHERE seller_id = %s",
+                (seller_id,),
+            )
+            return await cursor.fetchone()
+
+    async def upsert_store(self, payload: dict[str, Any]) -> dict[str, Any]:
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO commerce_seller_stores (
+                    seller_id, store_name, city, state, pin, serviceability_tokens,
+                    fulfilment_sla_hours, return_window_days, support_hours, status
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (seller_id) DO UPDATE SET
+                    store_name = EXCLUDED.store_name,
+                    city = EXCLUDED.city,
+                    state = EXCLUDED.state,
+                    pin = EXCLUDED.pin,
+                    serviceability_tokens = EXCLUDED.serviceability_tokens,
+                    fulfilment_sla_hours = EXCLUDED.fulfilment_sla_hours,
+                    return_window_days = EXCLUDED.return_window_days,
+                    support_hours = EXCLUDED.support_hours,
+                    status = EXCLUDED.status,
+                    version = commerce_seller_stores.version + 1,
+                    updated_at = NOW()
+                RETURNING *
+                """,
+                (
+                    payload["seller_id"],
+                    payload["store_name"],
+                    payload["city"],
+                    payload["state"],
+                    payload["pin"],
+                    Jsonb(payload["serviceability_tokens"]),
+                    payload["fulfilment_sla_hours"],
+                    payload["return_window_days"],
+                    payload["support_hours"],
+                    payload["status"],
+                ),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError("store upsert returned no row")
+        return row
+
     async def _dict_row(
         self,
         table: str,
