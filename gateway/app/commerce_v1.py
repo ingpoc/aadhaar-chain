@@ -95,13 +95,20 @@ def owner_staff_row(seller_id: str) -> dict[str, Any]:
     }
 
 
-def normalize_store_payload(seller_id: str, body: dict[str, Any]) -> dict[str, Any]:
-    """Validate Seller /business fields. Empty store is a draft, not an error."""
-    tokens = body.get("serviceability_tokens") or []
+def _serviceability_tokens(body: dict[str, Any]) -> list[str]:
+    tokens = body.get("serviceability_tokens")
+    if tokens in (None, ""):
+        tokens = body.get("serviceability") or []
     if isinstance(tokens, str):
         tokens = [token.strip() for token in tokens.split(",") if token.strip()]
     elif not isinstance(tokens, list):
         tokens = []
+    return [str(token).strip() for token in tokens if str(token).strip()]
+
+
+def normalize_store_payload(seller_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Validate Seller /business fields. Empty store is a draft, not an error."""
+    tokens = _serviceability_tokens(body)
     sla = body.get("fulfilment_sla_hours")
     returns = body.get("return_window_days")
     sla_hours = None if sla in (None, "") else int(sla)
@@ -113,18 +120,25 @@ def normalize_store_payload(seller_id: str, body: dict[str, Any]) -> dict[str, A
     store_name = str(body.get("store_name") or "").strip()
     city = str(body.get("city") or "").strip()
     pin = str(body.get("pin") or body.get("pincode") or "").strip()
-    ready = bool(store_name and city and pin)
+    fields_complete = bool(store_name and city and pin)
+    # Seller UI sends complete=false for Save draft and complete=true for Open store.
+    if body.get("complete") is False:
+        status = "draft"
+    elif fields_complete:
+        status = "ready"
+    else:
+        status = "draft"
     return {
         "seller_id": seller_id,
         "store_name": store_name,
         "city": city,
         "state": str(body.get("state") or "").strip(),
         "pin": pin,
-        "serviceability_tokens": [str(token).strip() for token in tokens if str(token).strip()],
+        "serviceability_tokens": tokens,
         "fulfilment_sla_hours": sla_hours,
         "return_window_days": return_days,
         "support_hours": str(body.get("support_hours") or "").strip(),
-        "status": "ready" if ready else "draft",
+        "status": status,
     }
 
 

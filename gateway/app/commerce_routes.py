@@ -153,14 +153,24 @@ class StoreBody(BaseModel):
     state: Optional[str] = None
     pin: Optional[str] = None
     pincode: Optional[str] = None
+    serviceability: Optional[Any] = None
     serviceability_tokens: Optional[Any] = None
     fulfilment_sla_hours: Optional[int] = None
     return_window_days: Optional[int] = None
     support_hours: Optional[str] = None
+    complete: Optional[bool] = None
 
 
 def _idem(body_key: Optional[str], header_key: Optional[str]) -> Optional[str]:
     return body_key or header_key
+
+
+def _store_data(store: dict[str, Any]) -> dict[str, Any]:
+    setup_required = bool(
+        store.get("setup_required", store.get("status") != "ready")
+    )
+    payload = {**store, "setup_required": setup_required}
+    return {"store": payload, "setup_required": setup_required}
 
 
 def _handle_error(exc: Exception) -> None:
@@ -308,11 +318,16 @@ async def list_seller_items(request: Request) -> ApiResponse:
 async def get_seller_store(request: Request) -> ApiResponse:
     principal_id = _session_principal(request, "ondcseller")
     compat = _compat(request)
-    if compat is not None:
-        store = await compat.get_store_or_empty(principal_id)
-    else:
-        store = commerce_demo.get_store(principal_id) or empty_store(principal_id)
-    return ApiResponse(success=True, message="Store", data={"store": store})
+    try:
+        if compat is not None:
+            store = await compat.get_store_or_empty(principal_id)
+        else:
+            store = commerce_demo.get_store(principal_id) or empty_store(principal_id)
+    except HTTPException:
+        raise
+    except (KeyError, LookupError):
+        store = empty_store(principal_id)
+    return ApiResponse(success=True, message="Store", data=_store_data(store))
 
 
 @router.put("/seller/store", response_model=ApiResponse)
@@ -328,7 +343,10 @@ async def put_seller_store(request: Request, body: StoreBody) -> ApiResponse:
         )
     except Exception as exc:
         _handle_error(exc)
-    return ApiResponse(success=True, message="Store saved", data=result)
+    store = result.get("store") if isinstance(result, dict) else None
+    if not isinstance(store, dict):
+        store = empty_store(principal_id)
+    return ApiResponse(success=True, message="Store saved", data=_store_data(store))
 
 
 @router.get("/seller/items/{item_id}", response_model=ApiResponse)
