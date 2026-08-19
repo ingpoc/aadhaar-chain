@@ -565,12 +565,17 @@ async def test_postgres_seller_store_get_empty_is_200_not_404(
                 "city": "Hyderabad",
                 "pin": "500001",
                 "fulfilment_sla_hours": 12,
+                "return_window_days": 30,
+                "serviceability_tokens": ["500001"],
             },
         )
         assert saved.status_code == 200, saved.text
         assert saved.json()["data"]["store"]["status"] == "ready"
         loaded = await client.get("/api/demo-commerce/seller/store")
-        assert loaded.json()["data"]["store"]["store_name"] == "Durable Store"
+        store = loaded.json()["data"]["store"]
+        assert store["store_name"] == "Durable Store"
+        assert store["serviceability_tokens"] == ["500001"]
+        assert store["return_window_days"] == 30
 
 
 async def test_same_principal_buyer_checkout_lists_on_seller_and_short_id(

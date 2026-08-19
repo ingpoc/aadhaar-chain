@@ -59,6 +59,31 @@ async def _open_migrated_pool(postgres_url: str) -> ConnectionPool:
     return pool
 
 
+LIVE_025_CHECKSUM = (
+    "7381238ac85cfc825bced04ae09ca573583850ed094d2e5856eb302452a7f8dd"
+)
+LIVE_026_CHECKSUM = (
+    "b40f0d0852f9b90bf21be038712da9600430041891b8e923fd6396f9b07c535a"
+)
+LIVE_STORE_TABLE = """
+CREATE TABLE commerce_seller_stores (
+    seller_id TEXT PRIMARY KEY,
+    store_name TEXT NOT NULL DEFAULT '',
+    city TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT '',
+    pin TEXT NOT NULL DEFAULT '',
+    serviceability_tokens TEXT[] NOT NULL DEFAULT '{}',
+    fulfilment_sla_hours INTEGER,
+    return_window_days INTEGER,
+    support_hours TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'draft',
+    version BIGINT NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+
 async def test_migrations_apply_once_and_rerun_cleanly(postgres_url: str) -> None:
     pool = ConnectionPool(postgres_url, min_size=0, max_size=2)
     await pool.open()
@@ -73,6 +98,142 @@ async def test_migrations_apply_once_and_rerun_cleanly(postgres_url: str) -> Non
                 "SELECT migration_number FROM schema_migrations ORDER BY migration_number"
             )
             assert [row[0] for row in await result.fetchall()] == expected
+        assert 25 not in expected
+        assert 26 not in expected
+        assert 27 in expected
+    finally:
+        await pool.close()
+
+
+async def _store_column_types(connection) -> dict[str, str]:
+    result = await connection.execute(
+        """
+        SELECT a.attname, t.typname
+        FROM pg_attribute a
+        JOIN pg_type t ON t.oid = a.atttypid
+        WHERE a.attrelid = 'commerce_seller_stores'::regclass
+          AND a.attname IN ('serviceability_tokens', 'version')
+          AND a.attnum > 0 AND NOT a.attisdropped
+        """
+    )
+    return {name: typname for name, typname in await result.fetchall()}
+
+
+async def test_seller_stores_use_text_array_on_fresh_postgres(postgres_url: str) -> None:
+    pool = await _open_migrated_pool(postgres_url)
+    try:
+        async with pool.connection() as connection:
+            types = await _store_column_types(connection)
+            await connection.execute(
+                """
+                INSERT INTO commerce_seller_stores
+                    (seller_id, serviceability_tokens, return_window_days)
+                VALUES ('seller-fresh', ARRAY['560001'], 30)
+                """
+            )
+            row = await connection.execute(
+                """
+                SELECT serviceability_tokens, return_window_days, version
+                FROM commerce_seller_stores
+                WHERE seller_id = %s
+                """,
+                ("seller-fresh",),
+            )
+            tokens, return_days, version = await row.fetchone()
+        assert types["serviceability_tokens"] == "_text"
+        assert types["version"] == "int8"
+        assert tokens == ["560001"]
+        assert return_days == 30
+        assert version == 1
+    finally:
+        await pool.close()
+
+
+async def test_seller_stores_migration_is_safe_when_live_table_exists(
+    postgres_url: str,
+) -> None:
+    pool = ConnectionPool(postgres_url, min_size=0, max_size=2)
+    await pool.open()
+    try:
+        async with pool.connection() as connection:
+            await connection.execute(LIVE_STORE_TABLE)
+        runner = MigrationRunner(pool, MIGRATIONS)
+        applied_now = await runner.apply()
+        assert 27 in applied_now
+        async with pool.connection() as connection:
+            types = await _store_column_types(connection)
+            await connection.execute(
+                """
+                INSERT INTO commerce_seller_stores (seller_id, serviceability_tokens)
+                VALUES ('seller-live', ARRAY['560001'])
+                """
+            )
+            tokens = await connection.execute(
+                """
+                SELECT serviceability_tokens
+                FROM commerce_seller_stores
+                WHERE seller_id = %s
+                """,
+                ("seller-live",),
+            )
+            assert (await tokens.fetchone())[0] == ["560001"]
+        assert types["serviceability_tokens"] == "_text"
+        assert types["version"] == "int8"
+        assert await runner.apply() == []
+    finally:
+        await pool.close()
+
+
+async def test_boot_does_not_recheck_applied_025_026_without_files(
+    postgres_url: str, tmp_path: Path
+) -> None:
+    partial = tmp_path / "partial"
+    partial.mkdir()
+    for path in MIGRATIONS.iterdir():
+        if path.suffix == ".sql" and path.name != "027_seller_stores.sql":
+            (partial / path.name).write_bytes(path.read_bytes())
+
+    pool = ConnectionPool(postgres_url, min_size=0, max_size=2)
+    await pool.open()
+    try:
+        first = MigrationRunner(pool, partial)
+        applied = await first.apply()
+        assert 25 not in applied
+        assert 26 not in applied
+        assert 27 not in applied
+
+        async with pool.connection() as connection:
+            await connection.execute(LIVE_STORE_TABLE)
+            await connection.execute(
+                """
+                INSERT INTO schema_migrations
+                    (migration_number, migration_name, checksum)
+                VALUES
+                    (25, 'cf3_seller_store', %s),
+                    (26, 'cf3_seller_staff', %s)
+                """,
+                (LIVE_025_CHECKSUM, LIVE_026_CHECKSUM),
+            )
+
+        runner = MigrationRunner(pool, MIGRATIONS)
+        assert await runner.apply() == [27]
+        async with pool.connection() as connection:
+            types = await _store_column_types(connection)
+            history = await connection.execute(
+                """
+                SELECT migration_number, migration_name, checksum
+                FROM schema_migrations
+                WHERE migration_number IN (25, 26)
+                ORDER BY migration_number
+                """
+            )
+            rows = await history.fetchall()
+        assert types["serviceability_tokens"] == "_text"
+        assert rows == [
+            (25, "cf3_seller_store", LIVE_025_CHECKSUM),
+            (26, "cf3_seller_staff", LIVE_026_CHECKSUM),
+        ]
+        assert await runner.apply() == []
     finally:
         await pool.close()
 
