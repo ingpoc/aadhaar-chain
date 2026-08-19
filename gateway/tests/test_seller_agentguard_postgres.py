@@ -557,22 +557,45 @@ async def test_postgres_seller_store_get_empty_is_200_not_404(
         client.cookies.set(SESSION_COOKIE_NAME, _seller_cookie(principal_id))
         empty = await client.get("/api/demo-commerce/seller/store")
         assert empty.status_code == 200, empty.text
+        assert empty.json()["data"]["setup_required"] is True
         assert empty.json()["data"]["store"]["status"] == "draft"
+        assert empty.json()["data"]["store"]["setup_required"] is True
+        draft = await client.put(
+            "/api/demo-commerce/seller/store",
+            json={
+                "store_name": "Durable Store",
+                "city": "Hyderabad",
+                "state": "TS",
+                "pin": "500001",
+                "serviceability": "500001",
+                "fulfilment_sla_hours": 12,
+                "complete": False,
+            },
+        )
+        assert draft.status_code == 200, draft.text
+        assert draft.json()["data"]["store"]["status"] == "draft"
+        assert draft.json()["data"]["setup_required"] is True
+        loaded_draft = await client.get("/api/demo-commerce/seller/store")
+        assert loaded_draft.json()["data"]["store"]["status"] == "draft"
         saved = await client.put(
             "/api/demo-commerce/seller/store",
             json={
                 "store_name": "Durable Store",
                 "city": "Hyderabad",
+                "state": "TS",
                 "pin": "500001",
+                "serviceability": "500001",
                 "fulfilment_sla_hours": 12,
-                "serviceability_tokens": ["500001"],
+                "complete": True,
             },
         )
         assert saved.status_code == 200, saved.text
         assert saved.json()["data"]["store"]["status"] == "ready"
+        assert saved.json()["data"]["setup_required"] is False
         loaded = await client.get("/api/demo-commerce/seller/store")
         assert loaded.json()["data"]["store"]["store_name"] == "Durable Store"
         assert loaded.json()["data"]["store"]["serviceability_tokens"] == ["500001"]
+        assert loaded.json()["data"]["store"]["setup_required"] is False
 
 
 async def test_same_principal_buyer_checkout_lists_on_seller_and_short_id(

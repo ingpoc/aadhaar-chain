@@ -929,28 +929,59 @@ def test_seller_store_get_empty_is_200_not_404() -> None:
     )
     missing = seller.get("/api/demo-commerce/seller/store")
     assert missing.status_code == 200, missing.text
-    store = missing.json()["data"]["store"]
+    body = missing.json()["data"]
+    store = body["store"]
+    assert body["setup_required"] is True
     assert store["status"] == "draft"
     assert store["setup_required"] is True
     assert store["store_name"] == ""
+
+    draft = seller.put(
+        "/api/demo-commerce/seller/store",
+        json={
+            "store_name": "Sampoorna Groceries",
+            "city": "Bengaluru",
+            "state": "KA",
+            "pin": "560001",
+            "serviceability": "560001",
+            "fulfilment_sla_hours": 24,
+            "return_window_days": 7,
+            "complete": False,
+        },
+    )
+    assert draft.status_code == 200, draft.text
+    draft_store = draft.json()["data"]["store"]
+    assert draft.json()["data"]["setup_required"] is True
+    assert draft_store["status"] == "draft"
+    assert draft_store["setup_required"] is True
+    assert draft_store["serviceability_tokens"] == ["560001"]
+
+    loaded_draft = seller.get("/api/demo-commerce/seller/store")
+    assert loaded_draft.status_code == 200, loaded_draft.text
+    assert loaded_draft.json()["data"]["store"]["status"] == "draft"
+    assert loaded_draft.json()["data"]["store"]["store_name"] == "Sampoorna Groceries"
 
     saved = seller.put(
         "/api/demo-commerce/seller/store",
         json={
             "store_name": "Sampoorna Groceries",
             "city": "Bengaluru",
+            "state": "KA",
             "pin": "560001",
+            "serviceability": "560001",
             "fulfilment_sla_hours": 24,
             "return_window_days": 7,
-            "serviceability_tokens": ["560001"],
+            "complete": True,
         },
     )
     assert saved.status_code == 200, saved.text
+    assert saved.json()["data"]["setup_required"] is False
     assert saved.json()["data"]["store"]["status"] == "ready"
     loaded = seller.get("/api/demo-commerce/seller/store")
     assert loaded.status_code == 200
     assert loaded.json()["data"]["store"]["store_name"] == "Sampoorna Groceries"
     assert loaded.json()["data"]["store"]["fulfilment_sla_hours"] == 24
+    assert loaded.json()["data"]["store"]["setup_required"] is False
 
 
 def test_same_principal_buyer_checkout_is_listed_on_seller_orders() -> None:
