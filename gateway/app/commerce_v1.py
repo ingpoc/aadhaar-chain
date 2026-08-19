@@ -502,6 +502,386 @@ class CommerceV1:
             )
         return _jsonable(order)
 
+    async def get_retail_binding(self, transaction_id: str) -> dict[str, Any]:
+        if not transaction_id.strip():
+            raise CommerceValidation("retail transaction_id is required")
+        async with UnitOfWork(self.pool) as unit_of_work:
+            try:
+                order = await CommerceRepository(
+                    unit_of_work
+                ).get_order_by_retail_transaction(transaction_id.strip())
+            except LookupError as exc:
+                raise CommerceNotFound(str(exc)) from exc
+            except ValueError as exc:
+                raise CommerceConflict(str(exc)) from exc
+        return _jsonable(order)
+
+    async def bind_retail_protocol(
+        self, *, order_id: str, retail: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Attach one signed RET10 transaction to a CommerceV1 order."""
+        required = ("transaction_id", "bpp_id", "core_version")
+        if any(retail.get(field) in {None, ""} for field in required):
+            raise CommerceValidation("complete signed retail binding is required")
+        if retail["core_version"] != "1.2.0":
+            raise CommerceValidation("retail binding must be RET10 1.2.0")
+        transaction_id = str(retail["transaction_id"]).strip()
+        bpp_id = str(retail["bpp_id"]).strip()
+        async with UnitOfWork(self.pool) as unit_of_work:
+            repository = CommerceRepository(unit_of_work)
+            try:
+                order = await repository.get_order(UUID(order_id), lock=True)
+            except LookupError as exc:
+                raise CommerceNotFound(str(exc)) from exc
+            fulfilment = dict(order.get("fulfilment") or {})
+            prior = dict(fulfilment.get("retail") or {})
+            if prior.get("transaction_id") not in {None, "", transaction_id}:
+                raise CommerceConflict("order is already bound to a different RET10 transaction")
+            if (
+                prior.get("transaction_id") == transaction_id
+                and prior.get("bpp_id") not in {None, "", bpp_id}
+            ):
+                raise CommerceConflict("callback BPP does not match the bound seller")
+            if prior.get("transaction_id") == transaction_id and prior.get("bpp_id") == bpp_id:
+                return _jsonable(order)
+            try:
+                existing = await repository.get_order_by_retail_transaction(
+                    transaction_id, lock=True
+                )
+            except LookupError:
+                existing = None
+            except ValueError as exc:
+                raise CommerceConflict(str(exc)) from exc
+            if existing is not None and existing["order_id"] != order["order_id"]:
+                raise CommerceConflict("retail transaction is bound to another order")
+            recorded_at = self.clock().isoformat()
+            bound = dict(prior)
+            bound.update(
+                {
+                    "transaction_id": transaction_id,
+                    "bpp_id": bpp_id,
+                    "bpp_uri": str(retail.get("bpp_uri") or bound.get("bpp_uri") or ""),
+                    "core_version": "1.2.0",
+                    "signature_verified": bool(retail.get("signature_verified", True)),
+                }
+            )
+            if retail.get("protocol_order_id"):
+                bound["protocol_order_id"] = str(retail["protocol_order_id"])
+            fulfilment["retail"] = bound
+            fulfilment["history"] = [
+                *list(fulfilment.get("history") or []),
+                {
+                    "status": order["status"],
+                    "recorded_at": recorded_at,
+                    "source": "ondc-ret10-bind",
+                    "retail_transaction_id": transaction_id,
+                },
+            ]
+            order = await repository.update_order_fulfilment(
+                order["order_id"],
+                expected_version=int(order["version"]),
+                status=str(order["status"]),
+                fulfilment=fulfilment,
+            )
+        return _jsonable(order)
+
+    async def apply_retail_update(
+        self,
+        *,
+        transaction_id: str,
+        event_commitment: str,
+        update: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply one normalized, signature-verified RET10 callback exactly once."""
+        transaction_id = transaction_id.strip()
+        event_commitment = event_commitment.strip()
+        if (
+            not transaction_id
+            or len(event_commitment) != 64
+            or any(character not in "0123456789abcdef" for character in event_commitment)
+        ):
+            raise CommerceValidation(
+                "transaction_id and SHA-256 event_commitment are required"
+            )
+        action = str(update.get("action") or "").strip()
+        bpp_id = str(update.get("bpp_id") or "").strip()
+        message_id = str(update.get("message_id") or "").strip()
+        if not action or not bpp_id or not message_id:
+            raise CommerceValidation("callback action, bpp_id, and message_id are required")
+
+        async with UnitOfWork(self.pool) as unit_of_work:
+            repository = CommerceRepository(unit_of_work)
+            try:
+                order = await repository.get_order_by_retail_transaction(
+                    transaction_id, lock=True
+                )
+            except LookupError as exc:
+                raise CommerceNotFound(str(exc)) from exc
+            except ValueError as exc:
+                raise CommerceConflict(str(exc)) from exc
+
+            fulfilment = dict(order.get("fulfilment") or {})
+            retail = dict(fulfilment.get("retail") or {})
+            if str(retail.get("bpp_id") or "") != bpp_id:
+                raise CommerceConflict("callback BPP does not match the bound seller")
+            if str(retail.get("core_version") or "") != "1.2.0":
+                raise CommerceConflict("bound retail version is not RET10 1.2.0")
+
+            processed = list(retail.get("processed_callbacks") or [])
+            if event_commitment in processed:
+                return _jsonable({"order": order, "duplicate": True})
+
+            current_status = str(order["status"])
+            next_status = current_status
+            review_reason = str(update.get("review_reason") or "").strip()
+            provider_timestamp = str(update.get("provider_timestamp") or "").strip()
+            latest_provider_timestamp = str(
+                retail.get("latest_provider_timestamp")
+                or (retail.get("last_callback") or {}).get("provider_timestamp")
+                or ""
+            ).strip()
+            stale_callback = False
+            if provider_timestamp and latest_provider_timestamp:
+                try:
+                    current_provider_time = datetime.fromisoformat(
+                        provider_timestamp.replace("Z", "+00:00")
+                    )
+                    previous_provider_time = datetime.fromisoformat(
+                        latest_provider_timestamp.replace("Z", "+00:00")
+                    )
+                    if current_provider_time <= previous_provider_time:
+                        review_reason = "stale RET10 callback timestamp"
+                        stale_callback = True
+                except ValueError:
+                    review_reason = "invalid RET10 callback timestamp"
+                    stale_callback = True
+            target_status = str(update.get("target_status") or "").strip()
+            if not review_reason and target_status and target_status != current_status:
+                try:
+                    require_transition("order", current_status, target_status)
+                    next_status = target_status
+                except TransitionError as exc:
+                    review_reason = str(exc)
+
+            recorded_at = self.clock().isoformat()
+            provider_status = str(update.get("provider_status") or "").strip()
+            status_message = str(update.get("status_message") or "").strip()
+            if review_reason:
+                status_message = status_message or review_reason
+            if update.get("tracking_id") and not stale_callback:
+                fulfilment["tracking_id"] = str(update["tracking_id"])
+            if update.get("tracking_url") and not stale_callback:
+                fulfilment["tracking_url"] = str(update["tracking_url"])
+            if status_message:
+                fulfilment["status_message"] = status_message
+            if update.get("protocol_order_id") and not stale_callback:
+                retail["protocol_order_id"] = str(update["protocol_order_id"])
+            if update.get("quote") and not stale_callback:
+                retail["quote"] = dict(update["quote"])
+            if update.get("billing") and not stale_callback:
+                retail["billing"] = dict(update["billing"])
+            if update.get("payment") and not stale_callback:
+                retail["payment"] = dict(update["payment"])
+            if update.get("settlement") and not stale_callback:
+                retail["settlement"] = dict(update["settlement"])
+
+            retail.update(
+                {
+                    "last_callback": {
+                        "action": action,
+                        "message_id": message_id,
+                        "event_commitment": event_commitment,
+                        "received_at": recorded_at,
+                        "provider_timestamp": provider_timestamp or None,
+                    },
+                    "processed_callbacks": [*processed, event_commitment],
+                    "review_required": bool(review_reason),
+                }
+            )
+            if review_reason:
+                retail["review_reason"] = review_reason
+            else:
+                retail.pop("review_reason", None)
+            if provider_timestamp and not stale_callback:
+                retail["latest_provider_timestamp"] = provider_timestamp
+            if provider_status and not stale_callback:
+                retail["provider_status"] = provider_status
+
+            refund_row: dict[str, Any] | None = None
+            return_row: dict[str, Any] | None = None
+            if not stale_callback and not review_reason:
+                try:
+                    return_row = await self._apply_retail_return(
+                        repository, order, update, recorded_at
+                    )
+                    if return_row is not None:
+                        retail["return_id"] = str(return_row["return_id"])
+                        retail["return_status"] = return_row["status"]
+                    refund_row = await self._apply_retail_refund(
+                        repository, order, update, event_commitment
+                    )
+                    if refund_row is not None:
+                        retail["refund_id"] = str(refund_row["refund_id"])
+                        retail["refund_status"] = refund_row["status"]
+                except (CommerceConflict, CommerceValidation) as exc:
+                    review_reason = str(exc)
+                    status_message = status_message or review_reason
+                    retail["review_required"] = True
+                    retail["review_reason"] = review_reason
+                    fulfilment["status_message"] = status_message
+
+            event = {
+                "status": next_status,
+                "recorded_at": recorded_at,
+                "source": "ondc-ret10",
+                "callback_action": action,
+                "message_id": message_id,
+                "event_commitment": event_commitment,
+            }
+            if provider_status:
+                event["provider_status"] = provider_status
+            if update.get("tracking_id"):
+                event["tracking_id"] = str(update["tracking_id"])
+            elif fulfilment.get("tracking_id"):
+                event["tracking_id"] = fulfilment["tracking_id"]
+            if status_message:
+                event["status_message"] = status_message
+            fulfilment["status"] = next_status
+            fulfilment["last_verified_update_at"] = recorded_at
+            fulfilment["retail"] = retail
+            fulfilment["history"] = [
+                *list(fulfilment.get("history") or []),
+                event,
+            ]
+            order = await repository.update_order_fulfilment(
+                order["order_id"],
+                expected_version=int(order["version"]),
+                status=next_status,
+                fulfilment=fulfilment,
+            )
+        response = {"order": order, "duplicate": False}
+        if return_row is not None:
+            response["return"] = return_row
+        if refund_row is not None:
+            response["refund"] = refund_row
+        return _jsonable(response)
+
+    async def _apply_retail_return(
+        self,
+        repository: CommerceRepository,
+        order: dict[str, Any],
+        update: dict[str, Any],
+        recorded_at: str,
+    ) -> dict[str, Any] | None:
+        target = str(update.get("return_status") or "").strip()
+        if not target:
+            return None
+        reason = str(update.get("return_reason") or "Buyer requested return").strip()
+        existing = await repository.get_return_for_order(order["order_id"], lock=True)
+        if existing is None:
+            row, _created = await repository.create_or_get_return(
+                return_id=uuid5(
+                    NAMESPACE_URL, f"commerce-return:{order['order_id']}"
+                ),
+                order_id=order["order_id"],
+                principal_id=str(order["principal_id"]),
+                seller_id=str(order["seller_id"]),
+                reason=reason,
+            )
+            existing = row
+        current = str(existing["status"])
+        hops = {
+            "requested": (),
+            "approved": ("approved",),
+            "in_transit": ("approved", "in_transit"),
+            "received": ("approved", "in_transit", "received"),
+            "refund_pending": ("approved", "in_transit", "received", "refund_pending"),
+            "completed": (
+                "approved",
+                "in_transit",
+                "received",
+                "refund_pending",
+                "completed",
+            ),
+        }.get(target)
+        if hops is None:
+            raise CommerceConflict(f"unknown return status: {target}")
+        row = existing
+        for hop in hops:
+            if current == hop:
+                continue
+            try:
+                require_transition("return", current, hop)
+            except TransitionError as exc:
+                raise CommerceConflict(str(exc)) from exc
+            row = await repository.set_return_status(
+                row["return_id"],
+                expected_version=int(row["version"]),
+                status=hop,
+                resolution={
+                    "source": "ondc-ret10",
+                    "updated_at": recorded_at,
+                    "provider_status": update.get("provider_status"),
+                },
+            )
+            current = hop
+        return row
+
+    async def _apply_retail_refund(
+        self,
+        repository: CommerceRepository,
+        order: dict[str, Any],
+        update: dict[str, Any],
+        event_commitment: str,
+    ) -> dict[str, Any] | None:
+        amount_paise = update.get("refund_amount_paise")
+        if amount_paise in {None, ""}:
+            return None
+        try:
+            amount_paise = int(amount_paise)
+        except (TypeError, ValueError) as exc:
+            raise CommerceValidation("refund amount must be an integer") from exc
+        if amount_paise <= 0:
+            raise CommerceValidation("refund amount must be positive")
+        refundable = await repository.get_refundable_order(
+            order["order_id"], str(order["seller_id"]), lock=True
+        )
+        if refundable["payment_status"] not in {"succeeded", "reconciled"}:
+            raise CommerceConflict("only a verified paid order can be refunded")
+        if amount_paise > refundable["payment_amount_paise"]:
+            raise CommerceConflict("refund exceeds the verified paid amount")
+        seller_id = str(order["seller_id"])
+        idempotency_key = f"ondc-ret10:{event_commitment}"
+        refund_namespace = f"commerce-refund:{seller_id}:{idempotency_key}"
+        refund, created = await repository.create_or_get_refund(
+            refund_id=uuid5(NAMESPACE_URL, refund_namespace),
+            order_id=order["order_id"],
+            payment_attempt_id=refundable["payment_attempt_id"],
+            seller_id=seller_id,
+            principal_id=str(order["principal_id"]),
+            amount_paise=amount_paise,
+            idempotency_key=idempotency_key,
+            correlation_id=str(update.get("message_id") or event_commitment),
+        )
+        if created:
+            require_transition("refund", refund["status"], "succeeded")
+            transaction_id = uuid5(NAMESPACE_URL, f"{refund_namespace}:ledger")
+            await repository.post_balanced_ledger(
+                transaction_id,
+                order["order_id"],
+                refundable["payment_attempt_id"],
+                "refund",
+                amount_paise,
+                (
+                    (uuid5(transaction_id, "debit"), "seller_payable", "debit"),
+                    (uuid5(transaction_id, "credit"), "payment_clearing", "credit"),
+                ),
+            )
+            refund = await repository.set_refund_status(
+                refund["refund_id"], "pending", "succeeded"
+            )
+        return refund
+
     async def upsert_inventory(
         self,
         *,

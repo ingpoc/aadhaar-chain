@@ -727,10 +727,17 @@ async def _post_on_action(
         return
     providers = await _durable_catalog_providers(pool, query="")
     order = _order_from_request(request_body, providers)
+    request_order_id = str(
+        ((request_body.get("message") or {}).get("order") or {}).get("id")
+        or (request_body.get("message") or {}).get("order_id")
+        or order.get("id")
+        or ""
+    ).strip()
+    callback_message: dict[str, Any]
     if action == "confirm":
         order = {
             **order,
-            "id": f"ord_{uuid.uuid4().hex[:12]}",
+            "id": request_order_id or f"ord_{uuid.uuid4().hex[:12]}",
             "state": "Accepted",
             "payment": {
                 **(order.get("payment") or {}),
@@ -751,8 +758,48 @@ async def _post_on_action(
                     "created_at": int(time.time()),
                 }
             )
+        callback_message = {"order": order}
     elif action == "init":
         order = {**order, "payment": {**(order.get("payment") or {}), "status": "NOT-PAID"}}
+        callback_message = {"order": order}
+    elif action == "status":
+        order = {
+            **order,
+            "id": request_order_id or order.get("id"),
+            "state": order.get("state") or "In-progress",
+            "fulfillments": [
+                {
+                    **((order.get("fulfillments") or [{}])[0]),
+                    "state": {"descriptor": {"code": "Packed"}},
+                }
+            ],
+        }
+        callback_message = {"order": order}
+    elif action == "track":
+        tracking_id = request_order_id or "track"
+        callback_message = {
+            "tracking": {
+                "id": tracking_id,
+                "url": f"{_bpp_uri()}/track/{tracking_id}",
+                "status": "active",
+            }
+        }
+    elif action == "cancel":
+        order = {
+            **order,
+            "id": request_order_id or order.get("id"),
+            "state": "Cancelled",
+        }
+        callback_message = {"order": order}
+    elif action == "update":
+        order = {
+            **order,
+            "id": request_order_id or order.get("id"),
+            "state": order.get("state") or "Completed",
+        }
+        callback_message = {"order": order}
+    else:
+        callback_message = {"order": order}
     message_id = _paired_callback_message_id(ctx)
     if not message_id:
         logger.warning("BPP on_%s skipped — missing request message_id", action)
@@ -774,7 +821,7 @@ async def _post_on_action(
             "timestamp": _iso_now(),
             "ttl": ctx.get("ttl") or "PT30S",
         },
-        "message": {"order": order},
+        "message": callback_message,
     }
     uk = _seller_uk_id()
     pem = _seller_signing_pem()
@@ -822,7 +869,15 @@ async def handle_bpp_order_action(
     body: dict[str, Any],
     background: BackgroundTasks,
 ) -> JSONResponse:
-    if action not in {"select", "init", "confirm"}:
+    if action not in {
+        "select",
+        "init",
+        "confirm",
+        "status",
+        "track",
+        "cancel",
+        "update",
+    }:
         raise HTTPException(status_code=404, detail=f"unsupported BPP action: {action}")
     if not getattr(settings, "ondc_enabled", False):
         raise HTTPException(status_code=503, detail="ONDC_ENABLED=false")
@@ -847,6 +902,26 @@ async def np_seller_confirm(request: Request, background: BackgroundTasks) -> JS
     return await handle_bpp_order_action(request, "confirm", await request.json(), background)
 
 
+@router.post("/ondc/np/seller/status")
+async def np_seller_status(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_order_action(request, "status", await request.json(), background)
+
+
+@router.post("/ondc/np/seller/track")
+async def np_seller_track(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_order_action(request, "track", await request.json(), background)
+
+
+@router.post("/ondc/np/seller/cancel")
+async def np_seller_cancel(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_order_action(request, "cancel", await request.json(), background)
+
+
+@router.post("/ondc/np/seller/update")
+async def np_seller_update(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_order_action(request, "update", await request.json(), background)
+
+
 @router.post("/ondc/select")
 async def root_select(request: Request, background: BackgroundTasks) -> JSONResponse:
     return await handle_bpp_order_action(request, "select", await request.json(), background)
@@ -860,6 +935,26 @@ async def root_init(request: Request, background: BackgroundTasks) -> JSONRespon
 @router.post("/ondc/confirm")
 async def root_confirm(request: Request, background: BackgroundTasks) -> JSONResponse:
     return await handle_bpp_order_action(request, "confirm", await request.json(), background)
+
+
+@router.post("/ondc/status")
+async def root_status(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_order_action(request, "status", await request.json(), background)
+
+
+@router.post("/ondc/track")
+async def root_track(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_order_action(request, "track", await request.json(), background)
+
+
+@router.post("/ondc/cancel")
+async def root_cancel(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_order_action(request, "cancel", await request.json(), background)
+
+
+@router.post("/ondc/update")
+async def root_update(request: Request, background: BackgroundTasks) -> JSONResponse:
+    return await handle_bpp_order_action(request, "update", await request.json(), background)
 
 
 async def _post_on_issue(

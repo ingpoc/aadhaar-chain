@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from app import ondc_store
-from app.commerce_v1 import CommerceConflict, CommerceNotFound, CommerceV1
+from app.commerce_v1 import CommerceConflict, CommerceNotFound, CommerceV1, CommerceValidation
 from app.ondc_crypto import (
     create_authorization_header,
     load_ed25519_private_pem,
@@ -61,7 +61,18 @@ _LOGISTICS_LIFECYCLE_CALLBACKS = {
 }
 _IGM_ACTIONS = frozenset({"issue", "issue_status"})
 _IGM_CALLBACKS = frozenset({"on_issue", "on_issue_status"})
-_RETAIL_SIGNED_CALLBACKS = _IGM_CALLBACKS | frozenset({"on_track"})
+_RETAIL_LIFECYCLE_CALLBACKS = frozenset(
+    {
+        "on_select",
+        "on_init",
+        "on_confirm",
+        "on_status",
+        "on_track",
+        "on_cancel",
+        "on_update",
+    }
+)
+_RETAIL_SIGNED_CALLBACKS = _IGM_CALLBACKS | _RETAIL_LIFECYCLE_CALLBACKS
 # Workbench mock BPP mints a new callback message_id. Correlate by transaction
 # outbox, ACK, persist the callback message_id, and log the mismatch. Our BPP
 # still echoes the request message_id on outbound on_confirm / on_issue.
@@ -102,6 +113,27 @@ _LOGISTICS_STATE_TARGETS = {
     "Order-delivered": "delivered",
     "Delivered": "delivered",
     "Cancelled": "cancelled",
+}
+_RETAIL_STATE_TARGETS = {
+    "Accepted": "confirmed",
+    "In-progress": "preparing",
+    "Packed": "preparing",
+    "Agent-assigned": "preparing",
+    "Order-picked-up": "shipped",
+    "Out-for-delivery": "shipped",
+    "Order-delivered": "delivered",
+    "Completed": "delivered",
+    "Cancelled": "cancelled",
+}
+_RETAIL_RETURN_TARGETS = {
+    "Return_Initiated": "requested",
+    "Return_Approved": "approved",
+    "Return_Picked": "in_transit",
+    "Return_Packed": "in_transit",
+    "Return_Delivered": "received",
+    "Return_Received": "received",
+    "Liquidated": "refund_pending",
+    "Refunded": "completed",
 }
 
 
@@ -359,6 +391,146 @@ def _normalize_logistics_callback(record: dict[str, Any]) -> dict[str, Any]:
         "status_message": status_message,
         "review_reason": review_reason,
         "conformance": conformance,
+    }
+
+
+def _retail_fulfillments(envelope: dict[str, Any]) -> list[dict[str, Any]]:
+    order = (envelope.get("message") or {}).get("order") or {}
+    fulfillments = order.get("fulfillments") or []
+    return [item for item in fulfillments if isinstance(item, dict)]
+
+
+def _retail_order_state(envelope: dict[str, Any]) -> str:
+    order = (envelope.get("message") or {}).get("order") or {}
+    if not isinstance(order, dict):
+        return ""
+    return str(order.get("state") or "").strip()
+
+
+def _retail_fulfillment_state(envelope: dict[str, Any]) -> str:
+    fulfillments = _retail_fulfillments(envelope)
+    if not fulfillments:
+        return ""
+    return _provider_state(fulfillments[0])
+
+
+def _retail_price_paise(price: Any) -> int | None:
+    if not isinstance(price, dict):
+        return None
+    value = price.get("value")
+    if value in {None, ""}:
+        return None
+    try:
+        return int((Decimal(str(value)) * 100).quantize(Decimal("1")))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _retail_return_code(envelope: dict[str, Any]) -> str:
+    order = (envelope.get("message") or {}).get("order") or {}
+    if not isinstance(order, dict):
+        return ""
+    for fulfillment in _retail_fulfillments(envelope):
+        if str(fulfillment.get("type") or "").lower() != "return":
+            continue
+        code = _provider_state(fulfillment)
+        if code:
+            return code
+    tags = _tag_values(order.get("tags"), "return_request")
+    return str(tags.get("code") or tags.get("status") or "").strip()
+
+
+def _retail_settlement(envelope: dict[str, Any]) -> dict[str, Any] | None:
+    order = (envelope.get("message") or {}).get("order") or {}
+    payment = order.get("payment") if isinstance(order, dict) else {}
+    if not isinstance(payment, dict):
+        return None
+    details = (
+        payment.get("@ondc/org/settlement_details")
+        or payment.get("settlement_details")
+        or payment.get("settlement")
+    )
+    if details is None or details == "" or details == []:
+        return None
+    if isinstance(details, list):
+        details = details[0] if details and isinstance(details[0], dict) else {"items": details}
+    if not isinstance(details, dict):
+        return {"raw": details}
+    return dict(details)
+
+
+def _normalize_retail_callback(record: dict[str, Any]) -> dict[str, Any]:
+    envelope = record.get("envelope") or {}
+    context = envelope.get("context") or {}
+    message = envelope.get("message") or {}
+    order = message.get("order") if isinstance(message.get("order"), dict) else {}
+    tracking = message.get("tracking") or {}
+    if not isinstance(tracking, dict):
+        tracking = {}
+    action = str(record.get("action") or context.get("action") or "")
+    fulfillments = _retail_fulfillments(envelope)
+    fulfillment = fulfillments[0] if fulfillments else {}
+    order_state = _retail_order_state(envelope)
+    fulfillment_state = _provider_state(fulfillment) if fulfillment else ""
+    provider_status = fulfillment_state or order_state
+    return_code = _retail_return_code(envelope)
+    settlement = _retail_settlement(envelope)
+    tracking_id = (
+        tracking.get("id")
+        or fulfillment.get("tracking_id")
+        or fulfillment.get("@ondc/org/awb_no")
+    )
+    raw_tracking_url = str(tracking.get("url") or "").strip()
+    tracking_url = raw_tracking_url if raw_tracking_url.startswith("https://") else None
+    target_status = None
+    if action in {"on_confirm", "on_status", "on_cancel"}:
+        target_status = _RETAIL_STATE_TARGETS.get(provider_status)
+        if action == "on_cancel":
+            target_status = "cancelled"
+    review_reason = ""
+    status_message = str(
+        tracking.get("status") or order_state or fulfillment_state or return_code or ""
+    )
+    if action in {"on_status", "on_cancel"} and not target_status:
+        review_reason = (
+            f"unknown RET10 order state: {provider_status or 'missing'}"
+        )
+        status_message = status_message or review_reason
+    if raw_tracking_url and tracking_url is None and not review_reason:
+        review_reason = "tracking URL must use HTTPS"
+        status_message = status_message or review_reason
+    refund_amount = None
+    if settlement is not None:
+        refund_amount = _retail_price_paise(
+            settlement.get("settlement_amount")
+            or {"value": settlement.get("amount") or settlement.get("value")}
+        )
+        if refund_amount is None:
+            refund_amount = _retail_price_paise((order.get("quote") or {}).get("price") or {})
+        if refund_amount is None:
+            refund_amount = _retail_price_paise(order.get("payment") or {})
+    elif action == "on_update" and return_code in {"Liquidated", "Refunded"}:
+        refund_amount = _retail_price_paise((order.get("quote") or {}).get("price") or {})
+
+    return {
+        "action": action,
+        "message_id": str(record.get("message_id") or context.get("message_id") or ""),
+        "bpp_id": str(record.get("subscriber_id") or context.get("bpp_id") or ""),
+        "provider_timestamp": context.get("timestamp"),
+        "provider_status": provider_status,
+        "target_status": target_status,
+        "protocol_order_id": order.get("id") or message.get("order_id"),
+        "quote": order.get("quote") if isinstance(order.get("quote"), dict) else None,
+        "billing": order.get("billing") if isinstance(order.get("billing"), dict) else None,
+        "payment": order.get("payment") if isinstance(order.get("payment"), dict) else None,
+        "tracking_id": tracking_id or None,
+        "tracking_url": tracking_url,
+        "status_message": status_message,
+        "review_reason": review_reason,
+        "return_status": _RETAIL_RETURN_TARGETS.get(return_code),
+        "return_reason": return_code or None,
+        "refund_amount_paise": refund_amount,
+        "settlement": settlement,
     }
 
 
@@ -644,10 +816,11 @@ class OutboxDrainBody(BaseModel):
 
 
 class OrderActionBody(BaseModel):
-    """select / init / confirm / track — order or order_id + target BPP."""
+    """select / init / confirm / track / status / cancel / update."""
 
     order: dict[str, Any] = Field(default_factory=dict)
     order_id: Optional[str] = None
+    commerce_order_id: Optional[str] = None
     message_id: Optional[str] = None
     transaction_id: Optional[str] = None
     bpp_id: Optional[str] = None
@@ -1098,6 +1271,38 @@ async def _resolve_bpp_target(
     return bpp_id, bpp_uri
 
 
+async def _maybe_bind_retail_order(
+    request: Request,
+    body: OrderActionBody | LogisticsActionBody,
+    *,
+    transaction_id: str,
+    bpp_id: str,
+    bpp_uri: str,
+) -> None:
+    commerce_order_id = str(getattr(body, "commerce_order_id", None) or "").strip()
+    if not commerce_order_id:
+        return
+    pool = getattr(request.app.state, "persistence_pool", None)
+    if pool is None:
+        raise HTTPException(
+            status_code=409,
+            detail="PostgreSQL CommerceV1 binding is required for RET10 protocol bind",
+        )
+    try:
+        await CommerceV1(pool).bind_retail_protocol(
+            order_id=commerce_order_id,
+            retail={
+                "transaction_id": transaction_id,
+                "bpp_id": bpp_id,
+                "bpp_uri": bpp_uri,
+                "core_version": CORE_VERSION,
+                "signature_verified": True,
+            },
+        )
+    except (CommerceNotFound, CommerceConflict, CommerceValidation) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 async def _dispatch_order_action(
     request: Request,
     action: str,
@@ -1105,9 +1310,9 @@ async def _dispatch_order_action(
     *,
     role: str = "buyer",
 ) -> JSONResponse:
-    """Signed select/init/confirm/track → bpp_uri/{action}; persist outbox."""
+    """Signed select/init/confirm/track/status/cancel/update → bpp_uri/{action}."""
     allowed_actions = (
-        {"select", "init", "confirm", "track"}
+        {"select", "init", "confirm", "track", "status", "cancel", "update"}
         if role == "buyer"
         else {"init", "confirm", "update", "status", "track"}
     )
@@ -1156,17 +1361,42 @@ async def _dispatch_order_action(
                 status_code=422,
                 detail=f"LOG10 {action} requires message.order_id",
             )
-    elif action == "track":
+    elif action in {"track", "status"}:
         order_id = str(
             getattr(body, "order_id", None)
             or ((getattr(body, "order", None) or {}).get("id"))
             or ""
         ).strip()
         if not order_id:
-            raise HTTPException(status_code=422, detail="track requires order_id")
+            raise HTTPException(status_code=422, detail=f"{action} requires order_id")
         message = {"order_id": order_id}
+    elif action == "cancel":
+        order_id = str(
+            getattr(body, "order_id", None)
+            or ((getattr(body, "order", None) or {}).get("id"))
+            or ""
+        ).strip()
+        if not order_id:
+            raise HTTPException(status_code=422, detail="cancel requires order_id")
+        reason = str(
+            (getattr(body, "order", None) or {}).get("cancellation_reason_id") or "001"
+        )
+        message = {
+            "order_id": order_id,
+            "cancellation_reason_id": reason,
+        }
+        if getattr(body, "order", None):
+            message["order"] = body.order
     else:
         message = {"order": body.order or {}}  # type: ignore[union-attr]
+    if role == "buyer":
+        await _maybe_bind_retail_order(
+            request,
+            body,
+            transaction_id=transaction_id,
+            bpp_id=bpp_id,
+            bpp_uri=bpp_uri,
+        )
     bap_id = (
         getattr(settings, "ondc_bap_id", None) or _subscriber_id()
         if role == "buyer"
@@ -1302,6 +1532,21 @@ async def ondc_confirm(body: ConfirmBody, request: Request) -> JSONResponse:
 @router.post("/api/ondc/track")
 async def ondc_track(body: OrderActionBody, request: Request) -> JSONResponse:
     return await _dispatch_order_action(request, "track", body)
+
+
+@router.post("/api/ondc/order-status")
+async def ondc_order_status(body: OrderActionBody, request: Request) -> JSONResponse:
+    return await _dispatch_order_action(request, "status", body)
+
+
+@router.post("/api/ondc/cancel")
+async def ondc_cancel(body: OrderActionBody, request: Request) -> JSONResponse:
+    return await _dispatch_order_action(request, "cancel", body)
+
+
+@router.post("/api/ondc/update")
+async def ondc_update(body: OrderActionBody, request: Request) -> JSONResponse:
+    return await _dispatch_order_action(request, "update", body)
 
 
 def _igm_issue_id(envelope: dict[str, Any]) -> str:
@@ -1646,9 +1891,13 @@ async def _verify_retail_callback(
     if version != CORE_VERSION:
         return False, f"unsupported Retail core_version: {version or 'missing'}"
     bpp_id = str(context.get("bpp_id") or "").strip()
+    if not bpp_id:
+        bpp_id = _callback_subscriber_id(context, request)
     authorization = (request.headers.get("Authorization") or "").strip()
     if not authorization:
         return False, "missing ONDC Authorization header"
+    if not bpp_id:
+        return False, "callback bpp_id or Authorization subscriber is required"
 
     local = _configured_seller_public_key_b64()
     configured_bpp = (
@@ -2171,6 +2420,15 @@ async def _reconcile_claimed_inbox(pool: Any, record: dict[str, Any]) -> dict[st
                 event_commitment=str(record["event_commitment"]),
                 update=_normalize_logistics_callback(record),
             )
+        elif (
+            context.get("domain") == DEFAULT_DOMAIN
+            and record.get("action") in _RETAIL_LIFECYCLE_CALLBACKS
+        ):
+            await CommerceV1(pool).apply_retail_update(
+                transaction_id=str(record["transaction_id"]),
+                event_commitment=str(record["event_commitment"]),
+                update=_normalize_retail_callback(record),
+            )
         elif record.get("action") in _IGM_CALLBACKS:
             await _record_igm_correlation(
                 envelope,
@@ -2325,7 +2583,7 @@ async def _ingest_callback(
             )
 
     signature_verified = False
-    if normalized_action in _RETAIL_SIGNED_CALLBACKS:
+    if normalized_action in _IGM_CALLBACKS:
         signature_verified, verification_error = await _verify_retail_callback(
             request,
             body,
@@ -2348,6 +2606,24 @@ async def _ingest_callback(
         or ctx.get("core_version") == LOGISTICS_CORE_VERSION
     ):
         signature_verified, verification_error = await _verify_logistics_callback(
+            request,
+            body,
+            action=normalized_action,
+        )
+        if not signature_verified:
+            return JSONResponse(
+                {
+                    "message": {"ack": {"status": "NACK"}},
+                    "error": {
+                        "type": "CORE-ERROR",
+                        "code": "30000",
+                        "message": verification_error,
+                    },
+                },
+                status_code=401,
+            )
+    elif normalized_action in _RETAIL_LIFECYCLE_CALLBACKS:
+        signature_verified, verification_error = await _verify_retail_callback(
             request,
             body,
             action=normalized_action,
@@ -2427,9 +2703,16 @@ async def _ingest_callback(
             )
         background = None
         if (
-            ctx.get("domain") == LOGISTICS_DOMAIN
-            and normalized_action in _LOGISTICS_LIFECYCLE_CALLBACKS
-        ) or normalized_action in _IGM_CALLBACKS:
+            (
+                ctx.get("domain") == LOGISTICS_DOMAIN
+                and normalized_action in _LOGISTICS_LIFECYCLE_CALLBACKS
+            )
+            or (
+                ctx.get("domain") == DEFAULT_DOMAIN
+                and normalized_action in _RETAIL_LIFECYCLE_CALLBACKS
+            )
+            or normalized_action in _IGM_CALLBACKS
+        ):
             background = BackgroundTask(
                 _process_inbox_record,
                 persistence_pool,

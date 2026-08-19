@@ -386,6 +386,106 @@ class CommerceRepository:
             raise ValueError("logistics transaction is bound to multiple orders")
         return rows[0]
 
+    async def get_order_by_retail_transaction(
+        self, transaction_id: str, *, lock: bool = False
+    ) -> dict[str, Any]:
+        suffix = " FOR UPDATE" if lock else ""
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                f"""
+                SELECT * FROM commerce_orders
+                WHERE fulfilment->'retail'->>'transaction_id' = %s
+                ORDER BY created_at
+                LIMIT 2{suffix}
+                """,
+                (transaction_id,),
+            )
+            rows = list(await cursor.fetchall())
+        if not rows:
+            raise LookupError("retail transaction is not bound to an order")
+        if len(rows) != 1:
+            raise ValueError("retail transaction is bound to multiple orders")
+        return rows[0]
+
+    async def get_return_for_order(
+        self, order_id: UUID, *, lock: bool = False
+    ) -> dict[str, Any] | None:
+        suffix = " FOR UPDATE" if lock else ""
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                f"""
+                SELECT * FROM commerce_returns
+                WHERE order_id = %s
+                ORDER BY created_at
+                LIMIT 1{suffix}
+                """,
+                (order_id,),
+            )
+            return await cursor.fetchone()
+
+    async def create_or_get_return(
+        self,
+        *,
+        return_id: UUID,
+        order_id: UUID,
+        principal_id: str,
+        seller_id: str,
+        reason: str,
+    ) -> tuple[dict[str, Any], bool]:
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO commerce_returns (
+                    return_id, order_id, principal_id, seller_id, reason
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (order_id) DO NOTHING
+                RETURNING *
+                """,
+                (return_id, order_id, principal_id, seller_id, reason),
+            )
+            created_row = await cursor.fetchone()
+            if created_row is not None:
+                return created_row, True
+            await cursor.execute(
+                """
+                SELECT * FROM commerce_returns
+                WHERE order_id = %s
+                ORDER BY created_at
+                LIMIT 1
+                """,
+                (order_id,),
+            )
+            existing = await cursor.fetchone()
+        if existing is None:
+            raise RuntimeError("return insert conflicted without an existing row")
+        return existing, False
+
+    async def set_return_status(
+        self,
+        return_id: UUID,
+        *,
+        expected_version: int,
+        status: str,
+        resolution: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                """
+                UPDATE commerce_returns
+                SET status = %s,
+                    version = version + 1,
+                    resolution = COALESCE(%s, resolution),
+                    updated_at = NOW()
+                WHERE return_id = %s AND version = %s
+                RETURNING *
+                """,
+                (status, Jsonb(resolution) if resolution is not None else None, return_id, expected_version),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError("stale return transition")
+        return row
+
     async def update_order_fulfilment(
         self,
         order_id: UUID,

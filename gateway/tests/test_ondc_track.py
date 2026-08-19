@@ -68,6 +68,15 @@ def _seller_key(ed25519_pem: Path) -> Ed25519PrivateKey:
     return key
 
 
+def _sign(envelope: dict, ed25519_pem: Path) -> str:
+    return create_authorization_header(
+        envelope,
+        subscriber_id="ondcseller.aadharcha.in",
+        unique_key_id="seller-uk",
+        private_key=_seller_key(ed25519_pem),
+    )
+
+
 def _retail_envelope(
     *,
     action: str,
@@ -231,7 +240,11 @@ def test_on_confirm_acks_workbench_new_message_id(
             message_id="72b2829c-25b8-49ff-8edf-6cc9bfd334b0",
             message={"order": {"id": "B5d77ff31", "state": "Accepted"}},
         )
-        ack = client.post("/ondc/on_confirm", json=matched)
+        ack = client.post(
+            "/ondc/on_confirm",
+            json=matched,
+            headers={"Authorization": _sign(matched, ed25519_pem)},
+        )
         assert ack.status_code == 200
         assert ack.json()["message"]["ack"]["status"] == "ACK"
 
@@ -241,7 +254,11 @@ def test_on_confirm_acks_workbench_new_message_id(
             message_id="b4905f64-3064-49f9-8465-95f024d47a76",
             message={"order": {"id": "B5d77ff31", "state": "Accepted"}},
         )
-        workbench = client.post("/ondc/on_confirm", json=mismatched)
+        workbench = client.post(
+            "/ondc/on_confirm",
+            json=mismatched,
+            headers={"Authorization": _sign(mismatched, ed25519_pem)},
+        )
         assert workbench.status_code == 200, workbench.text
         assert workbench.json()["message"]["ack"]["status"] == "ACK"
 
@@ -251,7 +268,11 @@ def test_on_confirm_acks_workbench_new_message_id(
             message_id="54816c38-e7c5-446b-a6e6-503d19a662a1",
             message={"order": {"id": "B5d77ff31", "state": "In-progress"}},
         )
-        status_ack = client.post("/ondc/on_status", json=status_mismatch)
+        status_ack = client.post(
+            "/ondc/on_status",
+            json=status_mismatch,
+            headers={"Authorization": _sign(status_mismatch, ed25519_pem)},
+        )
         assert status_ack.status_code == 200, status_ack.text
         assert status_ack.json()["message"]["ack"]["status"] == "ACK"
 
@@ -283,7 +304,17 @@ def test_on_status_accepts_camelcase_and_authorization_subscriber(
         },
         message={"order": {"id": "B5d77ff31", "state": "Accepted"}},
     )
-    camel = client.post("/ondc/on_status", json=envelope)
+    authorization = create_authorization_header(
+        envelope,
+        subscriber_id="ondcseller.aadharcha.in",
+        unique_key_id="seller-uk",
+        private_key=_seller_key(ed25519_pem),
+    )
+    camel = client.post(
+        "/ondc/on_status",
+        json=envelope,
+        headers={"Authorization": authorization},
+    )
     assert camel.status_code == 200, camel.text
     assert camel.json()["message"]["ack"]["status"] == "ACK"
 
