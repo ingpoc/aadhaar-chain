@@ -198,3 +198,67 @@ def test_bpp_select_init_confirm_ack_and_callback(tmp_path: Path, seller_keys: P
     assert orders[0]["state"] == "Accepted"
     assert orders[0]["order"]["items"][0]["id"] == item_id
     assert orders[0]["order"]["quote"]["price"]["value"] == "178.00"
+
+
+def test_bpp_status_track_cancel_update_post_signed_callbacks(
+    tmp_path: Path, seller_keys: Path, monkeypatch
+):
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path / "data"))
+    monkeypatch.setattr(settings, "ondc_enabled", True)
+    monkeypatch.setattr(settings, "ondc_seller_keys_dir", str(seller_keys))
+    monkeypatch.setattr(settings, "ondc_seller_unique_key_id", "seller-uk-id")
+    monkeypatch.setattr(
+        settings, "ondc_seller_signing_private_key_path", str(seller_keys / "signing_private.pem")
+    )
+    monkeypatch.setattr(settings, "ondc_bpp_id", "ondcseller.aadharcha.in")
+    monkeypatch.setattr(settings, "ondc_bpp_uri", "https://ondcseller.aadharcha.in/ondc")
+
+    mock_resp = AsyncMock()
+    mock_resp.status_code = 200
+    mock_resp.text = '{"message":{"ack":{"status":"ACK"}}}'
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = None
+    mock_client.post = AsyncMock(return_value=mock_resp)
+
+    from main import app
+
+    envelope = {
+        "context": {
+            "action": "status",
+            "domain": "ONDC:RET10",
+            "bap_id": "ondcbuyer.aadharcha.in",
+            "bap_uri": "https://ondcbuyer.aadharcha.in/ondc",
+            "bpp_id": "ondcseller.aadharcha.in",
+            "bpp_uri": "https://ondcseller.aadharcha.in/ondc",
+            "transaction_id": "txn-order-lifecycle",
+            "message_id": "msg-status",
+            "city": "std:080",
+            "country": "IND",
+            "core_version": "1.2.0",
+        },
+        "message": {"order_id": "ord_isn_1"},
+    }
+    with patch("app.ondc_bpp.httpx.AsyncClient", return_value=mock_client):
+        client = TestClient(app)
+        for action in ("status", "track", "cancel", "update"):
+            envelope["context"]["action"] = action
+            envelope["context"]["message_id"] = f"msg-{action}"
+            res = client.post(f"/ondc/np/seller/{action}", json=envelope)
+            assert res.status_code == 200, res.text
+            assert res.json()["message"]["ack"]["status"] == "ACK"
+
+    targets = [call.args[0] for call in mock_client.post.await_args_list]
+    assert any(target.endswith("/on_status") for target in targets)
+    assert any(target.endswith("/on_track") for target in targets)
+    assert any(target.endswith("/on_cancel") for target in targets)
+    assert any(target.endswith("/on_update") for target in targets)
+    payloads = [
+        json.loads(call.kwargs["content"].decode("utf-8"))
+        for call in mock_client.post.await_args_list
+    ]
+    by_action = {payload["context"]["action"]: payload for payload in payloads}
+    assert by_action["on_status"]["message"]["order"]["state"] == "In-progress"
+    assert by_action["on_track"]["message"]["tracking"]["url"].startswith("https://")
+    assert by_action["on_cancel"]["message"]["order"]["state"] == "Cancelled"
+    assert all("Authorization" in call.kwargs["headers"] for call in mock_client.post.await_args_list)

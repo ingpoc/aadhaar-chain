@@ -67,3 +67,5 @@ def test_checked_in_migrations_do_not_reuse_live_025_026() -> None:
     assert names[27] == "seller_stores"
     assert 28 in numbers
     assert names[28] == "seller_staff"
+    assert 34 in numbers
+    assert names[34] == "b4_retail_protocol_bind"
