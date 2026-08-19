@@ -31,6 +31,7 @@ from app.ondc_crypto import (
     minify_json,
     verify_authorization_header,
 )
+from app.persistence.connection import live_connection_pool
 from app.persistence.ondc_repository import (
     CorrelationMismatch,
     EnvelopeCommitmentMismatch,
@@ -2012,7 +2013,7 @@ async def _persistent_records(
     state: str | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]] | None:
-    pool = getattr(request.app.state, "persistence_pool", None)
+    pool = live_connection_pool(getattr(request.app.state, "persistence_pool", None))
     if pool is None:
         return None
     async with UnitOfWork(pool) as unit_of_work:

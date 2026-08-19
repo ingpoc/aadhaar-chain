@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from app import agentguard
 from app.agentguard_contract import principal_id_from_wallet
 from app.checkout_orchestrator import CheckoutOrchestrator
+from app.commerce_v1 import CommerceNotFound, CommerceValidation
 from app.models import ApiResponse
 from app.persistence import ConnectionPool
 from app.persistence.agentguard_repository import (
@@ -139,13 +140,13 @@ def _persistence_pool(request: Request) -> ConnectionPool | None:
 
 
 def _raise_persistent_error(error: Exception) -> None:
-    if isinstance(error, AgentGuardNotFound):
+    if isinstance(error, (AgentGuardNotFound, CommerceNotFound)):
         raise HTTPException(status_code=404, detail=str(error)) from error
     if isinstance(error, AgentGuardPermissionDenied):
         raise HTTPException(status_code=403, detail=str(error)) from error
     if isinstance(error, AgentGuardConflict):
         raise HTTPException(status_code=409, detail=str(error)) from error
-    if isinstance(error, ValueError):
+    if isinstance(error, (ValueError, CommerceValidation)):
         raise HTTPException(status_code=422, detail=str(error)) from error
     raise error
 

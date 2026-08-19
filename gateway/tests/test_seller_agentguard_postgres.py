@@ -16,9 +16,11 @@ from psycopg.conninfo import make_conninfo
 
 from app.agentguard_routes import router as agentguard_router
 from app.commerce_compat import CommerceCompatibilityAdapter
+from app.commerce_routes import router as commerce_router
 from app.commerce_v1 import CommerceV1
+from app.commerce_v1_routes import router as commerce_v1_router
 from app.persistence import ConnectionPool, MigrationRunner
-from app.persistence.agentguard_repository import AgentGuardConflict
+from app.persistence.agentguard_repository import AgentGuardConflict, AgentGuardNotFound
 from app.persistence.ondc_repository import persist_callback_before_ack
 from app.seller_agentguard_orchestrator import SellerAgentGuardOrchestrator
 from app.session_auth import SESSION_COOKIE_NAME, create_principal_session_token
@@ -524,3 +526,316 @@ async def test_seller_refund_uses_one_durable_financial_effect(
             """
         )
         assert await counts.fetchone() == (1, 1, 1, 1)
+
+
+def _seller_cookie(principal_id: str) -> str:
+    return create_principal_session_token(
+        principal_id=principal_id,
+        audience="ondcseller",
+        identity_provider="auth0",
+    )
+
+
+def _buyer_cookie(principal_id: str) -> str:
+    return create_principal_session_token(
+        principal_id=principal_id,
+        audience="ondcbuyer",
+        identity_provider="auth0",
+    )
+
+
+async def test_postgres_seller_store_get_empty_is_200_not_404(
+    pool: ConnectionPool,
+) -> None:
+    principal_id = "principal:auth0:store-empty"
+    app = FastAPI()
+    app.state.persistence_pool = pool
+    app.include_router(commerce_router)
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _seller_cookie(principal_id))
+        empty = await client.get("/api/demo-commerce/seller/store")
+        assert empty.status_code == 200, empty.text
+        assert empty.json()["data"]["store"]["status"] == "draft"
+        saved = await client.put(
+            "/api/demo-commerce/seller/store",
+            json={
+                "store_name": "Durable Store",
+                "city": "Hyderabad",
+                "pin": "500001",
+                "fulfilment_sla_hours": 12,
+            },
+        )
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["data"]["store"]["status"] == "ready"
+        loaded = await client.get("/api/demo-commerce/seller/store")
+        assert loaded.json()["data"]["store"]["store_name"] == "Durable Store"
+
+
+async def test_same_principal_buyer_checkout_lists_on_seller_and_short_id(
+    pool: ConnectionPool,
+) -> None:
+    principal_id = "principal:auth0:two-sided-pg"
+    app = FastAPI()
+    app.state.persistence_pool = pool
+    app.include_router(commerce_router)
+    app.include_router(commerce_v1_router)
+    app.include_router(agentguard_router)
+    seller_token = _seller_cookie(principal_id)
+    buyer_token = _buyer_cookie(principal_id)
+    sku = "loop-pg-atta"
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, seller_token)
+        ensure = await client.post(
+            "/api/agentguard/agents/ensure", json={"role": "seller"}
+        )
+        assert ensure.status_code == 200, ensure.text
+        published = await client.post(
+            "/api/agentguard/actions/execute",
+            headers={
+                "Idempotency-Key": "pg-loop-publish",
+                "X-Correlation-ID": "corr:pg-loop-publish",
+            },
+            json={
+                "action": "seller.catalog.publish",
+                "amount_inr": 0,
+                "resource_id": sku,
+                "payload": {
+                    "title": "Sampoorna Whole Wheat Atta 1kg",
+                    "price_inr": 89,
+                    "inventory": 6,
+                    "seller_name": "Sampoorna Groceries",
+                },
+            },
+        )
+        assert published.status_code == 200, published.text
+        assert published.json()["data"]["decision"] == "allow"
+
+        client.cookies.set(SESSION_COOKIE_NAME, buyer_token)
+        compiled = await client.post(
+            "/api/agentguard/mandates/compile",
+            json={"role": "buyer", "limits": {"max_order_paise": 1_000_000}},
+        )
+        assert compiled.status_code == 200, compiled.text
+        mandate_id = compiled.json()["data"]["mandate"]["mandate_id"]
+        confirmed = await client.post(
+            f"/api/agentguard/mandates/{mandate_id}/confirm", json={}
+        )
+        assert confirmed.status_code == 200, confirmed.text
+        cart = await client.post(
+            "/api/commerce/v1/carts",
+            headers={"Idempotency-Key": "pg-loop-cart"},
+            json={"seller_id": principal_id},
+        )
+        assert cart.status_code == 201, cart.text
+        cart_body = cart.json()["data"]["cart"]
+        line = await client.put(
+            f"/api/commerce/v1/carts/{cart_body['cart_id']}/lines/{sku}",
+            headers={"Idempotency-Key": "pg-loop-line"},
+            json={"quantity": 2, "expected_version": cart_body["version"]},
+        )
+        assert line.status_code == 200, line.text
+        cart_body = line.json()["data"]["cart"]
+        preview = await client.post(
+            f"/api/commerce/v1/carts/{cart_body['cart_id']}/checkout-preview",
+            headers={"Idempotency-Key": "pg-loop-preview"},
+            json={"expected_version": cart_body["version"]},
+        )
+        assert preview.status_code == 200, preview.text
+        quote = preview.json()["data"]["quote"]
+        evaluation = await client.post(
+            "/api/agentguard/actions/evaluate",
+            json={
+                "action": "buyer.checkout.commit",
+                "amount_inr": 178,
+                "resource_id": quote["quote_id"],
+                "payload": {"quote_id": quote["quote_id"]},
+            },
+        )
+        assert evaluation.status_code == 200, evaluation.text
+        decision = evaluation.json()["data"]
+        checkout = await client.post(
+            "/api/agentguard/actions/execute",
+            headers={
+                "Idempotency-Key": "pg-loop-checkout",
+                "X-Correlation-ID": "corr:pg-loop-checkout",
+            },
+            json={
+                "action": "buyer.checkout.commit",
+                "amount_inr": 178,
+                "resource_id": quote["quote_id"],
+                "decision_id": decision["decision_id"],
+                "payload": {
+                    "quote_id": quote["quote_id"],
+                    "payment_outcome": "succeeded",
+                },
+            },
+        )
+        assert checkout.status_code == 200, checkout.text
+        order = checkout.json()["data"]["result"]["order"]
+        order_id = order["order_id"]
+        display_id = order.get("display_id") or order_id.replace("-", "")[:8].upper()
+
+        client.cookies.set(SESSION_COOKIE_NAME, seller_token)
+        listed = await client.get("/api/demo-commerce/seller/orders")
+        assert listed.status_code == 200, listed.text
+        ids = {row["order_id"] for row in listed.json()["data"]["orders"]}
+        assert order_id in ids
+        by_uuid = await client.get(f"/api/demo-commerce/seller/orders/{order_id}")
+        assert by_uuid.status_code == 200, by_uuid.text
+        by_short = await client.get(f"/api/demo-commerce/seller/orders/{display_id}")
+        assert by_short.status_code == 200, by_short.text
+        assert by_short.json()["data"]["order"]["order_id"] == order_id
+
+
+async def test_seller_refund_over_limit_and_missing_order_are_server_enforced(
+    pool: ConnectionPool,
+) -> None:
+    seller_id = "principal:auth0:refund-pg"
+    buyer_id = "principal:auth0:refund-pg-buyer"
+    commerce = CommerceV1(pool)
+    await commerce.upsert_inventory(
+        seller_id=seller_id,
+        sku="refund-pg-item",
+        title="Refund item",
+        unit_price_paise=80_000,
+        available_quantity=2,
+    )
+    cart = await commerce.create_cart(
+        principal_id=buyer_id,
+        seller_id=seller_id,
+        idempotency_key="refund-pg-cart",
+    )
+    cart = await commerce.set_cart_line(
+        principal_id=buyer_id,
+        cart_id=cart["cart_id"],
+        sku="refund-pg-item",
+        quantity=1,
+        expected_version=cart["version"],
+        idempotency_key="refund-pg-line",
+    )
+    quote = await commerce.preview_checkout(
+        principal_id=buyer_id,
+        cart_id=cart["cart_id"],
+        expected_version=cart["version"],
+        idempotency_key="refund-pg-preview",
+    )
+    prepared = await commerce.prepare_checkout(
+        principal_id=buyer_id,
+        quote_id=quote["quote_id"],
+        idempotency_key="refund-pg-prepare",
+        request={"proof": "seller-refund-pg"},
+    )
+    await commerce.record_payment_result(
+        principal_id=buyer_id,
+        payment_attempt_id=prepared["payment_attempt"]["payment_attempt_id"],
+        status="succeeded",
+        provider_reference="sandbox:refund-pg",
+    )
+    order_id = str(prepared["order"]["order_id"])
+    orchestrator = SellerAgentGuardOrchestrator(pool)
+    await orchestrator.ensure_agent(principal_id=seller_id)
+
+    over = await orchestrator.execute(
+        principal_id=seller_id,
+        decision_id=None,
+        approval_id=None,
+        action="seller.refund.issue",
+        amount_inr=9000,
+        resource_id=order_id,
+        idempotency_key="refund-pg-over",
+        correlation_id="corr-refund-pg-over",
+        payload={"order_id": order_id},
+    )
+    assert over["decision"] == "need_approval"
+    assert over["reason_code"] == "approval_required_amount"
+    assert over.get("result") is None
+    projected = await CommerceCompatibilityAdapter(pool).get_order(order_id)
+    assert projected.get("refunded_amount_inr") in (0, 0.0, None)
+
+    stepped = await orchestrator.execute(
+        principal_id=seller_id,
+        decision_id=None,
+        approval_id=None,
+        action="seller.refund.issue",
+        amount_inr=6000,
+        resource_id=order_id,
+        idempotency_key="refund-pg-step",
+        correlation_id="corr-refund-pg-step",
+        payload={"order_id": order_id},
+    )
+    assert stepped["decision"] == "need_approval"
+    approved = await orchestrator.execute(
+        principal_id=seller_id,
+        decision_id=stepped["decision_id"],
+        approval_id=stepped["approval"]["approval_id"],
+        action="seller.refund.issue",
+        amount_inr=6000,
+        resource_id=order_id,
+        idempotency_key="refund-pg-approved",
+        correlation_id="corr-refund-pg-approved",
+        payload={"order_id": order_id},
+    )
+    assert approved["decision"] == "allow"
+    replay = await orchestrator.execute(
+        principal_id=seller_id,
+        decision_id=stepped["decision_id"],
+        approval_id=stepped["approval"]["approval_id"],
+        action="seller.refund.issue",
+        amount_inr=6000,
+        resource_id=order_id,
+        idempotency_key="refund-pg-approved",
+        correlation_id="corr-refund-pg-approved",
+        payload={"order_id": order_id},
+    )
+    assert replay["receipt"]["receipt_id"] == approved["receipt"]["receipt_id"]
+
+    with pytest.raises(AgentGuardNotFound, match="Seller order not found"):
+        await orchestrator.execute(
+            principal_id=seller_id,
+            decision_id=None,
+            approval_id=None,
+            action="seller.refund.issue",
+            amount_inr=1000,
+            resource_id="7BA6FE24",
+            idempotency_key="refund-pg-missing",
+            correlation_id="corr-refund-pg-missing",
+            payload={"order_id": "7BA6FE24"},
+        )
+    activity = await orchestrator.ensure_agent(principal_id=seller_id)
+    refund_receipts = [
+        row
+        for row in activity["receipts"]
+        if row.get("action") == "seller.refund.issue"
+    ]
+    assert any(row.get("outcome") == "succeeded" for row in refund_receipts)
+    assert any(row.get("outcome") == "denied" for row in refund_receipts)
+
+    from app.checkout_orchestrator import CheckoutOrchestrator
+
+    await CheckoutOrchestrator(pool).set_agent_status(
+        principal_id=seller_id,
+        agent_id=activity["agent"]["agent_id"],
+        status="paused",
+    )
+    with pytest.raises(AgentGuardConflict, match="Seller decision denied"):
+        await orchestrator.execute(
+            principal_id=seller_id,
+            decision_id=None,
+            approval_id=None,
+            action="seller.refund.issue",
+            amount_inr=100,
+            resource_id=order_id,
+            idempotency_key="refund-pg-paused",
+            correlation_id="corr-refund-pg-paused",
+            payload={"order_id": order_id},
+        )
+    paused_activity = await orchestrator.ensure_agent(principal_id=seller_id)
+    assert any(
+        row.get("action") == "seller.refund.issue" and row.get("outcome") == "paused"
+        for row in paused_activity["receipts"]
+    )

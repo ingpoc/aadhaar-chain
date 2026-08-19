@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 from app import agentguard
 from app.agentguard_contract import canonicalize
 from app.commerce_compat import CommerceCompatibilityAdapter
+from app.commerce_v1 import CommerceNotFound
 from app.persistence.agentguard_repository import (
     AgentGuardConflict,
     AgentGuardNotFound,
@@ -397,7 +398,20 @@ class SellerAgentGuardOrchestrator:
             threshold = int(
                 limits.get(normalized, limits.get("seller.refund.issue", 0))
             )
-            requires_approval = status == "allow" and amount_inr > threshold
+            if status == "allow" and amount_inr > threshold:
+                status = "need_approval"
+                reason_code = "approval_required_amount"
+                over_by = amount_inr - threshold
+                human_reason = (
+                    f"This refund is INR {over_by} above the automatic refund "
+                    "limit and needs one-time approval before execution."
+                    if normalized == "seller.refund.issue"
+                    else (
+                        "This Seller action exceeds the automatic mandate "
+                        "limit and needs one-time approval before execution."
+                    )
+                )
+            requires_approval = status == "need_approval"
             bound_action = {
                 "action": normalized,
                 "amount_inr": amount_inr,
@@ -488,8 +502,31 @@ class SellerAgentGuardOrchestrator:
                 correlation_id=correlation_id,
             )
             decision_id = evaluated["decision_id"]
-            if evaluated.get("approval") is not None and approval_id is None:
+            if evaluated["decision"] == "need_approval" and approval_id is None:
                 return evaluated
+            if evaluated["decision"] != "allow" and approval_id is None:
+                await self._record_denied_receipt(
+                    principal_id=principal_id,
+                    agent=evaluated["agent"],
+                    mandate=evaluated["mandate"],
+                    decision_id=decision_id,
+                    action=normalized,
+                    amount_inr=amount_inr,
+                    resource_id=resource_id,
+                    payload=payload,
+                    correlation_id=correlation_id,
+                    reason_code=str(evaluated.get("reason_code") or "denied"),
+                    human_reason=str(
+                        evaluated.get("human_reason")
+                        or "Seller decision denied the protected action"
+                    ),
+                    outcome=(
+                        "paused"
+                        if str(evaluated.get("reason_code") or "").endswith("paused")
+                        else "denied"
+                    ),
+                )
+                raise AgentGuardConflict("Seller decision denied the protected action")
         bound_action = {
             "action": normalized,
             "amount_inr": amount_inr,
@@ -507,7 +544,9 @@ class SellerAgentGuardOrchestrator:
             )
             if decision is None:
                 raise AgentGuardNotFound("Seller decision not found")
-            if decision["status"] != "allow":
+            if decision["status"] == "need_approval" and approval_id is None:
+                raise AgentGuardConflict("exact Seller approval is required")
+            if decision["status"] not in {"allow", "need_approval"}:
                 raise AgentGuardConflict("Seller decision denied the protected action")
             if decision.get("expiry") and decision["expiry"] <= _utcnow():
                 raise AgentGuardConflict("Seller decision expired")
@@ -546,7 +585,11 @@ class SellerAgentGuardOrchestrator:
             )
             if not created and intent.get("result") is not None:
                 return _jsonable(intent["result"])
-            if created and decision["required_action"] == "review":
+            needs_exact_approval = (
+                decision["status"] == "need_approval"
+                or decision["required_action"] == "review"
+            )
+            if created and needs_exact_approval:
                 if approval_id is None:
                     raise AgentGuardConflict("exact Seller approval is required")
                 await repository.consume_approval(
@@ -554,7 +597,7 @@ class SellerAgentGuardOrchestrator:
                     approval_id=approval_id,
                     request_hash=request_hash,
                 )
-            elif decision["required_action"] == "review" and approval_id is None:
+            elif needs_exact_approval and approval_id is None:
                 raise AgentGuardConflict("exact Seller approval is required")
             await repository.set_execution_intent_status(
                 principal_id=principal_id,
@@ -569,15 +612,34 @@ class SellerAgentGuardOrchestrator:
             if mandate is None:
                 raise AgentGuardNotFound("Seller mandate not found")
 
-        effect = await self._execute_effect(
-            principal_id=principal_id,
-            action=normalized,
-            resource_id=resource_id,
-            payload=payload,
-            amount_inr=amount_inr,
-            idempotency_key=idempotency_key,
-            correlation_id=correlation_id,
-        )
+        try:
+            effect = await self._execute_effect(
+                principal_id=principal_id,
+                action=normalized,
+                resource_id=resource_id,
+                payload=payload,
+                amount_inr=amount_inr,
+                idempotency_key=idempotency_key,
+                correlation_id=correlation_id,
+            )
+        except (AgentGuardNotFound, KeyError, CommerceNotFound) as exc:
+            if normalized != "seller.refund.issue":
+                raise
+            await self._fail_missing_order_refund(
+                principal_id=principal_id,
+                agent=agent,
+                mandate=mandate,
+                decision_id=decision_id,
+                approval_id=approval_id,
+                intent_id=intent["intent_id"],
+                action=normalized,
+                amount_inr=amount_inr,
+                resource_id=resource_id,
+                payload=payload,
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key,
+            )
+            raise AgentGuardNotFound("Seller order not found") from exc
         receipt_id = f"receipt_{uuid4().hex}"
         receipt = sign_receipt(
             {
@@ -709,14 +771,121 @@ class SellerAgentGuardOrchestrator:
                 raise AgentGuardNotFound("Seller issue not found")
             return await self.commerce.remedy_issue(resource_id, payload)
         if action == "seller.refund.issue":
-            return await self.commerce.issue_refund(
-                resource_id,
-                seller_id=principal_id,
-                amount_inr=amount_inr,
-                idempotency_key=idempotency_key,
-                correlation_id=correlation_id,
-            )
+            try:
+                return await self.commerce.issue_refund(
+                    resource_id,
+                    seller_id=principal_id,
+                    amount_inr=amount_inr,
+                    idempotency_key=idempotency_key,
+                    correlation_id=correlation_id,
+                )
+            except (KeyError, CommerceNotFound) as exc:
+                raise AgentGuardNotFound("Seller order not found") from exc
         raise ValueError("unsupported Seller protected action")
+
+    async def _record_denied_receipt(
+        self,
+        *,
+        principal_id: str,
+        agent: dict[str, Any],
+        mandate: dict[str, Any],
+        decision_id: str,
+        action: str,
+        amount_inr: int,
+        resource_id: str,
+        payload: dict[str, Any],
+        correlation_id: str,
+        reason_code: str,
+        human_reason: str,
+        outcome: str,
+        approval_id: str | None = None,
+        intent_id: str | None = None,
+    ) -> dict[str, Any]:
+        receipt_id = f"receipt_{uuid4().hex}"
+        receipt = sign_receipt(
+            {
+                "schema_version": "2",
+                "receipt_id": receipt_id,
+                "principal_id": principal_id,
+                "action": action,
+                "decision_id": decision_id,
+                "approval_id": approval_id,
+                "intent_id": intent_id,
+                "correlation_id": correlation_id,
+                "bound_action": {
+                    "action": action,
+                    "amount_inr": amount_inr,
+                    "resource_id": resource_id,
+                    "payload": payload,
+                    "correlation_id": correlation_id,
+                },
+                "result": None,
+                "outcome": outcome,
+                "reason_code": reason_code,
+                "human_reason": human_reason,
+                "created_at": _utcnow().isoformat(),
+            }
+        )
+        async with UnitOfWork(self.pool) as unit_of_work:
+            await AgentGuardRepository(unit_of_work).record_receipt(
+                receipt_id=receipt_id,
+                principal_id=principal_id,
+                agent_id=agent["agent_id"],
+                mandate_id=mandate["mandate_id"],
+                mandate_version=mandate["version"],
+                decision_id=decision_id,
+                approval_id=approval_id,
+                intent_id=intent_id,
+                status=outcome,
+                payload=receipt,
+            )
+        return receipt
+
+    async def _fail_missing_order_refund(
+        self,
+        *,
+        principal_id: str,
+        agent: dict[str, Any],
+        mandate: dict[str, Any],
+        decision_id: str,
+        approval_id: str | None,
+        intent_id: str,
+        action: str,
+        amount_inr: int,
+        resource_id: str,
+        payload: dict[str, Any],
+        correlation_id: str,
+        idempotency_key: str,
+    ) -> None:
+        receipt = await self._record_denied_receipt(
+            principal_id=principal_id,
+            agent=agent,
+            mandate=mandate,
+            decision_id=decision_id,
+            action=action,
+            amount_inr=amount_inr,
+            resource_id=resource_id,
+            payload=payload,
+            correlation_id=correlation_id,
+            reason_code="resource_not_found",
+            human_reason="Seller order not found",
+            outcome="denied",
+            approval_id=approval_id,
+            intent_id=intent_id,
+        )
+        async with UnitOfWork(self.pool) as unit_of_work:
+            await AgentGuardRepository(unit_of_work).set_execution_intent_status(
+                principal_id=principal_id,
+                intent_id=intent_id,
+                status="failed",
+                result={
+                    "decision": "deny",
+                    "reason_code": "resource_not_found",
+                    "human_reason": "Seller order not found",
+                    "receipt": receipt,
+                    "idempotency_key": idempotency_key,
+                },
+            )
 
 
 __all__ = ["SellerAgentGuardOrchestrator"]

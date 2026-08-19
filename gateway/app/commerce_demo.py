@@ -1436,7 +1436,6 @@ def publish_item_from_payload(
     resource_id: str,
     idempotency_key: str,
 ) -> dict[str, Any]:
-    require_ready_store(principal_id)
     item_id = payload.get("item_id")
     effective_payload = {**payload, "seller_id": principal_id}
     if not item_id:

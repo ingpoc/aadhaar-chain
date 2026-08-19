@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from app.commerce_v1 import CommerceV1
+from app.commerce_v1 import CommerceV1, empty_store
 from app.domain_state_machines import apply_igm_legal_path, require_transition
 from app.persistence.connection import ConnectionPool
 from app.persistence.transaction import UnitOfWork
@@ -30,6 +30,17 @@ def _as_uuid(value: str | None) -> UUID | None:
         return UUID(str(value))
     except (ValueError, TypeError, AttributeError):
         return None
+
+
+def _order_hex_prefix(value: str) -> str | None:
+    prefix = str(value or "").replace("-", "").strip().lower()
+    if len(prefix) < 8 or any(character not in "0123456789abcdef" for character in prefix):
+        return None
+    return prefix
+
+
+DEFAULT_DELIVERY_ESTIMATE = "Delivery timing confirmed at checkout"
+DEFAULT_RETURN_POLICY = "Return eligibility confirmed before order placement"
 
 
 def stamp_fulfilment_sla(
@@ -65,22 +76,41 @@ class CommerceCompatibilityAdapter:
 
     @staticmethod
     def _item(row: dict[str, Any]) -> dict[str, Any]:
+        sla_hours = row.get("fulfilment_sla_hours")
+        return_days = row.get("return_window_days")
+        store_delivery = (
+            f"{int(sla_hours)}-hour delivery" if sla_hours is not None else None
+        )
+        store_returns = (
+            f"Returns within {int(return_days)} days"
+            if return_days is not None
+            else None
+        )
+        seller_name = str(row.get("seller_name") or "").strip() or None
+        store_name = str(row.get("store_name") or "").strip() or None
         return {
             "item_id": row["sku"],
             "version": row["version"],
             "status": row["status"],
             "seller_id": row["seller_id"],
-            "seller_name": row.get("seller_name"),
+            "seller_name": seller_name or store_name,
             "title": row["title"],
             "description": row.get("description") or "",
             "price_inr": row["unit_price_paise"] / 100,
             "inventory": row["available_quantity"] - row["reserved_quantity"],
             "category_id": row.get("category_id"),
-            "delivery_estimate": row.get("delivery_estimate"),
-            "return_policy": row.get("return_policy"),
+            "delivery_estimate": (
+                row.get("delivery_estimate")
+                or store_delivery
+                or DEFAULT_DELIVERY_ESTIMATE
+            ),
+            "return_policy": (
+                row.get("return_policy") or store_returns or DEFAULT_RETURN_POLICY
+            ),
             "image_url": row.get("image_url"),
             "image_caption": row.get("image_caption"),
-            "delivery_areas": row.get("delivery_areas") or [],
+            "delivery_areas": row.get("delivery_areas")
+            or list(row.get("serviceability_tokens") or []),
             "created_at": _iso(row["created_at"]),
             "updated_at": _iso(row["updated_at"]),
         }
@@ -90,8 +120,10 @@ class CommerceCompatibilityAdapter:
         lines = row.get("line_snapshot") or []
         line = lines[0] if lines else {}
         payment_status = row.get("payment_status")
+        order_id = str(row["order_id"])
         return {
-            "order_id": str(row["order_id"]),
+            "order_id": order_id,
+            "display_id": order_id.replace("-", "")[:8].upper(),
             "transaction_id": str(row["order_id"]),
             "message_id": str(row["payment_attempt_id"]),
             "buyer_id": row["principal_id"],
@@ -243,6 +275,10 @@ class CommerceCompatibilityAdapter:
     async def get_store(self, seller_id: str) -> dict[str, Any] | None:
         row = await self.commerce.get_store(seller_id)
         return self._store(row)
+
+    async def get_store_or_empty(self, seller_id: str) -> dict[str, Any]:
+        store = await self.get_store(seller_id)
+        return store if store is not None else empty_store(seller_id)
 
     async def upsert_store(
         self, seller_id: str, body: dict[str, Any]
@@ -434,19 +470,26 @@ class CommerceCompatibilityAdapter:
         clauses: list[str] = []
         parameters: list[Any] = []
         if seller_id is not None:
-            clauses.append("seller_id = %s")
+            clauses.append("i.seller_id = %s")
             parameters.append(seller_id)
         if published_only:
-            clauses.append("status = 'published'")
+            clauses.append("i.status = 'published'")
         if query and query.strip():
-            clauses.append("(title ILIKE %s OR description ILIKE %s)")
+            clauses.append("(i.title ILIKE %s OR i.description ILIKE %s)")
             needle = f"%{query.strip()}%"
             parameters.extend((needle, needle))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         async with UnitOfWork(self.pool) as unit_of_work:
             async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(
-                    f"SELECT * FROM commerce_inventory {where} ORDER BY created_at DESC",
+                    f"""
+                    SELECT i.*, st.store_name, st.fulfilment_sla_hours,
+                           st.return_window_days, st.serviceability_tokens
+                    FROM commerce_inventory i
+                    LEFT JOIN commerce_seller_stores st ON st.seller_id = i.seller_id
+                    {where}
+                    ORDER BY i.created_at DESC
+                    """,
                     parameters,
                 )
                 rows = list(await cursor.fetchall())
@@ -517,7 +560,7 @@ class CommerceCompatibilityAdapter:
         rows = await self._orders(
             order_id=order_id, principal_id=principal_id, seller_id=seller_id
         )
-        if not rows:
+        if len(rows) != 1:
             raise KeyError("order not found")
         return self._order(rows[0])
 
@@ -530,9 +573,10 @@ class CommerceCompatibilityAdapter:
         idempotency_key: str,
         correlation_id: str,
     ) -> dict[str, Any]:
+        order = await self.get_order(order_id, seller_id=seller_id)
         return await self.commerce.issue_refund(
             seller_id=seller_id,
-            order_id=order_id,
+            order_id=order["order_id"],
             amount_paise=amount_inr * 100,
             idempotency_key=idempotency_key,
             correlation_id=correlation_id,
@@ -984,10 +1028,16 @@ class CommerceCompatibilityAdapter:
     async def _inventory(
         self, item_id: str, *, seller_id: str | None = None
     ) -> dict[str, Any]:
-        query = "SELECT * FROM commerce_inventory WHERE sku = %s"
+        query = (
+            "SELECT i.*, st.store_name, st.fulfilment_sla_hours, "
+            "st.return_window_days, st.serviceability_tokens "
+            "FROM commerce_inventory i "
+            "LEFT JOIN commerce_seller_stores st ON st.seller_id = i.seller_id "
+            "WHERE i.sku = %s"
+        )
         parameters: list[Any] = [item_id]
         if seller_id is not None:
-            query += " AND seller_id = %s"
+            query += " AND i.seller_id = %s"
             parameters.append(seller_id)
         async with UnitOfWork(self.pool) as unit_of_work:
             async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
@@ -1041,10 +1091,15 @@ class CommerceCompatibilityAdapter:
         parameters: list[Any] = []
         if order_id is not None:
             parsed = _as_uuid(order_id)
-            if parsed is None:
-                return []
-            clauses.append("o.order_id = %s")
-            parameters.append(parsed)
+            if parsed is not None:
+                clauses.append("o.order_id = %s")
+                parameters.append(parsed)
+            else:
+                prefix = _order_hex_prefix(order_id)
+                if prefix is None:
+                    return []
+                clauses.append("replace(o.order_id::text, '-', '') LIKE %s")
+                parameters.append(prefix + "%")
         if principal_id is not None:
             clauses.append("o.principal_id = %s")
             parameters.append(principal_id)

@@ -58,3 +58,8 @@ class ConnectionPool:
     @property
     def is_open(self) -> bool:
         return not self._pool.closed
+
+
+def live_connection_pool(pool: Any) -> ConnectionPool | None:
+    """Treat only an open gateway pool as PostgreSQL persistence."""
+    return pool if isinstance(pool, ConnectionPool) and pool.is_open else None
