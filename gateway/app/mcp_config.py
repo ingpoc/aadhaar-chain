@@ -44,11 +44,19 @@ class MCPRegistry(BaseModel):
         return self.servers.get(name)
 
 
+class AgentDefinition(BaseModel):
+    """Enabled-flag registration for a portfolio verification agent."""
+
+    agent_id: str
+    name: str
+    enabled: bool = True
+
+
 class AgentRegistry(BaseModel):
     """Registry of portfolio verification agents and their configurations."""
-    agents: Dict[str, "AgentDefinition"] = {}
+    agents: Dict[str, AgentDefinition] = {}
     
-    def register_agent(self, agent_def: "AgentDefinition"):
+    def register_agent(self, agent_def: AgentDefinition):
         """Register a new agent."""
         self.agents[agent_def.agent_id] = agent_def
     
@@ -66,7 +74,7 @@ class AgentRegistry(BaseModel):
         """Get list of enabled agent IDs."""
         return [agent_id for agent_id, config in self.agents.items() if config.enabled]
     
-    def get_agent_config(self, agent_id: str) -> Optional["AgentDefinition"]:
+    def get_agent_config(self, agent_id: str) -> Optional[AgentDefinition]:
         """Get configuration for a specific agent."""
         return self.agents.get(agent_id)
 

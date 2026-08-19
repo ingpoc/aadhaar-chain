@@ -29,6 +29,23 @@ jobs:
     defaults:
       run:
         working-directory: gateway
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/agentguard_test
+      AADHAAR_CHAIN_ENV: demo
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: agentguard_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d agentguard_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - uses: actions/checkout@v6
@@ -41,10 +58,16 @@ jobs:
       - name: Install gateway dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Ruff
+        run: ruff check app tests scripts
 
       - name: Validate gateway imports
-        run: python -m py_compile app/*.py tests/*.py ../mcp-servers/document-processor/server.py
+        run: python -m py_compile app/*.py tests/*.py scripts/*.py ../mcp-servers/document-processor/server.py
+
+      - name: Apply gateway migrations
+        run: python scripts/apply_migrations.py
 
       - name: Run gateway tests
         env:
