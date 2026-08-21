@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     # IPFS
     ipfs_gateway_url: str = "https://ipfs.io/ipfs"
 
+    # Razorpay Test Mode only (A7 sandbox). Never set rzp_live_ keys.
+    razorpay_key_id: Optional[str] = None
+    razorpay_key_secret: Optional[str] = None
+    razorpay_webhook_secret: Optional[str] = None
+
     # Setu.co Aadhaar eKYC (preferred production KYC rail)
     setu_ekyc_enabled: bool = False
     setu_ekyc_base_url: str = "https://dg-sandbox.setu.co"

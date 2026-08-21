@@ -1,8 +1,10 @@
 """Durable, single-seller commerce application service.
 
-This module models a simulated payment saga.  It deliberately does not call or
-claim a real payment provider: prepare, result recording, and reconciliation are
-separate durable operations.
+Prepare, result recording, and reconciliation are separate durable operations.
+The money owner is this CommerceV1 payment/ledger. The default rail is simulated.
+When Razorpay Test Mode keys (``rzp_test_``) are configured, checkout can capture
+via Razorpay Orders + Checkout HMAC + webhooks, still posting this same ledger.
+Live Razorpay keys are refused.
 """
 
 from __future__ import annotations
@@ -24,6 +26,20 @@ from .persistence.commerce_repository import CommerceRepository
 from .persistence.connection import ConnectionPool
 from .persistence.repositories import IdempotencyConflict, IdempotencyRepository
 from .persistence.transaction import UnitOfWork
+from .razorpay_test import (
+    CURRENCY,
+    PROVIDER as RAZORPAY_PROVIDER,
+    RazorpayApiError,
+    RazorpayConfigError,
+    RazorpayNotConfigured,
+    RazorpayTestClient,
+    razorpay_payment_id_from_result,
+    require_razorpay_client,
+    require_webhook_secret,
+    resolve_payment_rail,
+    verify_checkout_signature,
+    verify_webhook_signature,
+)
 
 
 class CommerceConflict(RuntimeError):
@@ -852,6 +868,9 @@ class CommerceV1:
             raise CommerceConflict("refund exceeds the verified paid amount")
         seller_id = str(order["seller_id"])
         idempotency_key = f"ondc-ret10:{event_commitment}"
+        razorpay_payment_id = razorpay_payment_id_from_result(
+            refundable.get("payment_result")
+        )
         refund_namespace = f"commerce-refund:{seller_id}:{idempotency_key}"
         refund, created = await repository.create_or_get_refund(
             refund_id=uuid5(NAMESPACE_URL, refund_namespace),
@@ -864,6 +883,22 @@ class CommerceV1:
             correlation_id=str(update.get("message_id") or event_commitment),
         )
         if created:
+            if (
+                refundable.get("payment_provider") == RAZORPAY_PROVIDER
+                and razorpay_payment_id
+            ):
+                try:
+                    await require_razorpay_client().refund(
+                        payment_id=razorpay_payment_id,
+                        amount_paise=amount_paise,
+                        idempotency_key=idempotency_key,
+                    )
+                except RazorpayConfigError:
+                    raise
+                except Exception as exc:
+                    raise CommerceConflict(
+                        f"Razorpay Test refund failed: {exc}"
+                    ) from exc
             require_transition("refund", refund["status"], "succeeded")
             transaction_id = uuid5(NAMESPACE_URL, f"{refund_namespace}:ledger")
             await repository.post_balanced_ledger(
@@ -1101,6 +1136,327 @@ class CommerceV1:
             except LookupError as exc:
                 raise CommerceNotFound(str(exc)) from exc
         return _jsonable({"order": order, "payment_attempt": payment})
+
+    async def create_razorpay_checkout_order(
+        self,
+        *,
+        principal_id: str,
+        order_id: str | UUID,
+        client: RazorpayTestClient | None = None,
+    ) -> dict[str, Any]:
+        """Create a Razorpay Test Order for a CommerceV1 order that is ready to pay."""
+        rail = resolve_payment_rail()
+        if rail["rail"] != RAZORPAY_PROVIDER:
+            raise RazorpayNotConfigured(str(rail["message"]))
+        razorpay = client or require_razorpay_client()
+        try:
+            order_uuid = UUID(str(order_id))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise CommerceNotFound("order not found") from exc
+        async with UnitOfWork(self.pool) as unit_of_work:
+            repository = CommerceRepository(unit_of_work)
+            try:
+                order = await repository.get_order(order_uuid, lock=True)
+                if order["principal_id"] != principal_id:
+                    raise CommerceNotFound("order not found")
+                if order["status"] != "payment_pending":
+                    raise CommerceConflict("order is not ready to pay")
+                payment = await repository.get_payment_for_order(order_uuid, lock=True)
+                if payment["status"] != "pending":
+                    raise CommerceConflict("payment attempt is not pending")
+                existing_ref = str(payment.get("provider_reference") or "")
+                if existing_ref and payment.get("provider") == RAZORPAY_PROVIDER:
+                    razorpay_order_id = existing_ref
+                else:
+                    created = await razorpay.create_order(
+                        amount_paise=int(payment["amount_paise"]),
+                        receipt=str(payment["payment_attempt_id"]),
+                        notes={
+                            "commerce_order_id": str(order["order_id"]),
+                            "payment_attempt_id": str(payment["payment_attempt_id"]),
+                        },
+                    )
+                    razorpay_order_id = str(created.get("id") or "")
+                    if not razorpay_order_id:
+                        raise RazorpayApiError("Razorpay order create returned no id")
+                    if int(created.get("amount") or 0) != int(payment["amount_paise"]):
+                        raise RazorpayApiError(
+                            "Razorpay order amount does not match commerce paise"
+                        )
+                    if str(created.get("currency") or CURRENCY) != CURRENCY:
+                        raise RazorpayApiError("Razorpay order currency must be INR")
+                    try:
+                        payment = await repository.attach_provider_order(
+                            payment["payment_attempt_id"],
+                            provider=RAZORPAY_PROVIDER,
+                            provider_reference=razorpay_order_id,
+                            result={
+                                "rail": RAZORPAY_PROVIDER,
+                                "razorpay_order_id": razorpay_order_id,
+                                "simulated": False,
+                                "source": "create_order",
+                            },
+                        )
+                    except ValueError as exc:
+                        raise CommerceConflict(str(exc)) from exc
+            except LookupError as exc:
+                raise CommerceNotFound(str(exc)) from exc
+        return _jsonable(
+            {
+                "order": order,
+                "payment_attempt": payment,
+                "payment_rail": rail,
+                "razorpay": {
+                    "key": rail["key_id"],
+                    "amount": int(payment["amount_paise"]),
+                    "currency": CURRENCY,
+                    "order_id": razorpay_order_id,
+                    "name": "AgentGuard",
+                    "description": "ONDC Buyer checkout (Razorpay Test Mode)",
+                },
+            }
+        )
+
+    async def confirm_razorpay_checkout(
+        self,
+        *,
+        principal_id: str,
+        order_id: str | UUID,
+        razorpay_order_id: str,
+        razorpay_payment_id: str,
+        razorpay_signature: str,
+    ) -> dict[str, Any]:
+        """Verify Checkout HMAC and capture into the CommerceV1 ledger."""
+        rail = resolve_payment_rail()
+        if rail["rail"] != RAZORPAY_PROVIDER:
+            raise RazorpayNotConfigured(str(rail["message"]))
+        verify_checkout_signature(
+            razorpay_order_id=razorpay_order_id,
+            razorpay_payment_id=razorpay_payment_id,
+            razorpay_signature=razorpay_signature,
+        )
+        try:
+            order_uuid = UUID(str(order_id))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise CommerceNotFound("order not found") from exc
+        async with UnitOfWork(self.pool) as unit_of_work:
+            repository = CommerceRepository(unit_of_work)
+            try:
+                order = await repository.get_order(order_uuid, lock=True)
+                if order["principal_id"] != principal_id:
+                    raise CommerceNotFound("order not found")
+                payment = await repository.get_payment_for_order(order_uuid, lock=True)
+            except LookupError as exc:
+                raise CommerceNotFound(str(exc)) from exc
+            if str(payment.get("provider_reference") or "") != razorpay_order_id:
+                raise CommerceConflict(
+                    "razorpay_order_id does not match this commerce order"
+                )
+        return await self.apply_provider_payment_result(
+            principal_id=principal_id,
+            payment_attempt_id=payment["payment_attempt_id"],
+            status="succeeded",
+            provider_payment_id=razorpay_payment_id,
+            detail={
+                "rail": RAZORPAY_PROVIDER,
+                "razorpay_order_id": razorpay_order_id,
+                "razorpay_payment_id": razorpay_payment_id,
+                "simulated": False,
+                "source": "checkout",
+            },
+        )
+
+    async def apply_razorpay_webhook(
+        self,
+        *,
+        body: bytes,
+        signature: str,
+        event_id: str | None,
+        webhook_secret: str | None = None,
+    ) -> dict[str, Any]:
+        """Verify webhook HMAC and reconcile payment.captured / payment.failed."""
+        resolve_payment_rail()
+        secret = webhook_secret if webhook_secret is not None else require_webhook_secret()
+        verify_webhook_signature(body=body, signature=signature, secret=secret)
+        try:
+            event = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CommerceValidation("webhook body must be JSON") from exc
+        if not isinstance(event, dict):
+            raise CommerceValidation("webhook body must be a JSON object")
+        event_name = str(event.get("event") or "")
+        stable_event_id = (event_id or "").strip() or str(event.get("id") or "")
+        if not stable_event_id:
+            stable_event_id = hashlib.sha256(body).hexdigest()
+        request_hash = hashlib.sha256(body).hexdigest()
+        if event_name not in {"payment.captured", "payment.failed"}:
+            return {
+                "ignored": True,
+                "reason": "unhandled_event",
+                "event": event_name,
+                "event_id": stable_event_id,
+            }
+        payment_entity = ((event.get("payload") or {}).get("payment") or {}).get(
+            "entity"
+        ) or {}
+        if not isinstance(payment_entity, dict):
+            raise CommerceValidation("webhook payment entity is missing")
+        razorpay_order_id = str(payment_entity.get("order_id") or "")
+        razorpay_payment_id = str(payment_entity.get("id") or "")
+        if not razorpay_order_id or not razorpay_payment_id:
+            raise CommerceValidation("webhook payment is missing order_id or id")
+        status = "succeeded" if event_name == "payment.captured" else "failed"
+        async with UnitOfWork(self.pool) as unit_of_work:
+            idempotency = IdempotencyRepository(unit_of_work)
+            created, record = await idempotency.create_or_get(
+                "razorpay:webhook",
+                "commerce.razorpay.webhook.v1",
+                stable_event_id,
+                request_hash,
+                resource=razorpay_order_id,
+            )
+            if not created and record["status"] == "success" and record["response"] is not None:
+                return {**record["response"], "duplicate": True}
+        try:
+            applied = await self.apply_provider_payment_result(
+                principal_id=None,
+                provider_reference=razorpay_order_id,
+                status=status,
+                provider_payment_id=razorpay_payment_id,
+                expected_amount_paise=int(payment_entity["amount"])
+                if payment_entity.get("amount") is not None
+                else None,
+                expected_currency=str(payment_entity.get("currency") or CURRENCY),
+                detail={
+                    "rail": RAZORPAY_PROVIDER,
+                    "razorpay_order_id": razorpay_order_id,
+                    "razorpay_payment_id": razorpay_payment_id,
+                    "simulated": False,
+                    "source": "webhook",
+                    "event": event_name,
+                    "event_id": stable_event_id,
+                },
+            )
+        except CommerceNotFound:
+            applied = {
+                "ignored": True,
+                "reason": "payment_not_found",
+                "event": event_name,
+                "event_id": stable_event_id,
+                "razorpay_order_id": razorpay_order_id,
+            }
+        except Exception as error:
+            async with UnitOfWork(self.pool) as unit_of_work:
+                await IdempotencyRepository(unit_of_work).update_response(
+                    "razorpay:webhook",
+                    "commerce.razorpay.webhook.v1",
+                    stable_event_id,
+                    "failure",
+                    {"error": str(error)},
+                )
+            raise
+        response = _jsonable(
+            {
+                "duplicate": False,
+                "event": event_name,
+                "event_id": stable_event_id,
+                **applied,
+            }
+        )
+        async with UnitOfWork(self.pool) as unit_of_work:
+            await IdempotencyRepository(unit_of_work).update_response(
+                "razorpay:webhook",
+                "commerce.razorpay.webhook.v1",
+                stable_event_id,
+                "success",
+                response,
+            )
+        return response
+
+    async def apply_provider_payment_result(
+        self,
+        *,
+        principal_id: str | None,
+        status: str,
+        payment_attempt_id: str | UUID | None = None,
+        provider_reference: str | None = None,
+        provider_payment_id: str | None = None,
+        expected_amount_paise: int | None = None,
+        expected_currency: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Idempotently capture or fail a pending CommerceV1 payment attempt."""
+        if status not in {"succeeded", "failed"}:
+            raise CommerceValidation("provider result must be succeeded or failed")
+        async with UnitOfWork(self.pool) as unit_of_work:
+            repository = CommerceRepository(unit_of_work)
+            try:
+                if payment_attempt_id is not None:
+                    payment = await repository.get_payment(
+                        UUID(str(payment_attempt_id)), lock=True
+                    )
+                elif provider_reference:
+                    payment = await repository.get_payment_by_provider_reference(
+                        provider_reference, lock=True
+                    )
+                else:
+                    raise CommerceValidation("payment attempt is required")
+                if principal_id is not None and payment["principal_id"] != principal_id:
+                    raise CommerceNotFound("payment attempt not found")
+            except LookupError as exc:
+                raise CommerceNotFound(str(exc)) from exc
+            if expected_currency and expected_currency != CURRENCY:
+                raise CommerceConflict("Razorpay payment currency must be INR")
+            if (
+                expected_amount_paise is not None
+                and int(expected_amount_paise) != int(payment["amount_paise"])
+            ):
+                raise CommerceConflict("Razorpay payment amount does not match order paise")
+            stored_payment_id = razorpay_payment_id_from_result(payment.get("result"))
+            current = payment["status"]
+            if current == "pending":
+                attempt_id = payment["payment_attempt_id"]
+                owner = payment["principal_id"]
+            elif current in {"succeeded", "reconciled"} and status == "succeeded":
+                if (
+                    stored_payment_id
+                    and provider_payment_id
+                    and stored_payment_id != provider_payment_id
+                ):
+                    raise CommerceConflict("payment already captured with a different id")
+                order = await repository.get_order(payment["order_id"])
+                return _jsonable({"order": order, "payment_attempt": payment})
+            elif current == "failed" and status == "failed":
+                order = await repository.get_order(payment["order_id"])
+                return _jsonable({"order": order, "payment_attempt": payment})
+            elif current in {"succeeded", "reconciled"} and status == "failed":
+                order = await repository.get_order(payment["order_id"])
+                return _jsonable({"order": order, "payment_attempt": payment})
+            else:
+                raise CommerceConflict(
+                    f"payment attempt is {current}, not pending for {status}"
+                )
+        merged = {**(payment.get("result") or {}), **(detail or {})}
+        if provider_payment_id:
+            merged["razorpay_payment_id"] = provider_payment_id
+        try:
+            return await self.record_payment_result(
+                principal_id=owner,
+                payment_attempt_id=attempt_id,
+                status=status,
+                provider_reference=provider_reference,
+                detail=merged,
+            )
+        except CommerceConflict:
+            state = await self.get_payment_state(
+                principal_id=owner, payment_attempt_id=attempt_id
+            )
+            current_status = state["payment_attempt"]["status"]
+            if status == "succeeded" and current_status in {"succeeded", "reconciled"}:
+                return state
+            if status == "failed" and current_status == "failed":
+                return state
+            raise
 
     async def prepare_checkout(
         self,
@@ -1350,6 +1706,25 @@ class CommerceV1:
                     correlation_id=correlation_id,
                 )
                 if created:
+                    razorpay_payment_id = razorpay_payment_id_from_result(
+                        order.get("payment_result")
+                    )
+                    if (
+                        order.get("payment_provider") == RAZORPAY_PROVIDER
+                        and razorpay_payment_id
+                    ):
+                        try:
+                            await require_razorpay_client().refund(
+                                payment_id=razorpay_payment_id,
+                                amount_paise=amount_paise,
+                                idempotency_key=idempotency_key,
+                            )
+                        except RazorpayConfigError:
+                            raise
+                        except Exception as exc:
+                            raise CommerceConflict(
+                                f"Razorpay Test refund failed: {exc}"
+                            ) from exc
                     require_transition("refund", refund["status"], "succeeded")
                     transaction_id = uuid5(
                         NAMESPACE_URL, f"{refund_namespace}:ledger"
