@@ -20,6 +20,7 @@ from app.persistence.commerce_repository import CommerceRepository
 from app.persistence.connection import ConnectionPool
 from app.persistence.transaction import UnitOfWork
 from app.receipt_signing import sign_receipt
+from app.razorpay import resolve_payment_rail
 
 
 def _utcnow() -> datetime:
@@ -751,6 +752,7 @@ class CheckoutOrchestrator:
     ) -> dict[str, Any]:
         if payment_outcome not in {"succeeded", "failed", "unknown"}:
             raise ValueError("unsupported simulated payment outcome")
+        payment_rail = resolve_payment_rail()
         normalized_delivery_context = _normalized_delivery_context(delivery_context)
         async with UnitOfWork(self.pool) as unit_of_work:
             agentguard = AgentGuardRepository(unit_of_work)
@@ -847,20 +849,30 @@ class CheckoutOrchestrator:
             current_status = payment_state["payment_attempt"]["status"]
             if (
                 not created
+                and intent.get("result") is not None
+                and current_status == "pending"
+                and payment_rail["rail"] == "razorpay_test"
+            ):
+                return intent["result"]
+            if (
+                not created
                 and current_status == "unknown"
                 and intent.get("result") is not None
             ):
                 return intent["result"]
             if current_status == "pending":
-                payment_result = await self.commerce.record_payment_result(
-                    principal_id=principal_id,
-                    payment_attempt_id=commerce_result["payment_attempt"][
-                        "payment_attempt_id"
-                    ],
-                    status=payment_outcome,
-                    provider_reference=f"sandbox:{idempotency_key}",
-                    detail={"simulated": True},
-                )
+                if payment_rail["rail"] == "razorpay_test":
+                    payment_result = payment_state
+                else:
+                    payment_result = await self.commerce.record_payment_result(
+                        principal_id=principal_id,
+                        payment_attempt_id=commerce_result["payment_attempt"][
+                            "payment_attempt_id"
+                        ],
+                        status=payment_outcome,
+                        provider_reference=f"sandbox:{idempotency_key}",
+                        detail={"simulated": True, "payment_rail": payment_rail},
+                    )
             elif (
                 (
                     not created
@@ -878,7 +890,11 @@ class CheckoutOrchestrator:
                 raise AgentGuardConflict(
                     f"payment is already {current_status}, not {payment_outcome}"
                 )
-            verified_result = {**commerce_result, **payment_result}
+            verified_result = {
+                **commerce_result,
+                **payment_result,
+                "payment_rail": payment_rail,
+            }
         except Exception as error:
             async with UnitOfWork(self.pool) as unit_of_work:
                 await AgentGuardRepository(unit_of_work).set_execution_intent_status(
@@ -890,6 +906,7 @@ class CheckoutOrchestrator:
             raise
 
         payment_status = verified_result["payment_attempt"]["status"]
+        payment_rail = verified_result.get("payment_rail") or {}
         if payment_status in {"succeeded", "reconciled"}:
             intent_status = "succeeded"
             receipt_status = "executed"
@@ -904,6 +921,18 @@ class CheckoutOrchestrator:
             reason_code = "PAYMENT_FAILED"
             human_reason = "Payment failed. No successful purchase was recorded."
             required_action = "review"
+        elif (
+            payment_status == "pending" and payment_rail.get("rail") == "razorpay_test"
+        ):
+            intent_status = "executing"
+            receipt_status = "pending"
+            receipt_outcome = "awaiting_payment"
+            reason_code = "AWAITING_RAZORPAY_TEST_PAYMENT"
+            human_reason = (
+                "Order is ready to pay via Razorpay Test Mode. "
+                "No live customer money is captured."
+            )
+            required_action = "pay"
         else:
             intent_status = "executing"
             receipt_status = "pending"

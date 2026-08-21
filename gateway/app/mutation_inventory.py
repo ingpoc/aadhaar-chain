@@ -70,8 +70,17 @@ def _record(method: str, path: str, handler: str) -> MutationRecord:
         action = "buyer_commerce_command"
         authority = "session_principal_plus_AgentGuard_at_checkout_effect"
         audit = "commerce_version_idempotency_ledger_and_AgentGuard_receipt"
-        risk = "high" if "checkout" in path else "medium"
+        risk = "high" if "checkout" in path or "razorpay" in path else "medium"
         negative = "reject_stale_version_foreign_principal_or_idempotency_conflict"
+        if "razorpay/webhook" in path:
+            authority = "razorpay_test_webhook_hmac"
+            action = "commerce_payment_reconcile"
+            idempotency = "x_razorpay_event_id"
+            negative = "reject_invalid_signature_live_key_or_unconfigured_secret"
+        elif "razorpay" in path:
+            authority = "buyer_session_plus_razorpay_test_checkout_hmac"
+            action = "commerce_payment_capture"
+            negative = "reject_foreign_order_invalid_signature_or_live_key"
     elif path.startswith("/api/demo-commerce/test-fixtures/"):
         policy_family = "fixture_compatibility"
         owner = "CommerceCompatibilityAdapter"

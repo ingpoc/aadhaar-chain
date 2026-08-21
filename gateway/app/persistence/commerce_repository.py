@@ -518,6 +518,56 @@ class CommerceRepository:
             lock=lock,
         )
 
+    async def get_payment_for_order(
+        self, order_id: UUID, *, lock: bool = False
+    ) -> dict[str, Any]:
+        return await self._dict_row(
+            "commerce_payment_attempts",
+            "order_id = %s",
+            (order_id,),
+            lock=lock,
+        )
+
+    async def get_payment_by_provider_reference(
+        self, provider_reference: str, *, lock: bool = False
+    ) -> dict[str, Any]:
+        return await self._dict_row(
+            "commerce_payment_attempts",
+            "provider_reference = %s",
+            (provider_reference,),
+            lock=lock,
+        )
+
+    async def attach_provider_order(
+        self,
+        payment_attempt_id: UUID,
+        *,
+        provider: str,
+        provider_reference: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        payment = await self.get_payment(payment_attempt_id, lock=True)
+        merged = {**(payment.get("result") or {}), **result}
+        current_ref = payment.get("provider_reference")
+        if current_ref and current_ref != provider_reference:
+            raise ValueError("payment attempt is already bound to a different provider order")
+        await self.connection.execute(
+            """
+            UPDATE commerce_payment_attempts
+            SET provider = %s, provider_reference = %s, result = %s, updated_at = NOW()
+            WHERE payment_attempt_id = %s AND status = 'pending'
+              AND (provider_reference IS NULL OR provider_reference = %s)
+            """,
+            (
+                provider,
+                provider_reference,
+                Jsonb(merged),
+                payment_attempt_id,
+                provider_reference,
+            ),
+        )
+        return await self.get_payment(payment_attempt_id)
+
     async def set_payment_status(
         self,
         payment_attempt_id: UUID,
@@ -625,7 +675,10 @@ class CommerceRepository:
                 f"""
                 SELECT
                     orders.*, payment.payment_attempt_id, payment.status AS payment_status,
-                    payment.amount_paise AS payment_amount_paise
+                    payment.amount_paise AS payment_amount_paise,
+                    payment.provider AS payment_provider,
+                    payment.provider_reference AS payment_provider_reference,
+                    payment.result AS payment_result
                 FROM commerce_orders AS orders
                 JOIN commerce_payment_attempts AS payment ON payment.order_id = orders.order_id
                 WHERE orders.order_id = %s AND orders.seller_id = %s{suffix}

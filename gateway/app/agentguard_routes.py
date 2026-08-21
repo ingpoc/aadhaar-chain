@@ -21,6 +21,7 @@ from app.persistence.agentguard_repository import (
 )
 from app.seller_agentguard_orchestrator import SellerAgentGuardOrchestrator
 from app.session_auth import SESSION_COOKIE_NAME, parse_session_token
+from app.razorpay import RazorpayConfigError, RazorpayLiveKeyRefused
 
 router = APIRouter(prefix="/api/agentguard", tags=["agentguard"])
 
@@ -140,6 +141,10 @@ def _persistence_pool(request: Request) -> ConnectionPool | None:
 
 
 def _raise_persistent_error(error: Exception) -> None:
+    if isinstance(error, (RazorpayLiveKeyRefused, RazorpayConfigError)):
+        raise HTTPException(
+            status_code=getattr(error, "status_code", 503), detail=str(error)
+        ) from error
     if isinstance(error, (AgentGuardNotFound, CommerceNotFound)):
         raise HTTPException(status_code=404, detail=str(error)) from error
     if isinstance(error, AgentGuardPermissionDenied):
@@ -608,7 +613,10 @@ async def execute_action(
             )
         except Exception as error:
             _raise_persistent_error(error)
-        if result["reason_code"] == "PAYMENT_STATUS_UNKNOWN":
+        if result["reason_code"] in {
+            "PAYMENT_STATUS_UNKNOWN",
+            "AWAITING_RAZORPAY_TEST_PAYMENT",
+        }:
             response.status_code = 202
         return ApiResponse(
             success=True,
