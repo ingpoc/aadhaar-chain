@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from app.payment_adapter import PaymentAdapter
-from app.razorpay_test import (
+from app.razorpay import (
     RAZORPAY_API_BASE,
     RazorpayLiveKeyRefused,
     RazorpayNotConfigured,

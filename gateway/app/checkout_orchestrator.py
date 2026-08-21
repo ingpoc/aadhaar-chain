@@ -20,7 +20,7 @@ from app.persistence.commerce_repository import CommerceRepository
 from app.persistence.connection import ConnectionPool
 from app.persistence.transaction import UnitOfWork
 from app.receipt_signing import sign_receipt
-from app.razorpay_test import resolve_payment_rail
+from app.razorpay import resolve_payment_rail
 
 
 def _utcnow() -> datetime:

@@ -21,7 +21,7 @@ from app.persistence.agentguard_repository import (
 )
 from app.seller_agentguard_orchestrator import SellerAgentGuardOrchestrator
 from app.session_auth import SESSION_COOKIE_NAME, parse_session_token
-from app.razorpay_test import RazorpayConfigError, RazorpayLiveKeyRefused
+from app.razorpay import RazorpayConfigError, RazorpayLiveKeyRefused
 
 router = APIRouter(prefix="/api/agentguard", tags=["agentguard"])
 

@@ -21,7 +21,7 @@ from psycopg.conninfo import make_conninfo
 from app.commerce_v1 import CommerceV1
 from app.commerce_v1_routes import router as commerce_v1_router
 from app.persistence import ConnectionPool, MigrationRunner
-from app.razorpay_test import (
+from app.razorpay import (
     RazorpayTestClient,
     checkout_signature,
 )

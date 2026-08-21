@@ -17,7 +17,7 @@ from app.commerce_v1 import (
 )
 from app.models import ApiResponse
 from app.persistence import ConnectionPool
-from app.razorpay_test import (
+from app.razorpay import (
     RazorpayApiError,
     RazorpayConfigError,
     RazorpayLiveKeyRefused,

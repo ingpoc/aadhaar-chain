@@ -26,7 +26,7 @@ from .persistence.commerce_repository import CommerceRepository
 from .persistence.connection import ConnectionPool
 from .persistence.repositories import IdempotencyConflict, IdempotencyRepository
 from .persistence.transaction import UnitOfWork
-from .razorpay_test import (
+from .razorpay import (
     CURRENCY,
     PROVIDER as RAZORPAY_PROVIDER,
     RazorpayApiError,
