@@ -485,6 +485,26 @@ def test_buyer_search_rice_does_not_match_poha_description() -> None:
     assert search_items("flattened rice")["count"] == 1
 
 
+def test_buyer_search_rice_matches_existing_atta_title_synonym() -> None:
+    atta = create_item(
+        {
+            "title": "Sampoorna Whole Wheat Atta 1kg",
+            "description": "Stone-ground whole wheat flour for soft rotis.",
+            "price_inr": 89,
+            "inventory": 4,
+            "seller_id": "ondcseller.example",
+            "seller_name": "Grain Mart",
+            "category_id": "Grocery",
+        }
+    )
+    publish_item(atta["item"]["item_id"])
+
+    rice_hits = search_items("rice")
+    assert rice_hits["count"] == 1
+    assert rice_hits["items"][0]["title"].startswith("Sampoorna Whole Wheat Atta")
+    assert search_items("atta")["count"] == 1
+
+
 def test_buyer_search_relevance_rejects_unrelated_titles() -> None:
     oil = create_item(
         {

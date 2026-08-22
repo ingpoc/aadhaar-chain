@@ -13,6 +13,7 @@ from httpx import ASGITransport, AsyncClient
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
+from app.cart_routes import router as cart_router
 from app.commerce_routes import router as commerce_router
 from app.commerce_v1 import CommerceV1
 from app.persistence import ConnectionPool, MigrationRunner
@@ -57,6 +58,7 @@ async def test_demo_commerce_is_a_postgres_compatibility_adapter(
     api = FastAPI()
     api.state.persistence_pool = pool
     api.include_router(commerce_router)
+    api.include_router(cart_router)
 
     def reject_file_fork(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("PostgreSQL-selected commerce touched file state")
@@ -109,6 +111,32 @@ async def test_demo_commerce_is_a_postgres_compatibility_adapter(
             search = await client.get("/api/demo-commerce/buyer/search?q=atta")
             assert search.status_code == 200
             assert search.json()["data"]["items"][0]["delivery_areas"] == ["560001"]
+            rice = await client.get("/api/demo-commerce/buyer/search?q=rice")
+            assert rice.status_code == 200
+            titles = [item["title"] for item in rice.json()["data"]["items"]]
+            assert any("Atta" in title for title in titles)
+            grocery = await client.get("/api/demo-commerce/buyer/search?q=grocery")
+            assert grocery.status_code == 200
+            assert grocery.json()["data"]["count"] >= 1
+
+            session_id = "ondc-session-pg-billing"
+            draft = await client.get(f"/api/cart/buyer/{session_id}")
+            assert draft.status_code == 200, draft.text
+            assert draft.json()["session"]["buyer"] == {}
+            empty_save = await client.put(f"/api/cart/buyer/{session_id}", json={})
+            assert empty_save.status_code == 200, empty_save.text
+            billed = await client.patch(
+                f"/api/cart/buyer/{session_id}",
+                json={
+                    "name": "PG Buyer",
+                    "email": "pg@example.com",
+                    "phone": "+919111111111",
+                },
+            )
+            assert billed.status_code == 200, billed.text
+            loaded = await client.get(f"/api/cart?sessionId={session_id}")
+            assert loaded.status_code == 200
+            assert loaded.json()["session"]["buyer"]["name"] == "PG Buyer"
 
             order = await client.post(
                 "/api/demo-commerce/test-fixtures/buyer/orders",

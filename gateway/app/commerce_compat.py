@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from app.commerce_demo import item_matches_search_query
 from app.commerce_v1 import CommerceV1, empty_store
 from app.domain_state_machines import apply_igm_legal_path, require_transition
 from app.persistence.connection import ConnectionPool
@@ -483,10 +484,6 @@ class CommerceCompatibilityAdapter:
             parameters.append(allowed)
         if published_only:
             clauses.append("i.status = 'published'")
-        if query and query.strip():
-            clauses.append("(i.title ILIKE %s OR i.description ILIKE %s)")
-            needle = f"%{query.strip()}%"
-            parameters.extend((needle, needle))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         async with UnitOfWork(self.pool) as unit_of_work:
             async with unit_of_work.connection.cursor(row_factory=dict_row) as cursor:
@@ -503,6 +500,12 @@ class CommerceCompatibilityAdapter:
                 )
                 rows = list(await cursor.fetchall())
         items = [self._item(row) for row in rows]
+        if query and str(query).strip():
+            items = [
+                item
+                for item in items
+                if item_matches_search_query(item, str(query))
+            ]
         return {"items": items, "count": len(items)}
 
     async def create_order(

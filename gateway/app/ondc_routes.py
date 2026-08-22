@@ -23,7 +23,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-from app import ondc_store
+from app import commerce_demo, ondc_store
+from app.commerce_compat import CommerceCompatibilityAdapter
 from app.commerce_v1 import CommerceConflict, CommerceNotFound, CommerceV1, CommerceValidation
 from app.ondc_crypto import (
     create_authorization_header,
@@ -1532,6 +1533,116 @@ async def ondc_confirm(body: ConfirmBody, request: Request) -> JSONResponse:
 @router.post("/api/ondc/track")
 async def ondc_track(body: OrderActionBody, request: Request) -> JSONResponse:
     return await _dispatch_order_action(request, "track", body)
+
+
+class LocalTrackBody(BaseModel):
+    order_id: Optional[str] = None
+
+
+def _tracking_from_order(order: dict[str, Any]) -> dict[str, Any]:
+    fulfilment = (
+        order.get("fulfilment") if isinstance(order.get("fulfilment"), dict) else {}
+    )
+    logistics = (
+        fulfilment.get("logistics")
+        if isinstance(fulfilment.get("logistics"), dict)
+        else {}
+    )
+    order_id = str(order.get("order_id") or order.get("id") or "")
+    tracking_id = str(
+        fulfilment.get("tracking_id")
+        or logistics.get("lsp_order_id")
+        or logistics.get("tracking_id")
+        or order_id
+    )
+    tracking_url = (
+        fulfilment.get("tracking_url")
+        or logistics.get("tracking_url")
+        or f"/api/ondc/track?order_id={order_id}"
+    )
+    location = logistics.get("tracking_location") or fulfilment.get("tracking_location")
+    if not isinstance(location, dict):
+        address = order.get("delivery_address") or fulfilment.get("delivery_address") or {}
+        if not isinstance(address, dict):
+            address = {}
+        location = {
+            "gps": None,
+            "address": {
+                "city": address.get("city") or "",
+                "area_code": (
+                    address.get("postalCode")
+                    or address.get("pincode")
+                    or address.get("pin")
+                    or ""
+                ),
+            },
+            "updated_at": order.get("updated_at") or fulfilment.get("updated_at"),
+        }
+    status = str(
+        order.get("status")
+        or order.get("state")
+        or fulfilment.get("status")
+        or "In-progress"
+    )
+    return {
+        "order_id": order_id,
+        "status": status,
+        "tracking": {
+            "id": tracking_id,
+            "url": tracking_url,
+            "status": "active",
+            "location": location,
+        },
+    }
+
+
+async def _local_order_track(request: Request, order_id: str | None) -> JSONResponse:
+    resolved = str(order_id or "").strip()
+    if not resolved:
+        raise HTTPException(status_code=422, detail="order_id is required")
+    pool = live_connection_pool(getattr(request.app.state, "persistence_pool", None))
+    order: dict[str, Any] | None = None
+    if pool is not None:
+        try:
+            order = await CommerceCompatibilityAdapter(pool).get_order(resolved)
+        except (KeyError, ValueError, LookupError):
+            order = None
+    if order is None:
+        try:
+            order = commerce_demo.get_order(resolved)["order"]
+        except KeyError:
+            order = None
+    if order is None:
+        for item in ondc_store.list_orders(limit=200):
+            nested = item.get("order") if isinstance(item.get("order"), dict) else {}
+            candidates = {
+                str(item.get("id") or ""),
+                str(item.get("order_id") or ""),
+                str(nested.get("id") or ""),
+                str(nested.get("order_id") or ""),
+            }
+            if resolved in candidates:
+                order = {**item, **nested} if nested else item
+                break
+    if order is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return JSONResponse(
+        {"success": True, "data": _tracking_from_order(order)}
+    )
+
+
+@router.get("/api/ondc/track")
+async def ondc_track_local_get(
+    request: Request, order_id: Optional[str] = None
+) -> JSONResponse:
+    return await _local_order_track(request, order_id)
+
+
+@router.post("/api/ondc/order-track")
+async def ondc_track_local_post(
+    body: LocalTrackBody, request: Request
+) -> JSONResponse:
+    return await _local_order_track(request, body.order_id)
 
 
 @router.post("/api/ondc/order-status")
