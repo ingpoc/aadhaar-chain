@@ -52,6 +52,7 @@ class CommerceState(BaseModel):
     remedies: dict[str, dict[str, Any]] = Field(default_factory=dict)
     stores: dict[str, dict[str, Any]] = Field(default_factory=dict)
     staff: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    cart_sessions: dict[str, dict[str, Any]] = Field(default_factory=dict)
     idempotency: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
@@ -584,6 +585,10 @@ def archive_item(
 _BROWSE_SEARCH_TERMS = frozenset(
     {"all", "food", "foods", "groceries", "grocery", "products"}
 )
+_SEARCH_SYNONYMS = {
+    "rice": frozenset({"rice", "atta"}),
+    "atta": frozenset({"atta", "rice"}),
+}
 _SEARCH_STOP = frozenset(
     {
         "the",
@@ -604,11 +609,20 @@ _SEARCH_STOP = frozenset(
 )
 
 
+def _title_aliases(token: str) -> frozenset[str]:
+    return _SEARCH_SYNONYMS.get(token, frozenset({token}))
+
+
+def _token_in_title(token: str, title: str) -> bool:
+    return any(alias in title for alias in _title_aliases(token))
+
+
 def item_matches_search_query(item: dict[str, Any], query: str) -> bool:
     """Strict relevance: empty match stays empty (no unrelated oil for \"tv\").
 
     Single-token queries match the title only — description phrases like
-    \"flattened rice\" must not make Poha a hit for \"rice\".
+    \"flattened rice\" must not make Poha a hit for \"rice\". Catalog synonyms
+    such as rice/atta match existing titles without inventing SKUs.
     """
     lowered = (query or "").strip().lower()
     if not lowered or lowered in _BROWSE_SEARCH_TERMS:
@@ -621,7 +635,7 @@ def item_matches_search_query(item: dict[str, Any], query: str) -> bool:
             str(item.get("category_id", "")),
         ]
     ).lower()
-    if lowered in title:
+    if lowered in title or _token_in_title(lowered, title):
         return True
     tokens = [
         token
@@ -630,8 +644,9 @@ def item_matches_search_query(item: dict[str, Any], query: str) -> bool:
     ]
     if not tokens:
         return False
-    # Title carries the product noun (atta / rice / tv / oil).
-    if all(token in title for token in tokens):
+    # Title carries the product noun (atta / rice / tv / oil), plus rice/atta
+    # synonyms so grocery atta SKUs stay findable as rice.
+    if all(_token_in_title(token, title) for token in tokens):
         return True
     # Multi-word specialty asks may live in description ("flattened rice" → poha)
     # only when every token appears somewhere and at least one hits the title,
@@ -674,6 +689,141 @@ def search_items(query: Optional[str] = None) -> dict[str, Any]:
     if query and str(query).strip():
         rows = [item for item in rows if item_matches_search_query(item, str(query))]
     return {"items": rows, "count": len(rows)}
+
+
+def empty_cart_session(session_id: str) -> dict[str, Any]:
+    return {
+        "id": session_id,
+        "items": [],
+        "buyer": {},
+        "status": "active",
+        "updatedAt": _utcnow(),
+    }
+
+
+def _keep_text(body: dict[str, Any], key: str, fallback: Any) -> str:
+    if body.get(key) is not None:
+        return str(body.get(key) or "").strip()
+    return str(fallback or "").strip()
+
+
+def apply_cart_buyer(session: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    buyer = dict(session.get("buyer") or {})
+    contact = dict(buyer.get("contact") or {})
+    name = _keep_text(body, "name", buyer.get("name"))
+    email = _keep_text(body, "email", buyer.get("email"))
+    phone = _keep_text(body, "phone", buyer.get("phone"))
+    tax = body.get("taxId", body.get("tax_id", buyer.get("taxId")))
+    tax_id = str(tax).strip() if tax is not None and str(tax).strip() else None
+    street = str(
+        body.get("line1") or body.get("street") or buyer.get("street") or ""
+    ).strip()
+    city = _keep_text(body, "city", buyer.get("city"))
+    state = _keep_text(body, "state", buyer.get("state"))
+    country = _keep_text(body, "country", buyer.get("country") or "IND") or "IND"
+    pin = str(
+        body.get("postalCode")
+        or body.get("pincode")
+        or body.get("pin")
+        or buyer.get("pincode")
+        or ""
+    ).strip()
+    if email:
+        contact["email"] = email
+    if phone:
+        contact["phone"] = phone
+    updated = {
+        **buyer,
+        "name": name,
+        "email": email,
+        "phone": phone,
+        "contact": contact,
+        "street": street,
+        "city": city,
+        "state": state,
+        "country": country,
+        "pincode": pin,
+    }
+    if tax_id:
+        updated["taxId"] = tax_id
+    elif "taxId" in updated and not updated.get("taxId"):
+        updated.pop("taxId", None)
+    session["buyer"] = updated
+    session["status"] = session.get("status") or "active"
+    session["updatedAt"] = _utcnow()
+    return session
+
+
+def apply_cart_item(
+    session: dict[str, Any], item: dict[str, Any], quantity: int
+) -> dict[str, Any]:
+    item_id = str((item or {}).get("id") or "").strip()
+    if not item_id:
+        raise ValueError("item.id is required")
+    if quantity < 1:
+        raise ValueError("quantity must be at least 1")
+    items = list(session.get("items") or [])
+    for row in items:
+        current = row.get("item") if isinstance(row.get("item"), dict) else {}
+        if str(current.get("id") or "") == item_id:
+            row["quantity"] = int(row.get("quantity") or 0) + quantity
+            session["items"] = items
+            session["updatedAt"] = _utcnow()
+            return session
+    items.append(
+        {
+            "id": f"line-{item_id}",
+            "item": item,
+            "quantity": quantity,
+            "addedAt": _utcnow(),
+        }
+    )
+    session["items"] = items
+    session["updatedAt"] = _utcnow()
+    return session
+
+
+def set_cart_item_quantity(
+    session: dict[str, Any], item_id: str, quantity: int
+) -> dict[str, Any]:
+    item_id = str(item_id or "").strip()
+    items = list(session.get("items") or [])
+    if quantity < 1:
+        session["items"] = [
+            row
+            for row in items
+            if str((row.get("item") or {}).get("id") or "") != item_id
+        ]
+        session["updatedAt"] = _utcnow()
+        return session
+    for row in items:
+        current = row.get("item") if isinstance(row.get("item"), dict) else {}
+        if str(current.get("id") or "") == item_id:
+            row["quantity"] = quantity
+            session["items"] = items
+            session["updatedAt"] = _utcnow()
+            return session
+    raise KeyError("cart item not found")
+
+
+def get_cart_session(session_id: str) -> dict[str, Any]:
+    state = load_state()
+    current = state.cart_sessions.get(session_id)
+    if not current:
+        return empty_cart_session(session_id)
+    return {**empty_cart_session(session_id), **current, "id": session_id}
+
+
+def save_cart_session(session: dict[str, Any]) -> dict[str, Any]:
+    session_id = str(session.get("id") or "").strip()
+    if not session_id:
+        raise ValueError("session id is required")
+    state = load_state()
+    session["id"] = session_id
+    session["updatedAt"] = _utcnow()
+    state.cart_sessions[session_id] = session
+    save_state(state)
+    return session
 
 
 def get_item(item_id: str) -> dict[str, Any]:

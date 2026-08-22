@@ -17,6 +17,7 @@ from config import (
 from app.routes import router as identity_router, identities
 from app.agentguard_routes import router as agentguard_router
 from app.portfolio_agent_routes import router as portfolio_agent_router
+from app.cart_routes import router as cart_router
 from app.commerce_routes import router as commerce_router
 from app.commerce_v1_routes import router as commerce_v1_router
 from app.realtime_routes import router as realtime_router
@@ -113,6 +114,7 @@ app.include_router(agentguard_router)
 app.include_router(portfolio_agent_router)
 app.include_router(commerce_router)
 app.include_router(commerce_v1_router)
+app.include_router(cart_router)
 app.include_router(realtime_router)
 
 

@@ -89,6 +89,16 @@ def _record(method: str, path: str, handler: str) -> MutationRecord:
         risk = "high"
         audit = "fixture_domain_row_and_idempotency_record"
         negative = "reject_when_fixture_mode_disabled_or_principal_mismatch"
+    elif path.startswith("/api/cart"):
+        policy_family = "buyer_cart_session"
+        owner = "BuyerCartSession"
+        source = "PostgreSQL_or_file"
+        authority = "cart_session_id"
+        action = "buyer_cart_session_upsert"
+        risk = "low"
+        audit = "buyer_session_row"
+        negative = "reject_missing_session_id"
+        idempotency = "session_id_upsert"
     elif path.startswith("/api/demo-commerce/"):
         policy_family = "commerce_compatibility"
         owner = "CommerceCompatibilityAdapter"

@@ -905,6 +905,35 @@ class CommerceRepository:
             raise RuntimeError("staff upsert returned no row")
         return row
 
+    async def get_buyer_session(self, session_id: str) -> dict[str, Any] | None:
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                "SELECT payload FROM commerce_buyer_sessions WHERE session_id = %s",
+                (session_id,),
+            )
+            row = await cursor.fetchone()
+        return dict(row["payload"]) if row and row.get("payload") is not None else None
+
+    async def upsert_buyer_session(
+        self, session_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        async with self.connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO commerce_buyer_sessions (session_id, payload)
+                VALUES (%s, %s)
+                ON CONFLICT (session_id) DO UPDATE SET
+                    payload = EXCLUDED.payload,
+                    updated_at = NOW()
+                RETURNING payload
+                """,
+                (session_id, Jsonb(payload)),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError("buyer session upsert returned no row")
+        return dict(row["payload"])
+
     async def ensure_owner_staff(self, seller_id: str) -> dict[str, Any]:
         digest = sha256(seller_id.encode("utf-8")).hexdigest()[:16]
         return await self.upsert_staff_member(

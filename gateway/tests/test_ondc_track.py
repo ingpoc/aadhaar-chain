@@ -350,3 +350,51 @@ def test_on_status_accepts_camelcase_and_authorization_subscriber(
     assert nack.status_code == 400
     assert nack.json()["message"]["ack"]["status"] == "NACK"
     assert "subscriber identifier" in nack.json()["error"]["message"]
+
+
+def test_local_track_returns_status_for_existing_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path / "data"))
+    monkeypatch.setattr(settings, "aadhaar_chain_env", "demo")
+    from app.commerce_demo import create_item, create_order, publish_item
+    from main import app
+
+    app.state.persistence_pool = None
+    created = create_item(
+        {
+            "title": "Track Atta 1kg",
+            "price_inr": 89,
+            "inventory": 2,
+            "seller_id": "ondcseller.example",
+            "seller_name": "Track Mart",
+        }
+    )
+    publish_item(created["item"]["item_id"])
+    order = create_order(
+        {
+            "item_id": created["item"]["item_id"],
+            "quantity": 1,
+            "buyer_id": "buyer-track",
+            "delivery_address": {"city": "Bengaluru", "postalCode": "560001"},
+        }
+    )["order"]
+    order_id = order["order_id"]
+
+    client = TestClient(app)
+    missing = client.get("/api/ondc/track")
+    assert missing.status_code == 422
+    empty_post = client.post("/api/ondc/order-track", json={})
+    assert empty_post.status_code == 422
+
+    tracked = client.get(f"/api/ondc/track?order_id={order_id}")
+    assert tracked.status_code == 200, tracked.text
+    payload = tracked.json()["data"]
+    assert payload["order_id"] == order_id
+    assert payload["status"]
+    assert payload["tracking"]["id"]
+    assert payload["tracking"]["location"]["address"]["city"] == "Bengaluru"
+
+    posted = client.post("/api/ondc/order-track", json={"order_id": order_id})
+    assert posted.status_code == 200, posted.text
+    assert posted.json()["data"]["tracking"]["status"] == "active"
