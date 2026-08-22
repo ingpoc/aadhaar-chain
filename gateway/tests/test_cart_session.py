@@ -23,7 +23,19 @@ def test_billing_save_upserts_missing_profile_and_never_404s() -> None:
     session_id = "ondc-session-billing-1"
 
     missing = client.get("/api/cart")
-    assert missing.status_code == 422
+    assert missing.status_code == 401
+    assert missing.headers["content-type"].startswith("application/json")
+
+    collection = client.get("/api/cart/buyer")
+    assert collection.status_code == 401
+    assert collection.json()["detail"] == "session_id is required"
+    assert client.put("/api/cart/buyer", json={}).status_code == 401
+    assert client.patch("/api/cart/buyer", json={}).status_code == 401
+
+    draft = client.get(f"/api/cart/buyer/{session_id}")
+    assert draft.status_code == 200, draft.text
+    assert draft.json()["session"]["id"] == session_id
+    assert draft.json()["session"]["buyer"] == {}
 
     empty = client.get(f"/api/cart?sessionId={session_id}")
     assert empty.status_code == 200, empty.text
@@ -62,6 +74,16 @@ def test_billing_save_upserts_missing_profile_and_never_404s() -> None:
     assert loaded.status_code == 200
     assert loaded.json()["session"]["buyer"]["name"] == "Gurusharan"
     assert loaded.json()["session"]["buyer"]["contact"]["phone"] == "+919876543210"
+
+    via_put = client.put(
+        f"/api/cart/buyer/{session_id}",
+        json={"name": "Guru Put", "email": "put@example.com", "phone": "+919800000000"},
+    )
+    assert via_put.status_code == 200, via_put.text
+    assert via_put.json()["session"]["buyer"]["name"] == "Guru Put"
+    again = client.get(f"/api/cart/buyer/{session_id}")
+    assert again.status_code == 200
+    assert again.json()["session"]["buyer"]["email"] == "put@example.com"
 
 
 def test_cart_item_persist_keeps_session_for_checkout_refresh() -> None:

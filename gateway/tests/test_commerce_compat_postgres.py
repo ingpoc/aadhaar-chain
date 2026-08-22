@@ -120,7 +120,10 @@ async def test_demo_commerce_is_a_postgres_compatibility_adapter(
             assert grocery.json()["data"]["count"] >= 1
 
             session_id = "ondc-session-pg-billing"
-            empty_save = await client.patch(f"/api/cart/buyer/{session_id}", json={})
+            draft = await client.get(f"/api/cart/buyer/{session_id}")
+            assert draft.status_code == 200, draft.text
+            assert draft.json()["session"]["buyer"] == {}
+            empty_save = await client.put(f"/api/cart/buyer/{session_id}", json={})
             assert empty_save.status_code == 200, empty_save.text
             billed = await client.patch(
                 f"/api/cart/buyer/{session_id}",
