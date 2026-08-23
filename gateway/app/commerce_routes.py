@@ -30,7 +30,8 @@ def _session_principal(request: Request, audience: str) -> str:
         raise HTTPException(status_code=401, detail="Authenticated principal required.")
     shared_social_session = (
         session.get("identity_provider") in {"auth0", "google"}
-        and {str(session.get("aud") or ""), audience} <= {"ondcbuyer", "ondcseller"}
+        and session.get("aud") == "ondcseller"
+        and audience == "ondcbuyer"
     )
     if session.get("aud") != audience and not shared_social_session:
         raise HTTPException(status_code=403, detail="Session audience mismatch.")
