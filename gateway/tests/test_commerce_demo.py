@@ -16,6 +16,7 @@ from app.commerce_demo import (
     archive_item_from_payload,
     create_issue,
     create_item,
+    create_order,
     load_state,
     propose_remedy,
     publish_item,
@@ -314,6 +315,32 @@ def test_commerce_reads_are_session_scoped_by_audience_and_principal() -> None:
     assert seller.get("/api/demo-commerce/buyer/orders").status_code == 403
     assert buyer.get("/api/demo-commerce/seller/items").status_code == 403
     assert TestClient(app).get("/api/demo-commerce/buyer/orders").status_code == 401
+
+
+def test_auth0_buyer_can_read_orders_after_seller_session() -> None:
+    principal_id = "principal:auth0:shared-shopper"
+    item = create_item(
+        {
+            "title": "Shared session Atta",
+            "price_inr": 89,
+            "inventory": 1,
+            "seller_id": "principal:auth0:seller",
+        }
+    )["item"]
+    publish_item(item["item_id"])
+    create_order(
+        {
+            "item_id": item["item_id"],
+            "quantity": 1,
+            "buyer_id": principal_id,
+        }
+    )
+    seller_session, _ = _signed_in_client("ondcseller", principal_id)
+
+    orders = seller_session.get("/api/demo-commerce/buyer/orders")
+
+    assert orders.status_code == 200, orders.text
+    assert orders.json()["data"]["count"] == 1
 
 
 def test_publish_search_order_and_idempotency() -> None:

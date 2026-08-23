@@ -28,7 +28,12 @@ def _session_principal(request: Request, audience: str) -> str:
     session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
     if not session or not session.get("principal_id"):
         raise HTTPException(status_code=401, detail="Authenticated principal required.")
-    if session.get("aud") != audience:
+    shared_social_session = (
+        session.get("identity_provider") in {"auth0", "google"}
+        and session.get("aud") == "ondcseller"
+        and audience == "ondcbuyer"
+    )
+    if session.get("aud") != audience and not shared_social_session:
         raise HTTPException(status_code=403, detail="Session audience mismatch.")
     return str(session["principal_id"])
 
