@@ -6,7 +6,7 @@ from typing import Any, Literal, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app import agentguard
 from app.agentguard_contract import principal_id_from_wallet
@@ -26,6 +26,33 @@ from app.razorpay import RazorpayConfigError, RazorpayLiveKeyRefused
 router = APIRouter(prefix="/api/agentguard", tags=["agentguard"])
 
 Role = Literal["buyer", "seller"]
+
+SELLER_ORDER_ACTIONS_OPENAPI = {
+    "seller.order.accept": {
+        "resulting_status": "confirmed",
+        "description": "Accept the seller-owned order.",
+    },
+    "seller.order.reject": {
+        "resulting_status": "cancelled",
+        "description": "Reject the seller-owned order.",
+    },
+    "seller.fulfilment.commit": {
+        "payload_statuses": {
+            "preparing": "Start preparing the order.",
+            "shipped": "Dispatch the order.",
+            "delivered": "Complete delivery.",
+        },
+        "payload_fields": {
+            "order_id": "Order identifier (also supplied as resource_id).",
+            "status": "One of preparing, shipped, or delivered.",
+            "status_message": "Optional seller-facing fulfilment note.",
+            "tracking_id": "Shipment tracking identifier.",
+            "provider_name": "Logistics provider display name.",
+            "logistics_transaction_id": "Optional verified logistics offer transaction.",
+            "logistics_bpp_id": "Optional logistics provider subscriber identifier.",
+        },
+    },
+}
 
 
 class EnsureAgentRequest(BaseModel):
@@ -73,16 +100,80 @@ class CompileMandateRequest(BaseModel):
 
 
 class ExecuteRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "action": "seller.order.accept",
+                    "resource_id": "order_123",
+                    "amount_inr": 0,
+                    "payload": {"order_id": "order_123"},
+                },
+                {
+                    "action": "seller.order.reject",
+                    "resource_id": "order_123",
+                    "amount_inr": 0,
+                    "payload": {"order_id": "order_123"},
+                },
+                {
+                    "action": "seller.fulfilment.commit",
+                    "resource_id": "order_123",
+                    "amount_inr": 0,
+                    "payload": {
+                        "order_id": "order_123",
+                        "status": "preparing",
+                        "status_message": "Preparing the order",
+                    },
+                },
+                {
+                    "action": "seller.fulfilment.commit",
+                    "resource_id": "order_123",
+                    "amount_inr": 0,
+                    "payload": {
+                        "order_id": "order_123",
+                        "status": "shipped",
+                        "tracking_id": "TRACK-123",
+                        "provider_name": "Example Courier",
+                    },
+                },
+                {
+                    "action": "seller.fulfilment.commit",
+                    "resource_id": "order_123",
+                    "amount_inr": 0,
+                    "payload": {
+                        "order_id": "order_123",
+                        "status": "delivered",
+                    },
+                },
+            ]
+        }
+    )
+
     wallet_address: Optional[str] = Field(None, min_length=32, max_length=64)
     agent_id: Optional[str] = None
     actor: Literal["agent", "user"] = "agent"
     approval_id: Optional[str] = None
     decision_id: Optional[str] = None
-    action: str
+    action: str = Field(
+        description=(
+            "Protected action. Seller order actions are seller.order.accept "
+            "(confirmed), seller.order.reject (cancelled), and "
+            "seller.fulfilment.commit (payload.status controls fulfilment state)."
+        )
+    )
     amount_inr: int = Field(0, ge=0)
-    resource_id: str = Field(..., min_length=1)
+    resource_id: str = Field(
+        ..., min_length=1, description="Protected resource identifier; use the order ID."
+    )
     idempotency_key: Optional[str] = None
-    payload: dict[str, Any] = Field(default_factory=dict)
+    payload: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Action payload. seller.fulfilment.commit accepts status preparing, "
+            "shipped, or delivered plus order_id, status_message, tracking_id, "
+            "provider_name, logistics_transaction_id, and logistics_bpp_id."
+        ),
+    )
 
 
 class ReceiptVerifyRequest(BaseModel):
@@ -555,13 +646,49 @@ def _consume_response(
     return ApiResponse(success=True, message=message, data=result)
 
 
-@router.post("/actions/execute", response_model=ApiResponse)
+@router.post(
+    "/actions/execute",
+    response_model=ApiResponse,
+    summary="Execute an AgentGuard-protected action",
+    description=(
+        "Authenticated protected-write boundary used by the Seller UI. "
+        "`seller.order.accept` confirms an order and `seller.order.reject` cancels it. "
+        "`seller.fulfilment.commit` uses `payload.status`: `preparing` starts preparation, "
+        "`shipped` dispatches the order, and `delivered` completes delivery. Dispatch "
+        "payloads may include `tracking_id`, `provider_name`, "
+        "`logistics_transaction_id`, and `logistics_bpp_id`. Seller protected writes "
+        "require `Idempotency-Key` and `X-Correlation-ID` headers."
+    ),
+    openapi_extra={
+        "x-required-headers": ["Idempotency-Key", "X-Correlation-ID"],
+        "x-seller-order-actions": SELLER_ORDER_ACTIONS_OPENAPI,
+    },
+    responses={
+        401: {"description": "Authenticated AgentGuard principal required."},
+        403: {"description": "AgentGuard denied the protected action."},
+        409: {"description": "Protected-write conflict or invalid state transition."},
+        422: {"description": "Invalid request or required header missing."},
+    },
+)
 async def execute_action(
     request: Request,
     response: Response,
     body: ExecuteRequest,
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
-    correlation_id: Optional[str] = Header(default=None, alias="X-Correlation-ID"),
+    idempotency_key: Optional[str] = Header(
+        default=None,
+        alias="Idempotency-Key",
+        description=(
+            "Required stable idempotency key for seller protected writes. "
+            "Legacy in-memory callers may also supply idempotency_key in the body."
+        ),
+    ),
+    correlation_id: Optional[str] = Header(
+        default=None,
+        alias="X-Correlation-ID",
+        description=(
+            "Required caller-owned correlation identifier for seller protected writes."
+        ),
+    ),
 ) -> ApiResponse:
     """Execute the tool-runner protected-write contract.
 
