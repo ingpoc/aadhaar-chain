@@ -1,4 +1,5 @@
 """AgentGuard store + HTTP API tests."""
+
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -235,7 +236,9 @@ def test_http_agentguard_checkout_action() -> None:
     assert replay.status_code == 409
 
 
-def test_execute_requires_idempotency_key_and_returns_correlation_id(monkeypatch) -> None:
+def test_execute_requires_idempotency_key_and_returns_correlation_id(
+    monkeypatch,
+) -> None:
     client = TestClient(app)
     captured: dict[str, object] = {}
 
@@ -256,7 +259,10 @@ def test_execute_requires_idempotency_key_and_returns_correlation_id(monkeypatch
 
     executed = client.post(
         "/api/agentguard/actions/execute",
-        headers={"Idempotency-Key": "checkout-correlation-1", "X-Correlation-ID": "corr-test-1"},
+        headers={
+            "Idempotency-Key": "checkout-correlation-1",
+            "X-Correlation-ID": "corr-test-1",
+        },
         json={
             "wallet_address": WALLET,
             "action": "buyer.checkout.commit",
@@ -279,6 +285,50 @@ def test_execute_requires_idempotency_key_and_returns_correlation_id(monkeypatch
         },
     )
     assert mismatch.status_code == 422
+
+
+def test_openapi_documents_seller_order_actions_on_protected_execute() -> None:
+    schema = app.openapi()
+    operation = schema["paths"]["/api/agentguard/actions/execute"]["post"]
+
+    assert operation["x-required-headers"] == [
+        "Idempotency-Key",
+        "X-Correlation-ID",
+    ]
+    seller_actions = operation["x-seller-order-actions"]
+    assert seller_actions["seller.order.accept"]["resulting_status"] == "confirmed"
+    assert seller_actions["seller.order.reject"]["resulting_status"] == "cancelled"
+    assert seller_actions["seller.fulfilment.commit"]["payload_statuses"] == {
+        "preparing": "Start preparing the order.",
+        "shipped": "Dispatch the order.",
+        "delivered": "Complete delivery.",
+    }
+    assert {"tracking_id", "provider_name"} <= set(
+        seller_actions["seller.fulfilment.commit"]["payload_fields"]
+    )
+
+    parameters = {parameter["name"]: parameter for parameter in operation["parameters"]}
+    assert (
+        "Required stable idempotency key"
+        in parameters["Idempotency-Key"]["description"]
+    )
+    assert (
+        "Required caller-owned correlation"
+        in parameters["X-Correlation-ID"]["description"]
+    )
+
+    request_schema = schema["components"]["schemas"]["ExecuteRequest"]
+    examples = request_schema["examples"]
+    fulfilment_examples = [
+        example
+        for example in examples
+        if example["action"] == "seller.fulfilment.commit"
+    ]
+    assert {example["payload"]["status"] for example in fulfilment_examples} == {
+        "preparing",
+        "shipped",
+        "delivered",
+    }
 
 
 def test_session_principal_wins_over_body_wallet() -> None:
