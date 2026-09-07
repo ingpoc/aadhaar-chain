@@ -218,6 +218,94 @@ def test_on_track_verifies_signature_like_issue(
     assert tampered.json()["message"]["ack"]["status"] == "NACK"
 
 
+def test_signed_lifecycle_aliases_persist_before_ack(
+    tmp_path: Path, ed25519_pem: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_retail(tmp_path, ed25519_pem, monkeypatch)
+    from main import app
+
+    app.state.persistence_pool = object()
+    persisted = AsyncMock(
+        side_effect=[
+            (True, {"inbox_id": 101}),
+            (True, {"inbox_id": 102}),
+        ]
+    )
+    process = AsyncMock(return_value=None)
+    with (
+        patch(
+            "app.ondc_routes.persist_callback_before_ack",
+            new=persisted,
+        ),
+        patch("app.ondc_routes._process_inbox_record", new=process),
+    ):
+        client = TestClient(app)
+        for action, message in (
+            (
+                "on_status",
+                {"order": {"id": "5A807CE9", "state": "Packed"}},
+            ),
+            (
+                "on_track",
+                {
+                    "tracking": {
+                        "id": "AWB-5A807CE9",
+                        "url": "https://ondcseller.aadharcha.in/track/AWB-5A807CE9",
+                        "status": "active",
+                    }
+                },
+            ),
+        ):
+            envelope = _retail_envelope(
+                action=action,
+                transaction_id=f"txn-{action}-5A807CE9",
+                message_id=f"msg-{action}-5A807CE9",
+                message=message,
+            )
+            response = client.post(
+                f"/api/ondc/{action}",
+                json=envelope,
+                headers={"Authorization": _sign(envelope, ed25519_pem)},
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["message"]["ack"]["status"] == "ACK"
+
+    assert [call.kwargs["action"] for call in persisted.await_args_list] == [
+        "on_status",
+        "on_track",
+    ]
+    assert all(
+        call.kwargs["redacted_payload"]["signature_verified"] is True
+        for call in persisted.await_args_list
+    )
+    assert process.await_count == 2
+    app.state.persistence_pool = None
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        ("/ondc/on_status", b""),
+        ("/ondc/on_track", b"{"),
+        ("/api/ondc/on_status", b"[]"),
+        ("/api/ondc/on_track", b"not-json"),
+        ("/api/ondc/callback/on_status", b""),
+    ],
+)
+def test_callback_routes_nack_empty_or_invalid_json(path: str, content: bytes) -> None:
+    from main import app
+
+    app.state.persistence_pool = None
+    response = TestClient(app).post(
+        path,
+        content=content,
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert response.json()["message"]["ack"]["status"] == "NACK"
+    assert "JSON object" in response.json()["error"]["message"]
+
+
 def test_on_confirm_acks_workbench_new_message_id(
     tmp_path: Path, ed25519_pem: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

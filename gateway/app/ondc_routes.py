@@ -2045,6 +2045,7 @@ async def _verify_retail_callback(
             expected_unique_key_id=unique_key_id,
         ):
             return True, ""
+        return False, "Retail callback signature did not match configured seller key"
 
     query = {
         "subscriber_id": bpp_id,
@@ -2874,11 +2875,37 @@ async def _ingest_callback(
     return JSONResponse({"message": {"ack": {"status": "ACK"}}})
 
 
+def _callback_nack(message: str, *, status_code: int = 400) -> JSONResponse:
+    return JSONResponse(
+        {
+            "message": {"ack": {"status": "NACK"}},
+            "error": {
+                "type": "CORE-ERROR",
+                "code": "30000",
+                "message": message,
+            },
+        },
+        status_code=status_code,
+    )
+
+
+async def _ingest_callback_request(
+    request: Request, action: str
+) -> JSONResponse:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _callback_nack("callback body must be a valid JSON object")
+    if not isinstance(body, dict):
+        return _callback_nack("callback body must be a JSON object")
+    return await _ingest_callback(request, action, body)
+
+
 @router.post("/api/ondc/callback/{action}")
 async def ondc_callback_api(
-    action: str, request: Request, body: dict[str, Any]
+    action: str, request: Request
 ) -> JSONResponse:
-    return await _ingest_callback(request, action, body)
+    return await _ingest_callback_request(request, action)
 
 
 _BECKN_CALLBACK_ACTIONS = (
@@ -2903,14 +2930,12 @@ def _register_beckn_callbacks() -> None:
     for act in _BECKN_CALLBACK_ACTIONS:
 
         async def _root(request: Request, action: str = act) -> JSONResponse:
-            body = await request.json()
-            return await _ingest_callback(request, f"on_{action}", body)
+            return await _ingest_callback_request(request, f"on_{action}")
 
         async def _np(role: str, request: Request, action: str = act) -> JSONResponse:
             if role not in {"buyer", "seller"}:
                 raise HTTPException(status_code=404, detail="role must be buyer|seller")
-            body = await request.json()
-            return await _ingest_callback(request, f"on_{action}", body)
+            return await _ingest_callback_request(request, f"on_{action}")
 
         router.add_api_route(
             f"/ondc/on_{act}",
@@ -2924,6 +2949,13 @@ def _register_beckn_callbacks() -> None:
             methods=["POST"],
             name=f"ondc_np_on_{act}",
         )
+        if act in {"status", "track"}:
+            router.add_api_route(
+                f"/api/ondc/on_{act}",
+                _root,
+                methods=["POST"],
+                name=f"ondc_api_on_{act}",
+            )
 
 
 _register_beckn_callbacks()
