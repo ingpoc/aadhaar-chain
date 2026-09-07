@@ -60,7 +60,12 @@ def _principal(request: Request) -> str:
     session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
     if not session or not session.get("principal_id"):
         raise HTTPException(status_code=401, detail="Authenticated principal required.")
-    if session.get("aud") != "ondcbuyer":
+    # Match demo-commerce (#16): allow Buyer commerce after a Seller social sign-in.
+    shared_social_session = (
+        session.get("identity_provider") in {"auth0", "google"}
+        and session.get("aud") == "ondcseller"
+    )
+    if session.get("aud") != "ondcbuyer" and not shared_social_session:
         raise HTTPException(status_code=403, detail="Buyer session required.")
     return str(session["principal_id"])
 
