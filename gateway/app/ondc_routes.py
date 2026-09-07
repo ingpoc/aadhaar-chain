@@ -1554,18 +1554,16 @@ def _tracking_from_order(order: dict[str, Any]) -> dict[str, Any]:
         or logistics.get("lsp_order_id")
         or logistics.get("tracking_id")
     )
-    tracking_id = str(
-        fulfilment_tracking_id or order_id
-    )
+    tracking_id = str(fulfilment_tracking_id or order_id)
     raw_tracking_url = str(
         fulfilment.get("tracking_url") or logistics.get("tracking_url") or ""
     ).strip()
-    tracking_url = (
-        raw_tracking_url if raw_tracking_url.startswith("https://") else None
-    )
+    tracking_url = raw_tracking_url if raw_tracking_url.startswith("https://") else None
     location = logistics.get("tracking_location") or fulfilment.get("tracking_location")
     if not isinstance(location, dict):
-        address = order.get("delivery_address") or fulfilment.get("delivery_address") or {}
+        address = (
+            order.get("delivery_address") or fulfilment.get("delivery_address") or {}
+        )
         if not isinstance(address, dict):
             address = {}
         location = {

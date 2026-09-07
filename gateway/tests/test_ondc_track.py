@@ -357,7 +357,12 @@ def test_local_track_returns_stub_gps_and_https_map_for_shipped_order(
 ) -> None:
     monkeypatch.setattr(settings, "data_dir", str(tmp_path / "data"))
     monkeypatch.setattr(settings, "aadhaar_chain_env", "demo")
-    from app.commerce_demo import create_item, create_order, publish_item, transition_order
+    from app.commerce_demo import (
+        create_item,
+        create_order,
+        publish_item,
+        transition_order,
+    )
     from main import app
 
     app.state.persistence_pool = None
