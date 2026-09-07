@@ -15,25 +15,64 @@ def _isolate_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(settings, "openai_api_key", "test-samantha-key")
 
 
-def _client(role: str | None = None, principal: str = "principal:auth0:test") -> TestClient:
+def _client(
+    role: str | None = None,
+    principal: str = "principal:auth0:test",
+    *,
+    identity_provider: str = "auth0",
+    audience: str | None = None,
+) -> TestClient:
     client = TestClient(app)
-    if role:
+    if role or audience:
         token = create_principal_session_token(
             principal_id=principal,
-            audience=f"ondc{role}",
-            identity_provider="auth0",
+            audience=audience or f"ondc{role}",
+            identity_provider=identity_provider,
         )
         client.cookies.set(SESSION_COOKIE_NAME, token)
     return client
 
 
+def _mock_openai_client_secret():
+    response = AsyncMock()
+    response.status_code = 200
+    response.json = lambda: {"value": "ephemeral-test", "expires_at": 123}
+    response.text = "ok"
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = None
+    mock_client.post = AsyncMock(return_value=response)
+    return mock_client
+
+
 def test_samantha_requires_matching_authenticated_app_session() -> None:
     assert _client().post("/api/realtime/client-secret", json={"role": "buyer"}).status_code == 401
-    assert _client("seller").post("/api/realtime/client-secret", json={"role": "buyer"}).status_code == 403
+    # Demo Seller cookie must not unlock Buyer Samantha.
+    assert (
+        _client("seller", identity_provider="demo")
+        .post("/api/realtime/client-secret", json={"role": "buyer"})
+        .status_code
+        == 403
+    )
+    # Buyer cookie must not unlock Seller Samantha.
+    assert _client("buyer").post("/api/realtime/client-secret", json={"role": "seller"}).status_code == 403
     assert _client().post(
         "/api/realtime/transcripts/events",
-        json={"role": "buyer", "session_id": "samantha-buyer-12345678", "event_type": "user_text", "content": "atta"},
+        json={
+            "role": "buyer",
+            "session_id": "samantha-buyer-12345678",
+            "event_type": "user_text",
+            "content": "atta",
+        },
     ).status_code == 401
+
+
+def test_auth0_seller_session_can_start_buyer_samantha() -> None:
+    """Shared portfolio cookie after Seller social SSO (Buyer AuthContext accepts it)."""
+    with patch("app.realtime_routes.httpx.AsyncClient", return_value=_mock_openai_client_secret()):
+        result = _client("seller").post("/api/realtime/client-secret", json={"role": "buyer"})
+    assert result.status_code == 200, result.text
+    assert result.json()["data"]["role"] == "buyer"
 
 
 def test_authenticated_transcripts_are_principal_scoped_and_sanitized() -> None:
@@ -60,16 +99,7 @@ def test_authenticated_transcripts_are_principal_scoped_and_sanitized() -> None:
 
 
 def test_client_secret_primes_complete_buyer_cart_tool_contract() -> None:
-    response = AsyncMock()
-    response.status_code = 200
-    response.json = lambda: {"value": "ephemeral-test", "expires_at": 123}
-    response.text = "ok"
-    mock_client = AsyncMock()
-    mock_client.__aenter__.return_value = mock_client
-    mock_client.__aexit__.return_value = None
-    mock_client.post = AsyncMock(return_value=response)
-
-    with patch("app.realtime_routes.httpx.AsyncClient", return_value=mock_client):
+    with patch("app.realtime_routes.httpx.AsyncClient", return_value=_mock_openai_client_secret()):
         result = _client("buyer").post("/api/realtime/client-secret", json={"role": "buyer"})
     assert result.status_code == 200
     data = result.json()["data"]

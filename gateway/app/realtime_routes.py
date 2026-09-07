@@ -289,8 +289,19 @@ def _authenticated_session(request: Request, role: str | None = None) -> dict[st
     session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
     if session is None:
         raise HTTPException(status_code=401, detail="Sign in before using Samantha.")
-    if role and session.get("aud") not in {role, f"ondc{role}"}:
-        raise HTTPException(status_code=403, detail="Samantha session does not match this app.")
+    if role:
+        allowed = {role, f"ondc{role}"}
+        # Match demo-commerce (#16) / commerce/v1 (#19) and Buyer AuthContext:
+        # shared aadharcha_session from Seller social SSO is accepted on Buyer Samantha.
+        shared_social_buyer = (
+            role == "buyer"
+            and session.get("identity_provider") in {"auth0", "google"}
+            and session.get("aud") == "ondcseller"
+        )
+        if session.get("aud") not in allowed and not shared_social_buyer:
+            raise HTTPException(
+                status_code=403, detail="Samantha session does not match this app."
+            )
     return session
 
 
