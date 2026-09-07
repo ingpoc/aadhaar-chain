@@ -163,7 +163,9 @@ class ExecuteRequest(BaseModel):
     )
     amount_inr: int = Field(0, ge=0)
     resource_id: str = Field(
-        ..., min_length=1, description="Protected resource identifier; use the order ID."
+        ...,
+        min_length=1,
+        description="Protected resource identifier; use the order ID.",
     )
     idempotency_key: Optional[str] = None
     payload: dict[str, Any] = Field(
