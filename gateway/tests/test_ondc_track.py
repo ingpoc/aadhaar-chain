@@ -352,12 +352,17 @@ def test_on_status_accepts_camelcase_and_authorization_subscriber(
     assert "subscriber identifier" in nack.json()["error"]["message"]
 
 
-def test_local_track_returns_status_for_existing_order(
+def test_local_track_returns_stub_gps_and_https_map_for_shipped_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(settings, "data_dir", str(tmp_path / "data"))
     monkeypatch.setattr(settings, "aadhaar_chain_env", "demo")
-    from app.commerce_demo import create_item, create_order, publish_item
+    from app.commerce_demo import (
+        create_item,
+        create_order,
+        publish_item,
+        transition_order,
+    )
     from main import app
 
     app.state.persistence_pool = None
@@ -376,10 +381,25 @@ def test_local_track_returns_status_for_existing_order(
             "item_id": created["item"]["item_id"],
             "quantity": 1,
             "buyer_id": "buyer-track",
-            "delivery_address": {"city": "Bengaluru", "postalCode": "560001"},
+            "delivery_address": {
+                "name": "Track Buyer",
+                "phone": "9999999999",
+                "line1": "1 Market Road",
+                "city": "Bengaluru",
+                "state": "Karnataka",
+                "postalCode": "560001",
+                "country": "IND",
+            },
         }
     )["order"]
     order_id = order["order_id"]
+    transition_order(order_id, "confirmed")
+    transition_order(order_id, "preparing")
+    transition_order(
+        order_id,
+        "shipped",
+        payload={"tracking_id": "TRACK-SHIPPED-1"},
+    )
 
     client = TestClient(app)
     missing = client.get("/api/ondc/track")
@@ -391,8 +411,13 @@ def test_local_track_returns_status_for_existing_order(
     assert tracked.status_code == 200, tracked.text
     payload = tracked.json()["data"]
     assert payload["order_id"] == order_id
-    assert payload["status"]
-    assert payload["tracking"]["id"]
+    assert payload["status"] == "shipped"
+    assert payload["tracking"]["id"] == "TRACK-SHIPPED-1"
+    assert payload["tracking"]["location"]["gps"] == "12.9715987,77.5945627"
+    assert (
+        payload["tracking"]["url"]
+        == "https://www.google.com/maps/search/?api=1&query=12.9715987,77.5945627"
+    )
     assert payload["tracking"]["location"]["address"]["city"] == "Bengaluru"
 
     posted = client.post("/api/ondc/order-track", json={"order_id": order_id})

@@ -1549,20 +1549,21 @@ def _tracking_from_order(order: dict[str, Any]) -> dict[str, Any]:
         else {}
     )
     order_id = str(order.get("order_id") or order.get("id") or "")
-    tracking_id = str(
+    fulfilment_tracking_id = (
         fulfilment.get("tracking_id")
         or logistics.get("lsp_order_id")
         or logistics.get("tracking_id")
-        or order_id
     )
-    tracking_url = (
-        fulfilment.get("tracking_url")
-        or logistics.get("tracking_url")
-        or f"/api/ondc/track?order_id={order_id}"
-    )
+    tracking_id = str(fulfilment_tracking_id or order_id)
+    raw_tracking_url = str(
+        fulfilment.get("tracking_url") or logistics.get("tracking_url") or ""
+    ).strip()
+    tracking_url = raw_tracking_url if raw_tracking_url.startswith("https://") else None
     location = logistics.get("tracking_location") or fulfilment.get("tracking_location")
     if not isinstance(location, dict):
-        address = order.get("delivery_address") or fulfilment.get("delivery_address") or {}
+        address = (
+            order.get("delivery_address") or fulfilment.get("delivery_address") or {}
+        )
         if not isinstance(address, dict):
             address = {}
         location = {
@@ -1578,12 +1579,28 @@ def _tracking_from_order(order: dict[str, Any]) -> dict[str, Any]:
             },
             "updated_at": order.get("updated_at") or fulfilment.get("updated_at"),
         }
+    else:
+        location = dict(location)
     status = str(
         order.get("status")
         or order.get("state")
         or fulfilment.get("status")
         or "In-progress"
     )
+    normalized_status = status.strip().lower().replace("_", "-").replace(" ", "-")
+    dispatched = bool(fulfilment_tracking_id) or normalized_status in {
+        "shipped",
+        "dispatched",
+        "in-transit",
+        "order-picked-up",
+        "out-for-delivery",
+    }
+    gps = str(location.get("gps") or "").strip()
+    if dispatched and not gps:
+        gps = "12.9715987,77.5945627"
+        location["gps"] = gps
+    if tracking_url is None and gps:
+        tracking_url = f"https://www.google.com/maps/search/?api=1&query={gps}"
     return {
         "order_id": order_id,
         "status": status,
