@@ -105,6 +105,34 @@ async def test_migrations_apply_once_and_rerun_cleanly(postgres_url: str) -> Non
         await pool.close()
 
 
+async def test_preprod_ondcseller_owner_binding_is_idempotent(
+    postgres_url: str,
+) -> None:
+    pool = await _open_migrated_pool(postgres_url)
+    try:
+        async with pool.connection() as connection:
+            await connection.execute(
+                """
+                INSERT INTO commerce_seller_stores (seller_id, status)
+                VALUES ('ondcseller', 'ready')
+                """
+            )
+            migration = (MIGRATIONS / "035_preprod_ondcseller_owner.sql").read_text()
+            await connection.execute(migration)
+            await connection.execute(migration)
+            result = await connection.execute(
+                """
+                SELECT seller_id, role, status, version
+                FROM commerce_seller_staff
+                WHERE member_principal_id =
+                    'principal:auth0:google-oauth2:109432510636331667287'
+                """
+            )
+            assert await result.fetchone() == ("ondcseller", "owner", "active", 1)
+    finally:
+        await pool.close()
+
+
 async def test_seller_stores_use_text_array_on_fresh_postgres(postgres_url: str) -> None:
     pool = await _open_migrated_pool(postgres_url)
     try:
