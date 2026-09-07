@@ -2889,9 +2889,7 @@ def _callback_nack(message: str, *, status_code: int = 400) -> JSONResponse:
     )
 
 
-async def _ingest_callback_request(
-    request: Request, action: str
-) -> JSONResponse:
+async def _ingest_callback_request(request: Request, action: str) -> JSONResponse:
     try:
         body = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -2902,9 +2900,7 @@ async def _ingest_callback_request(
 
 
 @router.post("/api/ondc/callback/{action}")
-async def ondc_callback_api(
-    action: str, request: Request
-) -> JSONResponse:
+async def ondc_callback_api(action: str, request: Request) -> JSONResponse:
     return await _ingest_callback_request(request, action)
 
 
