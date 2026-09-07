@@ -110,3 +110,38 @@ def test_body_wallet_rejected_on_social_session() -> None:
         cookies=login.cookies,
     )
     assert res.status_code == 403
+
+def test_identity_me_aliases_auth_session_not_wallet_kyc() -> None:
+    """GET /api/identity/me must not treat "me" as a wallet address."""
+    client = _client()
+    # Unauthenticated: same null payload as /api/auth/me, not "Identity not found".
+    bare = client.get("/api/identity/me")
+    assert bare.status_code == 200
+    bare_body = bare.json()
+    assert bare_body["data"] is None
+    assert "Identity not found" not in (bare_body.get("message") or "")
+
+    res = client.post(
+        "/api/auth/demo-continue",
+        json={
+            "audience": "ondcbuyer",
+            "display_name": "P2-15 Buyer",
+        },
+    )
+    assert res.status_code == 200
+    assert "aadharcha_session" in res.cookies
+
+    identity_me = client.get("/api/identity/me", cookies=res.cookies)
+    auth_me = client.get("/api/auth/me", cookies=res.cookies)
+    assert identity_me.status_code == 200
+    assert auth_me.status_code == 200
+    assert identity_me.json()["data"] == auth_me.json()["data"]
+    assert identity_me.json()["data"]["display_name"] == "P2-15 Buyer"
+    assert identity_me.json()["data"]["principal_id"] == "principal:demo:buyer"
+    assert "wallet_address" not in identity_me.json()["data"]
+
+    # Wallet catch-all still rejects reserved path segments on other verbs/routes.
+    trust = client.get("/api/identity/me/trust")
+    assert trust.status_code == 400
+    assert "reserved" in trust.json()["detail"].lower()
+
