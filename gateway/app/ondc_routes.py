@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
@@ -40,11 +40,13 @@ from app.persistence.ondc_repository import (
     persist_callback_before_ack,
 )
 from app.persistence.transaction import UnitOfWork
+from app.session_auth import require_buyer_principal
 from config import settings
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["ondc"])
+_BUYER_PRINCIPAL = [Depends(require_buyer_principal)]
 
 PREPROD_GATEWAY = "https://preprod.gateway.ondc.org/search"
 PREPROD_LOOKUP = "https://preprod.registry.ondc.org/v2.0/lookup"
@@ -1214,12 +1216,12 @@ async def _dispatch_search(
     )
 
 
-@router.post("/api/ondc/search")
+@router.post("/api/ondc/search", dependencies=_BUYER_PRINCIPAL)
 async def ondc_search(body: SearchBody, request: Request) -> JSONResponse:
     return await _dispatch_search(body, request)
 
 
-@router.post("/api/ondc/logistics/search")
+@router.post("/api/ondc/logistics/search", dependencies=_BUYER_PRINCIPAL)
 async def ondc_logistics_search(body: SearchBody, request: Request) -> JSONResponse:
     return await _dispatch_search(body, request, role="lbnp")
 
@@ -1515,22 +1517,22 @@ async def _dispatch_order_action(
     )
 
 
-@router.post("/api/ondc/select")
+@router.post("/api/ondc/select", dependencies=_BUYER_PRINCIPAL)
 async def ondc_select(body: OrderActionBody, request: Request) -> JSONResponse:
     return await _dispatch_order_action(request, "select", body)
 
 
-@router.post("/api/ondc/init")
+@router.post("/api/ondc/init", dependencies=_BUYER_PRINCIPAL)
 async def ondc_init(body: OrderActionBody, request: Request) -> JSONResponse:
     return await _dispatch_order_action(request, "init", body)
 
 
-@router.post("/api/ondc/confirm")
+@router.post("/api/ondc/confirm", dependencies=_BUYER_PRINCIPAL)
 async def ondc_confirm(body: ConfirmBody, request: Request) -> JSONResponse:
     return await _dispatch_order_action(request, "confirm", body)
 
 
-@router.post("/api/ondc/track")
+@router.post("/api/ondc/track", dependencies=_BUYER_PRINCIPAL)
 async def ondc_track(body: OrderActionBody, request: Request) -> JSONResponse:
     return await _dispatch_order_action(request, "track", body)
 
@@ -1662,17 +1664,17 @@ async def ondc_track_local_post(
     return await _local_order_track(request, body.order_id)
 
 
-@router.post("/api/ondc/order-status")
+@router.post("/api/ondc/order-status", dependencies=_BUYER_PRINCIPAL)
 async def ondc_order_status(body: OrderActionBody, request: Request) -> JSONResponse:
     return await _dispatch_order_action(request, "status", body)
 
 
-@router.post("/api/ondc/cancel")
+@router.post("/api/ondc/cancel", dependencies=_BUYER_PRINCIPAL)
 async def ondc_cancel(body: OrderActionBody, request: Request) -> JSONResponse:
     return await _dispatch_order_action(request, "cancel", body)
 
 
-@router.post("/api/ondc/update")
+@router.post("/api/ondc/update", dependencies=_BUYER_PRINCIPAL)
 async def ondc_update(body: OrderActionBody, request: Request) -> JSONResponse:
     return await _dispatch_order_action(request, "update", body)
 
@@ -2322,45 +2324,45 @@ async def _order_buyer_id(request: Request, order_id: str) -> str | None:
         return None
 
 
-@router.post("/api/ondc/issue")
+@router.post("/api/ondc/issue", dependencies=_BUYER_PRINCIPAL)
 async def ondc_issue(body: IgmIssueBody, request: Request) -> JSONResponse:
     return await _dispatch_igm_action(request, "issue", body)
 
 
-@router.post("/api/ondc/issue_status")
+@router.post("/api/ondc/issue_status", dependencies=_BUYER_PRINCIPAL)
 async def ondc_issue_status(body: IgmIssueBody, request: Request) -> JSONResponse:
     return await _dispatch_igm_action(request, "issue_status", body)
 
 
-@router.post("/api/ondc/logistics/init")
+@router.post("/api/ondc/logistics/init", dependencies=_BUYER_PRINCIPAL)
 async def ondc_logistics_init(
     body: LogisticsActionBody, request: Request
 ) -> JSONResponse:
     return await _dispatch_order_action(request, "init", body, role="lbnp")
 
 
-@router.post("/api/ondc/logistics/confirm")
+@router.post("/api/ondc/logistics/confirm", dependencies=_BUYER_PRINCIPAL)
 async def ondc_logistics_confirm(
     body: LogisticsActionBody, request: Request
 ) -> JSONResponse:
     return await _dispatch_order_action(request, "confirm", body, role="lbnp")
 
 
-@router.post("/api/ondc/logistics/update")
+@router.post("/api/ondc/logistics/update", dependencies=_BUYER_PRINCIPAL)
 async def ondc_logistics_update(
     body: LogisticsActionBody, request: Request
 ) -> JSONResponse:
     return await _dispatch_order_action(request, "update", body, role="lbnp")
 
 
-@router.post("/api/ondc/logistics/status")
+@router.post("/api/ondc/logistics/status", dependencies=_BUYER_PRINCIPAL)
 async def ondc_logistics_status(
     body: LogisticsActionBody, request: Request
 ) -> JSONResponse:
     return await _dispatch_order_action(request, "status", body, role="lbnp")
 
 
-@router.post("/api/ondc/logistics/track")
+@router.post("/api/ondc/logistics/track", dependencies=_BUYER_PRINCIPAL)
 async def ondc_logistics_track(
     body: LogisticsActionBody, request: Request
 ) -> JSONResponse:

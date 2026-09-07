@@ -117,6 +117,25 @@ def _record(method: str, path: str, handler: str) -> MutationRecord:
         idempotency = "message_id_deduplication"
         audit = "signed_envelope_inbox_outbox_dead_letter"
         negative = "reject_bad_signature_duplicate_or_correlation_mismatch"
+        bap_frontend = path.startswith("/api/ondc/") and any(
+            segment in path
+            for segment in (
+                "/search",
+                "/select",
+                "/init",
+                "/confirm",
+                "/track",
+                "/order-status",
+                "/cancel",
+                "/update",
+                "/issue",
+                "/issue_status",
+                "/logistics/",
+            )
+        )
+        if bap_frontend and "/order-track" not in path and "/callback/" not in path:
+            authority = "authenticated_session_principal"
+            negative = "reject_unauthenticated_or_audience_mismatch"
         risk = (
             "critical"
             if "dead-letter" in path or path.endswith("/inbox/drain") or path.endswith("/outbox/drain")

@@ -18,6 +18,7 @@ from psycopg.conninfo import make_conninfo
 
 from app.ondc_routes import router as ondc_router
 from app.ondc_bpp import router as ondc_bpp_router
+from app.session_auth import SESSION_COOKIE_NAME, create_principal_session_token
 from app.persistence import ConnectionPool, MigrationRunner, UnitOfWork
 from app.persistence.ondc_repository import (
     CorrelationMismatch,
@@ -29,6 +30,16 @@ from app.persistence.ondc_repository import (
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 MIGRATIONS = Path(__file__).parents[1] / "migrations"
+
+
+def _buyer_cookies() -> dict[str, str]:
+    return {
+        SESSION_COOKIE_NAME: create_principal_session_token(
+            principal_id="principal:auth0:ondc-buyer",
+            audience="ondcbuyer",
+            identity_provider="auth0",
+        )
+    }
 
 pytestmark = [
     pytest.mark.asyncio,
@@ -446,8 +457,12 @@ async def test_live_confirm_uses_durable_outbox_and_one_effect_replay(
         async with AsyncClient(
             transport=ASGITransport(app=api), base_url="http://test"
         ) as client:
-            first = await client.post("/api/ondc/confirm", json=body)
-            replay = await client.post("/api/ondc/confirm", json=body)
+            first = await client.post(
+                "/api/ondc/confirm", json=body, cookies=_buyer_cookies()
+            )
+            replay = await client.post(
+                "/api/ondc/confirm", json=body, cookies=_buyer_cookies()
+            )
 
         assert first.status_code == replay.status_code == 200
         assert first.json()["data"]["dispatched"] is True
@@ -496,7 +511,9 @@ async def test_live_confirm_failure_remains_retryable(
         async with AsyncClient(
             transport=ASGITransport(app=api), base_url="http://test"
         ) as client:
-            response = await client.post("/api/ondc/confirm", json=body)
+            response = await client.post(
+                "/api/ondc/confirm", json=body, cookies=_buyer_cookies()
+            )
 
         assert response.status_code == 502
         async with pool.connection() as connection:

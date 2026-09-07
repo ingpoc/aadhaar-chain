@@ -12,7 +12,19 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
 from app.ondc_crypto import create_authorization_header
+from app.session_auth import SESSION_COOKIE_NAME, create_principal_session_token
 from config import settings
+
+
+def _sign_in_buyer(client: TestClient) -> None:
+    client.cookies.set(
+        SESSION_COOKIE_NAME,
+        create_principal_session_token(
+            principal_id="principal:auth0:ondc-buyer",
+            audience="ondcbuyer",
+            identity_provider="auth0",
+        ),
+    )
 
 
 @pytest.fixture()
@@ -130,6 +142,9 @@ def test_buyer_track_dispatch_signs_and_posts_order_id(
     app.state.persistence_pool = None
     with patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client):
         client = TestClient(app)
+        unauthenticated = client.post("/api/ondc/track", json={})
+        assert unauthenticated.status_code == 401
+        _sign_in_buyer(client)
         missing = client.post("/api/ondc/track", json={})
         assert missing.status_code == 422
         response = client.post(
@@ -222,6 +237,7 @@ def test_on_confirm_acks_workbench_new_message_id(
     app.state.persistence_pool = None
     with patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client):
         client = TestClient(app)
+        _sign_in_buyer(client)
         confirm = client.post(
             "/api/ondc/confirm",
             json={

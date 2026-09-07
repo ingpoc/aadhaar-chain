@@ -13,7 +13,19 @@ from fastapi.testclient import TestClient
 
 from app.ondc_crypto import create_authorization_header
 from app.ondc_routes import _normalize_retail_callback
+from app.session_auth import SESSION_COOKIE_NAME, create_principal_session_token
 from config import settings
+
+
+def _sign_in_buyer(client: TestClient) -> None:
+    client.cookies.set(
+        SESSION_COOKIE_NAME,
+        create_principal_session_token(
+            principal_id="principal:auth0:ondc-buyer",
+            audience="ondcbuyer",
+            identity_provider="auth0",
+        ),
+    )
 
 
 @pytest.fixture()
@@ -155,6 +167,7 @@ def test_buyer_status_cancel_update_dispatch_signs(
     }
     with patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client):
         client = TestClient(app)
+        _sign_in_buyer(client)
         for path, body in bodies.items():
             response = client.post(f"/api/ondc/{path}", json=body)
             assert response.status_code == 200, response.text
