@@ -12,7 +12,19 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
 from app.ondc_crypto import create_authorization_header
+from app.session_auth import SESSION_COOKIE_NAME, create_principal_session_token
 from config import settings
+
+
+def _sign_in_buyer(client: TestClient) -> None:
+    client.cookies.set(
+        SESSION_COOKIE_NAME,
+        create_principal_session_token(
+            principal_id="principal:auth0:ondc-buyer",
+            audience="ondcbuyer",
+            identity_provider="auth0",
+        ),
+    )
 
 
 @pytest.fixture()
@@ -141,6 +153,7 @@ def test_signed_igm_issue_request_uses_retail_scope_and_authorization(
     app.state.persistence_pool = None
     with patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client):
         client = TestClient(app)
+        _sign_in_buyer(client)
         created = _create_local_issue(client)
         response = client.post(
             "/api/ondc/issue",
@@ -194,6 +207,7 @@ def test_igm_rejects_non_retail_domain_and_unknown_issue(
 
     app.state.persistence_pool = None
     client = TestClient(app)
+    _sign_in_buyer(client)
     created = _create_local_issue(client)
     unknown = client.post(
         "/api/ondc/issue",
@@ -306,6 +320,7 @@ def test_igm_dispatch_failure_stays_retryable(
         AsyncMock(side_effect=RuntimeError("network unavailable")),
     ):
         client = TestClient(app)
+        _sign_in_buyer(client)
         created = _create_local_issue(client)
         response = client.post(
             "/api/ondc/issue",
@@ -398,6 +413,7 @@ def test_igm_dispatch_binds_confirmed_order_without_local_issue(
     transaction_id = "f876d453-6c33-4297-952e-7ee54ed50551"
     with patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client):
         client = TestClient(app)
+        _sign_in_buyer(client)
         confirm = client.post(
             "/api/ondc/confirm",
             json={
@@ -482,6 +498,7 @@ def test_igm_close_sends_complainant_close_action(
     app.state.persistence_pool = None
     with patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client):
         client = TestClient(app)
+        _sign_in_buyer(client)
         created = _create_local_issue(client)
         response = client.post(
             "/api/ondc/issue",

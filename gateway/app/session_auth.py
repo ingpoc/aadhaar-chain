@@ -10,6 +10,8 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from fastapi import HTTPException, Request
+
 from config import get_runtime_mode, settings
 
 SESSION_COOKIE_NAME = "aadharcha_session"
@@ -126,6 +128,20 @@ def parse_session_token(token: str) -> Optional[dict[str, Any]]:
         payload["principal_id"] = f"wallet:{wallet_address}"
         payload.setdefault("identity_provider", "wallet")
     return payload
+
+
+def require_buyer_principal(request: Request) -> str:
+    """Buyer session, plus Seller social handoff used by commerce (#16/#19/#21)."""
+    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    if not session or not session.get("principal_id"):
+        raise HTTPException(status_code=401, detail="Authenticated principal required.")
+    shared_social_session = (
+        session.get("identity_provider") in {"auth0", "google"}
+        and session.get("aud") == "ondcseller"
+    )
+    if session.get("aud") != "ondcbuyer" and not shared_social_session:
+        raise HTTPException(status_code=403, detail="Buyer session required.")
+    return str(session["principal_id"])
 
 
 def session_user_payload(session: dict[str, Any]) -> dict[str, Any]:

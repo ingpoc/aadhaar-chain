@@ -18,7 +18,19 @@ from app.ondc_crypto import (
     minify_json,
     verify_authorization_header,
 )
+from app.session_auth import SESSION_COOKIE_NAME, create_principal_session_token
 from config import settings
+
+
+def _sign_in_buyer(client: TestClient) -> None:
+    client.cookies.set(
+        SESSION_COOKIE_NAME,
+        create_principal_session_token(
+            principal_id="principal:auth0:ondc-buyer",
+            audience="ondcbuyer",
+            identity_provider="auth0",
+        ),
+    )
 
 
 def test_lbnp_onboarding_uses_dedicated_identity_and_keys(
@@ -183,6 +195,7 @@ def test_ondc_search_dispatches_when_configured(
 
     with patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client):
         client = TestClient(app)
+        _sign_in_buyer(client)
         res = client.post(
             "/api/ondc/search", json={"query": "banana", "city": "std:080"}
         )
@@ -239,6 +252,7 @@ def test_ondc_search_can_also_dispatch_to_configured_bpp(
 
     with patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client):
         client = TestClient(app)
+        _sign_in_buyer(client)
         res = client.post(
             "/api/ondc/search",
             json={"query": "atta", "include_configured_bpp": True},
@@ -349,6 +363,7 @@ def test_ondc_select_init_confirm_dispatch(
     }
     with patch("app.ondc_routes.httpx.AsyncClient", return_value=mock_client):
         client = TestClient(app)
+        _sign_in_buyer(client)
         for action in ("select", "init", "confirm"):
             res = client.post(f"/api/ondc/{action}", json=body)
             assert res.status_code == 200, res.text
@@ -497,6 +512,7 @@ def test_logistics_routes_use_only_the_dedicated_lbnp_contract(
         ),
     ):
         client = TestClient(app)
+        _sign_in_buyer(client)
         response = client.post("/api/ondc/logistics/search", json=search)
         assert response.status_code == 200, response.text
         for action in ("init", "confirm", "update"):
