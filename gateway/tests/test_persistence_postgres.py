@@ -133,6 +133,60 @@ async def test_preprod_ondcseller_owner_binding_is_idempotent(
         await pool.close()
 
 
+async def test_preprod_ondcseller_seller_mandate_binding_is_idempotent(
+    postgres_url: str,
+) -> None:
+    pool = await _open_migrated_pool(postgres_url)
+    try:
+        async with pool.connection() as connection:
+            await connection.execute(
+                """
+                INSERT INTO commerce_seller_stores (seller_id, status)
+                VALUES ('ondcseller', 'ready')
+                """
+            )
+            owner = (MIGRATIONS / "035_preprod_ondcseller_owner.sql").read_text()
+            await connection.execute(owner)
+            mandate = (
+                MIGRATIONS / "036_preprod_ondcseller_seller_mandate.sql"
+            ).read_text()
+            await connection.execute(mandate)
+            await connection.execute(mandate)
+            result = await connection.execute(
+                """
+                SELECT agent_id, role, status,
+                       current_mandate_id, current_mandate_version
+                FROM agentguard_agents
+                WHERE principal_id =
+                    'principal:auth0:google-oauth2:109432510636331667287'
+                  AND role = 'seller'
+                """
+            )
+            assert await result.fetchone() == (
+                "agent_seller_e24723ffb9d2636d0bea",
+                "seller",
+                "active",
+                "mandate_seller_e24723ffb9d2636d0bea",
+                1,
+            )
+            result = await connection.execute(
+                """
+                SELECT mandate_id, version, status
+                FROM agentguard_mandate_versions
+                WHERE principal_id =
+                    'principal:auth0:google-oauth2:109432510636331667287'
+                  AND mandate_id = 'mandate_seller_e24723ffb9d2636d0bea'
+                """
+            )
+            assert await result.fetchone() == (
+                "mandate_seller_e24723ffb9d2636d0bea",
+                1,
+                "active",
+            )
+    finally:
+        await pool.close()
+
+
 async def test_seller_stores_use_text_array_on_fresh_postgres(postgres_url: str) -> None:
     pool = await _open_migrated_pool(postgres_url)
     try:
