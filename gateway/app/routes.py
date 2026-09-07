@@ -44,7 +44,13 @@ from app.models import (
 
 from app.agent_manager import agent_manager
 from app.evidence_store import store_encrypted_evidence
-from app.session_auth import create_session_token, set_session_cookie
+from app.session_auth import (
+    SESSION_COOKIE_NAME,
+    create_session_token,
+    parse_session_token,
+    session_user_payload,
+    set_session_cookie,
+)
 from app.setu_ekyc import (
     create_ekyc_request,
     get_ekyc_request,
@@ -63,6 +69,22 @@ class SetuEkycStartRequest(BaseModel):
 class SetuEkycSyncRequest(BaseModel):
     setu_id: str = Field(min_length=8)
 
+
+
+# Path segments that must never be treated as Solana wallet addresses.
+# /api/identity/me is reserved for the signed-in principal (see get_identity_me).
+_RESERVED_IDENTITY_PATH_WALLETS = frozenset({"me", "self", "current"})
+
+
+def _ensure_wallet_path_not_reserved(wallet_address: str) -> None:
+    if wallet_address.strip().lower() in _RESERVED_IDENTITY_PATH_WALLETS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"'{wallet_address}' is reserved and is not a wallet address. "
+                "Use GET /api/auth/me or GET /api/identity/me for the signed-in principal."
+            ),
+        )
 
 # Runtime stores hydrated on startup.
 verifications: dict[str, VerificationStatus] = {}
@@ -558,6 +580,7 @@ async def get_trust_surface(
     wallet_address: str,
 ):
     """Expose a downstream-safe trust view without leaking raw verification evidence."""
+    _ensure_wallet_path_not_reserved(wallet_address)
     if wallet_address not in identities:
         append_audit_event(
             "trust_read",
@@ -761,11 +784,33 @@ async def verify_pan_document(
 # --- Identity Routes ---
 
 
+@router.get("/me", response_model=ApiResponse, tags=["identity"])
+async def get_identity_me(request: Request):
+    """Signed-in principal from session — not wallet KYC.
+
+    Prefer GET /api/auth/me. This reserved path exists so clients that guess
+    /api/identity/me do not hit the wallet catch-all ("Identity not found").
+    """
+    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    if session is None:
+        return ApiResponse(
+            success=True,
+            message="No authenticated identity session.",
+            data=None,
+        )
+    return ApiResponse(
+        success=True,
+        message="Authenticated identity session active.",
+        data=session_user_payload(session),
+    )
+
+
 @router.get("/{wallet_address}", response_model=ApiResponse, tags=["identity"])
 async def get_identity(
     wallet_address: str,
 ):
     """Get identity data for wallet address."""
+    _ensure_wallet_path_not_reserved(wallet_address)
     if wallet_address not in identities:
         return ApiResponse(
             success=True,
@@ -785,6 +830,7 @@ async def create_identity(
     data: CreateIdentityRequest,
 ):
     """Create a new identity anchor for the wallet address."""
+    _ensure_wallet_path_not_reserved(wallet_address)
     if wallet_address in identities:
         raise HTTPException(status_code=409, detail="Identity already exists")
 
