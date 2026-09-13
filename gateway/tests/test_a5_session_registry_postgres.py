@@ -53,7 +53,10 @@ def _local_database_url() -> str:
 async def postgres_url() -> AsyncIterator[str]:
     admin_url = _local_database_url()
     schema = f"a5_session_{uuid4().hex}"
-    admin = await psycopg.AsyncConnection.connect(admin_url, autocommit=True)
+    try:
+        admin = await psycopg.AsyncConnection.connect(admin_url, autocommit=True)
+    except Exception as exc:  # noqa: BLE001 — local/CI optional DB
+        pytest.skip(f"local Postgres unavailable for A5 durability tests: {exc}")
     try:
         await admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
         yield make_conninfo(admin_url, options=f"-csearch_path={schema},public")
@@ -65,7 +68,7 @@ async def postgres_url() -> AsyncIterator[str]:
 
 
 async def _bind(postgres_url: str, *, migrate: bool) -> ConnectionPool:
-    pool = ConnectionPool(postgres_url, min_size=0, max_size=4)
+    pool = ConnectionPool(postgres_url, min_size=1, max_size=4)
     await pool.open()
     if migrate:
         await MigrationRunner(pool, MIGRATIONS).apply()
@@ -104,7 +107,7 @@ def _isolate_registry() -> None:
 
 async def test_revoke_sid_survives_new_connection(postgres_url: str) -> None:
     first = await _bind(postgres_url, migrate=True)
-    token = await _mint_persisted(principal_id="principal:auth0:a5-durable-sid")
+    token = await _mint_persisted(principal_id="principal:auth0:a5-user-sid")
     payload = decode_session_payload(token)
     assert payload is not None
     await revoke_sid_durable(str(payload["sid"]))
@@ -122,7 +125,7 @@ async def test_revoke_all_survives_new_connection_and_allows_fresh_login(
     postgres_url: str,
 ) -> None:
     first = await _bind(postgres_url, migrate=True)
-    principal = "principal:auth0:a5-durable-twins"
+    principal = "principal:auth0:a5-user-twins"
     token_a = await _mint_persisted(principal_id=principal)
     token_b = await _mint_persisted(principal_id=principal)
     await revoke_principal_durable(principal)
