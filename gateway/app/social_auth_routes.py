@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Optional
 from urllib.parse import urlencode
+import base64
+import json
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -18,10 +20,20 @@ from pydantic import BaseModel, Field
 from app.oauth_state import is_allowed_return_url, mint_oauth_state, parse_oauth_state
 from app.session_auth import (
     create_principal_session_token,
+    decode_session_payload,
     set_session_cookie,
+    clear_session_cookie,
     session_user_payload,
     parse_session_token,
     SESSION_COOKIE_NAME,
+)
+from app.session_registry import (
+    SessionRegistryUnavailable,
+    get_session,
+    list_principal_sessions,
+    persist_registered_session,
+    revoke_principal_durable,
+    revoke_sid_durable,
 )
 from config import get_runtime_mode, settings
 
@@ -93,21 +105,54 @@ def _demo_principal_for_audience(audience: str) -> str:
     return principal_id
 
 
-def _issue_session(
+async def _issue_session(
     *,
     principal_id: str,
     audience: str,
     identity_provider: str,
     display_name: Optional[str] = None,
     email: Optional[str] = None,
+    amr: Optional[list[str]] = None,
+    acr: Optional[str] = None,
 ) -> str:
-    return create_principal_session_token(
+    token = create_principal_session_token(
         principal_id=principal_id,
         audience=audience,
         identity_provider=identity_provider,
         display_name=display_name,
         email=email,
+        amr=amr,
+        acr=acr,
     )
+    payload = decode_session_payload(token)
+    if payload is not None:
+        try:
+            await persist_registered_session(payload)
+        except SessionRegistryUnavailable as exc:
+            raise HTTPException(
+                status_code=503, detail="Session registry unavailable."
+            ) from exc
+    return token
+
+
+def _require_session(request: Request) -> dict:
+    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    if not session or not session.get("principal_id"):
+        raise HTTPException(status_code=401, detail="Authenticated principal required.")
+    return session
+
+
+def _id_token_claims(id_token: Optional[str]) -> dict:
+    if not id_token or id_token.count(".") < 2:
+        return {}
+    try:
+        payload = id_token.split(".")[1]
+        padding = "=" * (-len(payload) % 4)
+        raw = base64.urlsafe_b64decode(f"{payload}{padding}")
+        data = json.loads(raw.decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
 
 
 @router.get("/providers")
@@ -129,6 +174,7 @@ async def auth_providers() -> JSONResponse:
 async def auth0_start(
     return_url: str = Query(..., alias="return"),
     aud: str = Query("ondcbuyer"),
+    step_up: bool = Query(False),
 ) -> RedirectResponse:
     """Start Auth0 Authorization Code Flow (Regular Web App)."""
     if not _auth0_configured():
@@ -146,6 +192,11 @@ async def auth0_start(
     }
     if settings.auth0_audience:
         params["audience"] = settings.auth0_audience
+    if step_up:
+        params["prompt"] = "login"
+        params["acr_values"] = (
+            "http://schemas.openid.net/pape/policies/2007/06/multi-factor"
+        )
     return RedirectResponse(
         f"https://{domain}/authorize?{urlencode(params)}",
         status_code=302,
@@ -199,14 +250,23 @@ async def auth0_callback(
     sub = info.get("sub")
     if not sub:
         raise HTTPException(status_code=502, detail="Auth0 userinfo missing sub.")
+    claims = _id_token_claims(tokens.get("id_token"))
+    amr = claims.get("amr")
+    if isinstance(amr, str):
+        amr = [amr]
+    if not isinstance(amr, list):
+        amr = None
+    acr = claims.get("acr") if isinstance(claims.get("acr"), str) else None
     # Normalize Auth0 sub (e.g. google-oauth2|123) into a stable principal id.
     safe_sub = str(sub).replace("|", ":")
-    token = _issue_session(
+    token = await _issue_session(
         principal_id=f"principal:auth0:{safe_sub}",
         audience=meta["aud"],
         identity_provider="auth0",
         display_name=info.get("name") or info.get("nickname"),
         email=info.get("email"),
+        amr=amr,
+        acr=acr,
     )
     response = RedirectResponse(meta["return_url"], status_code=302)
     set_session_cookie(response, token)
@@ -275,7 +335,7 @@ async def google_callback(
     sub = info.get("sub")
     if not sub:
         raise HTTPException(status_code=502, detail="Google userinfo missing sub.")
-    token = _issue_session(
+    token = await _issue_session(
         principal_id=f"principal:google:{sub}",
         audience=meta["aud"],
         identity_provider="google",
@@ -293,7 +353,7 @@ async def demo_continue_post(body: DemoContinueBody) -> JSONResponse:
         raise HTTPException(status_code=403, detail="Demo continue disabled.")
     audience = body.audience.strip().lower()
     principal_id = _demo_principal_for_audience(audience)
-    token = _issue_session(
+    token = await _issue_session(
         principal_id=principal_id,
         audience=audience,
         identity_provider="demo",
@@ -330,7 +390,7 @@ async def demo_continue_get(
         raise HTTPException(status_code=400, detail="return URL is not an allowed origin.")
     audience = aud.strip().lower()
     principal_id = _demo_principal_for_audience(audience)
-    token = _issue_session(
+    token = await _issue_session(
         principal_id=principal_id,
         audience=audience,
         identity_provider="demo",
@@ -338,6 +398,74 @@ async def demo_continue_get(
     )
     response = RedirectResponse(return_url, status_code=302)
     set_session_cookie(response, token)
+    return response
+
+
+@router.get("/sessions")
+async def list_sessions(request: Request) -> JSONResponse:
+    session = _require_session(request)
+    records = list_principal_sessions(str(session["principal_id"]))
+    return JSONResponse(
+        {
+            "success": True,
+            "data": {
+                "current_sid": session.get("sid"),
+                "sessions": records,
+            },
+        }
+    )
+
+
+class RevokeSessionBody(BaseModel):
+    sid: Optional[str] = Field(None, min_length=4, max_length=128)
+
+
+@router.post("/sessions/revoke")
+async def revoke_one_session(
+    request: Request, body: RevokeSessionBody
+) -> JSONResponse:
+    session = _require_session(request)
+    target = (body.sid or session.get("sid") or "").strip()
+    if not target:
+        raise HTTPException(status_code=422, detail="sid required.")
+    record = get_session(target)
+    if target != session.get("sid"):
+        if not record or record.get("principal_id") != session.get("principal_id"):
+            raise HTTPException(status_code=404, detail="Unknown session.")
+    try:
+        await revoke_sid_durable(target)
+    except SessionRegistryUnavailable as exc:
+        raise HTTPException(
+            status_code=503, detail="Session registry unavailable."
+        ) from exc
+    payload = {
+        "success": True,
+        "message": "Session revoked.",
+        "data": {"sid": target},
+    }
+    response = JSONResponse(payload)
+    if target == session.get("sid"):
+        clear_session_cookie(response)
+    return response
+
+
+@router.post("/sessions/revoke-all")
+async def revoke_all_sessions(request: Request) -> JSONResponse:
+    session = _require_session(request)
+    try:
+        dropped = await revoke_principal_durable(str(session["principal_id"]))
+    except SessionRegistryUnavailable as exc:
+        raise HTTPException(
+            status_code=503, detail="Session registry unavailable."
+        ) from exc
+    response = JSONResponse(
+        {
+            "success": True,
+            "message": "All sessions revoked for this principal.",
+            "data": {"revoked": dropped},
+        }
+    )
+    clear_session_cookie(response)
     return response
 
 

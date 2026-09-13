@@ -20,7 +20,12 @@ from app.persistence.agentguard_repository import (
     AgentGuardPermissionDenied,
 )
 from app.seller_agentguard_orchestrator import SellerAgentGuardOrchestrator
-from app.session_auth import SESSION_COOKIE_NAME, parse_session_token
+from app.session_auth import (
+    SESSION_COOKIE_NAME,
+    audiences_match,
+    parse_session_token,
+    step_up_required,
+)
 from app.razorpay import RazorpayConfigError, RazorpayLiveKeyRefused
 
 router = APIRouter(prefix="/api/agentguard", tags=["agentguard"])
@@ -190,9 +195,10 @@ def _principal(
     role: Optional[Role] = None,
 ) -> tuple[str, Optional[str]]:
     """Resolve authorization principal from session first; body wallet is legacy only."""
-    del role  # reserved for future audience checks
     session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
     if session:
+        if role is not None and not audiences_match(session.get("aud"), role):
+            raise HTTPException(status_code=403, detail="Session audience mismatch.")
         session_wallet = session.get("wallet_address")
         principal_id = session.get("principal_id")
         if not principal_id and session_wallet:
@@ -217,6 +223,28 @@ def _principal(
         # Legacy pytest / fixture path without cookie — maps to wallet:* principal.
         return principal_id_from_wallet(wallet_address), wallet_address
     raise HTTPException(status_code=401, detail="AgentGuard principal required.")
+
+
+def _assert_session_action(request: Request, action: str) -> None:
+    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    if not session:
+        return
+    normalized = agentguard.normalize_action(action) or action
+    required: Optional[str] = None
+    if str(normalized).startswith("seller.") or action == "refund":
+        required = "seller"
+    elif str(normalized).startswith("buyer.") or action == "checkout":
+        required = "buyer"
+    if required and not audiences_match(session.get("aud"), required):
+        raise HTTPException(status_code=403, detail="Session audience mismatch.")
+    if step_up_required(session, str(normalized)):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "step_up_required",
+                "message": "Step-up authentication required for this Seller action.",
+            },
+        )
 
 
 def _assert_agent_principal(agent_id: str, principal_id: str) -> agentguard.AgentRecord:
@@ -505,6 +533,7 @@ async def evaluate_action(
     principal_id, wallet_address = _principal(
         request, wallet_address=body.wallet_address
     )
+    _assert_session_action(request, body.action)
     pool = _persistence_pool(request)
     effective_correlation_id = correlation_id or f"correlation_{uuid4().hex}"
     response.headers["X-Correlation-ID"] = effective_correlation_id
@@ -712,6 +741,7 @@ async def execute_action(
     principal_id, wallet_address = _principal(
         request, wallet_address=body.wallet_address
     )
+    _assert_session_action(request, body.action)
     pool = _persistence_pool(request)
     if pool is not None and not (correlation_id or "").strip():
         raise HTTPException(

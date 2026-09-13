@@ -3,7 +3,7 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -11,6 +11,7 @@ import uvicorn
 from config import (
     apply_runtime_environment,
     get_cf1_persistence_backend,
+    get_runtime_mode,
     settings,
     validate_runtime_storage_config,
 )
@@ -28,6 +29,13 @@ from app.session_auth import (
     clear_session_cookie,
     parse_session_token,
     session_user_payload,
+)
+from app.session_registry import (
+    SessionRegistryUnavailable,
+    bind_session_store,
+    open_session_store,
+    revoke_sid_durable,
+    unbind_session_store,
 )
 from app.social_auth_routes import router as social_auth_router
 from app.ondc_routes import router as ondc_router
@@ -52,6 +60,12 @@ async def lifespan(_app: FastAPI):
         ).apply()
     _app.state.persistence_backend = persistence_backend
     _app.state.persistence_pool = persistence_pool
+    bind_session_store(
+        persistence_pool,
+        require_durable=persistence_backend == "postgres"
+        or get_runtime_mode() in ("staging", "production"),
+    )
+    await open_session_store()
     persisted_identities, persisted_verifications = load_gateway_state()
     identities.clear()
     identities.update(persisted_identities)
@@ -78,6 +92,7 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        unbind_session_store()
         if persistence_pool is not None:
             await persistence_pool.close()
 
@@ -184,8 +199,16 @@ async def auth_validate(request: Request) -> JSONResponse:
 
 
 @app.post("/api/auth/logout", tags=["auth"])
-async def auth_logout() -> JSONResponse:
-    """Clear the portfolio SSO session cookie."""
+async def auth_logout(request: Request) -> JSONResponse:
+    """Clear the portfolio SSO session cookie and deny the current sid."""
+    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    if session and session.get("sid"):
+        try:
+            await revoke_sid_durable(str(session["sid"]))
+        except SessionRegistryUnavailable as exc:
+            raise HTTPException(
+                status_code=503, detail="Session registry unavailable."
+            ) from exc
     response = JSONResponse(
         {
             "success": True,
