@@ -99,6 +99,7 @@ class Settings(BaseSettings):
 
     # Portfolio SSO session cookies (stateless signed tokens)
     session_secret: str = "aadhaarchain-local-dev-session-secret"
+    session_secret_previous: Optional[str] = None
     session_ttl_hours: int = 24
 
     # Social / demo principal (AgentGuard host identity — not wallet)
