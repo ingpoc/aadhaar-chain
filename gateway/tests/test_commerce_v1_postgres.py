@@ -252,6 +252,82 @@ async def test_successful_purchase_is_durable_and_ledger_balanced(commerce) -> N
                 )
 
 
+async def test_successful_multi_sku_purchase_consumes_all_reservations(commerce) -> None:
+    service, pool, _ = commerce
+    seller_id = "seller-multi-sku"
+    principal_id = "principal:multi-sku-buyer"
+    inventory = (
+        ("atta-2kg", "Atta 2kg", 12_500, 10, 2),
+        ("rice-1kg", "Rice 1kg", 8_000, 20, 3),
+    )
+    for sku, title, price, stock, _quantity in inventory:
+        await service.upsert_inventory(
+            seller_id=seller_id,
+            sku=sku,
+            title=title,
+            unit_price_paise=price,
+            available_quantity=stock,
+        )
+
+    cart = await service.create_cart(
+        principal_id=principal_id,
+        seller_id=seller_id,
+    )
+    for sku, _title, _price, _stock, quantity in inventory:
+        cart = await service.set_cart_line(
+            principal_id=principal_id,
+            cart_id=cart["cart_id"],
+            sku=sku,
+            quantity=quantity,
+            expected_version=cart["version"],
+        )
+    quote = await service.preview_checkout(
+        principal_id=principal_id,
+        cart_id=cart["cart_id"],
+        expected_version=cart["version"],
+    )
+    prepared = await service.prepare_checkout(
+        principal_id=principal_id,
+        quote_id=quote["quote_id"],
+        idempotency_key="checkout-multi-sku",
+    )
+
+    await service.record_payment_result(
+        principal_id=principal_id,
+        payment_attempt_id=prepared["payment_attempt"]["payment_attempt_id"],
+        status="succeeded",
+        provider_reference="simulated-multi-sku-success",
+    )
+
+    async with pool.connection() as connection:
+        inventory_result = await connection.execute(
+            """
+            SELECT sku, available_quantity, reserved_quantity
+            FROM commerce_inventory
+            WHERE seller_id = %s
+            ORDER BY sku
+            """,
+            (seller_id,),
+        )
+        assert await inventory_result.fetchall() == [
+            ("atta-2kg", 8, 0),
+            ("rice-1kg", 17, 0),
+        ]
+        reservation_result = await connection.execute(
+            """
+            SELECT sku, status
+            FROM commerce_inventory_reservations
+            WHERE order_id = %s
+            ORDER BY sku
+            """,
+            (prepared["order"]["order_id"],),
+        )
+        assert await reservation_result.fetchall() == [
+            ("atta-2kg", "consumed"),
+            ("rice-1kg", "consumed"),
+        ]
+
+
 async def test_logistics_callbacks_update_one_bound_order_idempotently(commerce) -> None:
     service, pool, _ = commerce
     _, quote = await _cart_and_quote(service)
