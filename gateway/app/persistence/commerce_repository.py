@@ -598,31 +598,25 @@ class CommerceRepository:
         )
 
     async def consume_reservations(self, order_id: UUID) -> None:
-        async with self.connection.cursor(row_factory=dict_row) as cursor:
-            await cursor.execute(
-                """
-                SELECT seller_id, sku, quantity FROM commerce_inventory_reservations
-                WHERE order_id = %s AND status = 'held' FOR UPDATE
-                """,
-                (order_id,),
+        await self.connection.execute(
+            """
+            WITH held_reservations AS (
+                SELECT seller_id, sku, quantity
+                FROM commerce_inventory_reservations
+                WHERE order_id = %s AND status = 'held'
+                FOR UPDATE
             )
-            reservations = await cursor.fetchall()
-        for reservation in reservations:
-            await self.connection.execute(
-                """
-                UPDATE commerce_inventory
-                SET available_quantity = available_quantity - %s,
-                    reserved_quantity = reserved_quantity - %s,
-                    version = version + 1, updated_at = NOW()
-                WHERE seller_id = %s AND sku = %s
-                """,
-                (
-                    reservation["quantity"],
-                    reservation["quantity"],
-                    reservation["seller_id"],
-                    reservation["sku"],
-                ),
-            )
+            UPDATE commerce_inventory AS inventory
+            SET available_quantity = inventory.available_quantity - reservation.quantity,
+                reserved_quantity = inventory.reserved_quantity - reservation.quantity,
+                version = inventory.version + 1,
+                updated_at = NOW()
+            FROM held_reservations AS reservation
+            WHERE inventory.seller_id = reservation.seller_id
+              AND inventory.sku = reservation.sku
+            """,
+            (order_id,),
+        )
         await self.connection.execute(
             "UPDATE commerce_inventory_reservations SET status = 'consumed' WHERE order_id = %s AND status = 'held'",
             (order_id,),
