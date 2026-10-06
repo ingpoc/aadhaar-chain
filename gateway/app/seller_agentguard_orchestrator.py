@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
+import logging
 import re
 from typing import Any
 from uuid import UUID, uuid4
@@ -22,6 +23,15 @@ from app.persistence.connection import ConnectionPool
 from app.persistence.ondc_repository import ONDCRepository
 from app.persistence.transaction import UnitOfWork
 from app.receipt_signing import sign_receipt
+
+logger = logging.getLogger(__name__)
+
+# An intent still pending/executing with no result after this long is treated
+# as abandoned (process died or effect error predates failure marking), so a
+# retry under the same idempotency key may reclaim it.
+STALE_INTENT_RECLAIM_SECONDS = 120
+# Financial effects never reclaim an in-flight intent by age alone.
+_NO_STALE_RECLAIM_ACTIONS = frozenset({"seller.refund.issue"})
 
 
 def _utcnow() -> datetime:
@@ -582,6 +592,12 @@ class SellerAgentGuardOrchestrator:
                 approval_id=approval_id,
                 payload={"bound_action": bound_action},
                 status="pending",
+                reclaim_failed=True,
+                reclaim_stale_after_seconds=(
+                    None
+                    if normalized in _NO_STALE_RECLAIM_ACTIONS
+                    else STALE_INTENT_RECLAIM_SECONDS
+                ),
             )
             if not created and intent.get("result") is not None:
                 return _jsonable(intent["result"])
@@ -624,6 +640,11 @@ class SellerAgentGuardOrchestrator:
             )
         except (AgentGuardNotFound, KeyError, CommerceNotFound) as exc:
             if normalized != "seller.refund.issue":
+                await self._release_failed_intent(
+                    principal_id=principal_id,
+                    intent_id=intent["intent_id"],
+                    error=exc,
+                )
                 raise
             await self._fail_missing_order_refund(
                 principal_id=principal_id,
@@ -640,6 +661,13 @@ class SellerAgentGuardOrchestrator:
                 idempotency_key=idempotency_key,
             )
             raise AgentGuardNotFound("Seller order not found") from exc
+        except Exception as exc:
+            await self._release_failed_intent(
+                principal_id=principal_id,
+                intent_id=intent["intent_id"],
+                error=exc,
+            )
+            raise
         receipt_id = f"receipt_{uuid4().hex}"
         receipt = sign_receipt(
             {
@@ -858,6 +886,36 @@ class SellerAgentGuardOrchestrator:
                 payload=receipt,
             )
         return receipt
+
+    async def _release_failed_intent(
+        self,
+        *,
+        principal_id: str,
+        intent_id: str,
+        error: BaseException,
+    ) -> None:
+        """Mark an intent failed so a corrected retry can reclaim its key.
+
+        Best effort: the original effect error is what the caller must see.
+        """
+        try:
+            async with UnitOfWork(self.pool) as unit_of_work:
+                await AgentGuardRepository(unit_of_work).set_execution_intent_status(
+                    principal_id=principal_id,
+                    intent_id=intent_id,
+                    status="failed",
+                    result={
+                        "decision": "error",
+                        "reason_code": "effect_failed",
+                        "error_type": type(error).__name__,
+                        "human_reason": str(error)[:500],
+                    },
+                )
+        except Exception:  # noqa: BLE001 - never mask the effect error
+            logger.warning(
+                "could not mark Seller execution intent %s failed", intent_id,
+                exc_info=True,
+            )
 
     async def _fail_missing_order_refund(
         self,
