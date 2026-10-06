@@ -1,0 +1,159 @@
+name: Codex Security
+
+# Report-only OpenAI Codex Security scan (https://github.com/openai/codex-security).
+# - pull_request: diff scan of the PR.
+# - push to main: diff scan of the pushed commits (base = previous main SHA).
+# - workflow_dispatch: live repository scan (optionally limited to paths).
+# PR/push runs are DRY-RUN (config check, no model calls, no spend) unless the
+# repository variable CODEX_SECURITY_LIVE is "true". Published CLI diff scans
+# currently do the paid analysis and then fail to save
+# ("scan.target.snapshotDigest: expected a non-empty string",
+# openai/codex-security#299), so live diff scans waste spend until that is fixed.
+# Non-blocking: findings never fail the job, scanner errors are surfaced as
+# warnings, and the job is skipped with a notice when no API key is configured.
+# Needs the repository secret CODEX_SECURITY_API_KEY (an OpenAI API key).
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      paths:
+        description: Space-separated repository-relative paths to scan (empty = whole repository)
+        required: false
+        default: gateway/app/razorpay.py gateway/app/payment_adapter.py
+      max_cost:
+        description: Estimated USD stop threshold for this run
+        required: false
+        default: "10"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codex-security:
+    name: Codex Security (report-only)
+    # Fork PRs cannot read secrets; only scan same-repository PRs.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - name: Check for API key
+        id: key
+        env:
+          HAS_KEY: ${{ secrets.CODEX_SECURITY_API_KEY != '' }}
+        run: |
+          if [ "$HAS_KEY" = "true" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Codex Security skipped::Repository secret CODEX_SECURITY_API_KEY is not set; skipping the scan."
+            {
+              echo "### Codex Security skipped"
+              echo ""
+              echo "The repository secret \`CODEX_SECURITY_API_KEY\` (an OpenAI API key) is not configured, so no scan ran."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Choose scan scope
+        id: scope
+        if: steps.key.outputs.present == 'true'
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          LIVE_VAR: ${{ vars.CODEX_SECURITY_LIVE }}
+          IN_PATHS: ${{ inputs.paths }}
+          IN_MAX_COST: ${{ inputs.max_cost }}
+        run: |
+          ref="${PR_HEAD:-$GITHUB_SHA}"
+          scope=repository
+          base=""
+          paths=""
+          dry_run=false
+          max_cost="${IN_MAX_COST:-10}"
+          if [ "$EVENT" = "pull_request" ]; then
+            scope=diff
+          elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            scope=diff
+            base="$BEFORE"
+          fi
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            paths="$(printf '%s\n' $IN_PATHS)"
+          elif [ "$LIVE_VAR" != "true" ]; then
+            dry_run=true
+            echo "::notice title=Codex Security dry run::Automatic PR/push scans are dry-run (no model calls) until the repository variable CODEX_SECURITY_LIVE is true. Use workflow_dispatch for a live scan."
+          fi
+          {
+            echo "ref=$ref"
+            echo "scope=$scope"
+            echo "base=$base"
+            echo "dry_run=$dry_run"
+            echo "max_cost=$max_cost"
+            echo "paths<<CODEX_SECURITY_PATHS_EOF"
+            if [ -n "$paths" ]; then echo "$paths"; fi
+            echo "CODEX_SECURITY_PATHS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Scope: $scope ${base:+(base $base)} at $ref; dry-run: $dry_run; paths: ${paths:-<all>}"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.key.outputs.present == 'true'
+        with:
+          ref: ${{ steps.scope.outputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Codex Security scan
+        id: security
+        if: steps.key.outputs.present == 'true'
+        continue-on-error: true
+        uses: openai/codex-security@aec8297f3b5d8b02a4c839a36da75766e5c20ad0 # main 2026-10-06 (CLI 0.1.31)
+        with:
+          scope: ${{ steps.scope.outputs.scope }}
+          diff-base: ${{ steps.scope.outputs.base }}
+          paths: ${{ steps.scope.outputs.paths }}
+          dry-run: ${{ steps.scope.outputs.dry_run }}
+          model: gpt-5.6-sol
+          effort: medium
+          max-cost: ${{ steps.scope.outputs.max_cost }}
+          fail-on-severity: none
+          upload-artifacts: "true"
+          artifact-name: codex-security-${{ github.run_id }}
+          retention-days: "14"
+        env:
+          OPENAI_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+
+      - name: Report outcome
+        if: always() && steps.key.outputs.present == 'true'
+        env:
+          OUTCOME: ${{ steps.security.outcome }}
+          SCAN_STATUS: ${{ steps.security.outputs.scan-status }}
+          SKIP_REASON: ${{ steps.security.outputs.skip-reason }}
+          CRITICAL: ${{ steps.security.outputs.critical-count }}
+          HIGH: ${{ steps.security.outputs.high-count }}
+          MEDIUM: ${{ steps.security.outputs.medium-count }}
+          LOW: ${{ steps.security.outputs.low-count }}
+          INFO: ${{ steps.security.outputs.informational-count }}
+          COST: ${{ steps.security.outputs.estimated-cost }}
+        run: |
+          {
+            echo "### Codex Security outcome (report-only)"
+            echo ""
+            echo "| Step outcome | Scan status | Critical | High | Medium | Low | Info | Est. cost (USD) |"
+            echo "| --- | --- | --- | --- | --- | --- | --- | --- |"
+            echo "| ${OUTCOME:-n/a} | ${SCAN_STATUS:-n/a}${SKIP_REASON:+ ($SKIP_REASON)} | ${CRITICAL:-?} | ${HIGH:-?} | ${MEDIUM:-?} | ${LOW:-?} | ${INFO:-?} | ${COST:-?} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "::warning title=Codex Security::Scan step did not succeed (outcome: ${OUTCOME:-unknown}, status: ${SCAN_STATUS:-unknown}). Report-only; not blocking."
+          elif [ $(( ${CRITICAL:-0} + ${HIGH:-0} )) -gt 0 ]; then
+            echo "::warning title=Codex Security::Report-only findings: critical=${CRITICAL:-0} high=${HIGH:-0}. See the job summary and artifact."
+          fi
