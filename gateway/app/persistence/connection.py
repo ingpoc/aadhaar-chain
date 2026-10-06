@@ -12,6 +12,23 @@ except ImportError:  # Lets migration discovery run without the optional DB extr
     AsyncConnectionPool = None  # type: ignore[assignment,misc]
 
 
+# Neon's pooler and compute drop idle connections server-side; retire pooled
+# connections well before that and health-check each one at checkout.
+DEFAULT_MAX_IDLE_SECONDS = 120.0
+DEFAULT_MAX_LIFETIME_SECONDS = 1800.0
+
+
+def _seconds_from_env(name: str, default: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 class ConnectionPool:
     """A lazily opened pool configured exclusively from ``DATABASE_URL``."""
 
@@ -21,6 +38,8 @@ class ConnectionPool:
         *,
         min_size: int = 1,
         max_size: int = 10,
+        max_idle: float | None = None,
+        max_lifetime: float | None = None,
     ) -> None:
         self.database_url = database_url or os.getenv("DATABASE_URL")
         if not self.database_url:
@@ -34,6 +53,15 @@ class ConnectionPool:
             min_size=min_size,
             max_size=max_size,
             open=False,
+            # Discard connections the server closed while idle (e.g. Neon
+            # "SSL connection has been closed unexpectedly") before use.
+            check=AsyncConnectionPool.check_connection,
+            max_idle=max_idle
+            or _seconds_from_env("PG_POOL_MAX_IDLE_SECONDS", DEFAULT_MAX_IDLE_SECONDS),
+            max_lifetime=max_lifetime
+            or _seconds_from_env(
+                "PG_POOL_MAX_LIFETIME_SECONDS", DEFAULT_MAX_LIFETIME_SECONDS
+            ),
         )
 
     async def open(self) -> None:
