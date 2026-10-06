@@ -21,9 +21,8 @@ from app.persistence.agentguard_repository import (
 )
 from app.seller_agentguard_orchestrator import SellerAgentGuardOrchestrator
 from app.session_auth import (
-    SESSION_COOKIE_NAME,
     audiences_match,
-    parse_session_token,
+    resolve_session,
     step_up_required,
 )
 from app.razorpay import RazorpayConfigError, RazorpayLiveKeyRefused
@@ -195,7 +194,7 @@ def _principal(
     role: Optional[Role] = None,
 ) -> tuple[str, Optional[str]]:
     """Resolve authorization principal from session first; body wallet is legacy only."""
-    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    session = resolve_session(request, role)
     if session:
         if role is not None and not audiences_match(session.get("aud"), role):
             raise HTTPException(status_code=403, detail="Session audience mismatch.")
@@ -225,16 +224,21 @@ def _principal(
     raise HTTPException(status_code=401, detail="AgentGuard principal required.")
 
 
+def _action_audience(action: str) -> Optional[Role]:
+    normalized = agentguard.normalize_action(action) or action
+    if str(normalized).startswith("seller.") or action == "refund":
+        return "seller"
+    if str(normalized).startswith("buyer.") or action == "checkout":
+        return "buyer"
+    return None
+
+
 def _assert_session_action(request: Request, action: str) -> None:
-    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    required = _action_audience(action)
+    session = resolve_session(request, required)
     if not session:
         return
     normalized = agentguard.normalize_action(action) or action
-    required: Optional[str] = None
-    if str(normalized).startswith("seller.") or action == "refund":
-        required = "seller"
-    elif str(normalized).startswith("buyer.") or action == "checkout":
-        required = "buyer"
     if required and not audiences_match(session.get("aud"), required):
         raise HTTPException(status_code=403, detail="Session audience mismatch.")
     if step_up_required(session, str(normalized)):
@@ -531,7 +535,9 @@ async def evaluate_action(
     correlation_id: Optional[str] = Header(default=None, alias="X-Correlation-ID"),
 ) -> ApiResponse:
     principal_id, wallet_address = _principal(
-        request, wallet_address=body.wallet_address
+        request,
+        wallet_address=body.wallet_address,
+        role=_action_audience(body.action),
     )
     _assert_session_action(request, body.action)
     pool = _persistence_pool(request)
@@ -739,7 +745,9 @@ async def execute_action(
     if not effective_idempotency_key:
         raise HTTPException(status_code=422, detail="Idempotency-Key is required.")
     principal_id, wallet_address = _principal(
-        request, wallet_address=body.wallet_address
+        request,
+        wallet_address=body.wallet_address,
+        role=_action_audience(body.action),
     )
     _assert_session_action(request, body.action)
     pool = _persistence_pool(request)

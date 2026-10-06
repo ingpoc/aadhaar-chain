@@ -8,7 +8,7 @@ import json
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from fastapi import HTTPException, Request
 
@@ -17,6 +17,8 @@ from config import get_runtime_mode, settings
 from app.session_registry import is_revoked, register_session
 
 SESSION_COOKIE_NAME = "aadharcha_session"
+BUYER_SESSION_COOKIE_NAME = "aadharcha_session_buyer"
+SELLER_SESSION_COOKIE_NAME = "aadharcha_session_seller"
 DEFAULT_SESSION_TTL_HOURS = 24
 AUDIENCE_ALIASES = {
     "ondcbuyer": "buyer",
@@ -227,9 +229,67 @@ def parse_session_token(token: str) -> Optional[dict[str, Any]]:
     return payload
 
 
+_AUDIENCE_COOKIE_NAMES = {
+    "buyer": BUYER_SESSION_COOKIE_NAME,
+    "seller": SELLER_SESSION_COOKIE_NAME,
+}
+ALL_SESSION_COOKIE_NAMES = (
+    SESSION_COOKIE_NAME,
+    BUYER_SESSION_COOKIE_NAME,
+    SELLER_SESSION_COOKIE_NAME,
+)
+# Local dev SPA ports (vite.config.ts in ondcbuyer / ondcseller).
+_DEV_PORT_AUDIENCES = {43102: "buyer", 43103: "seller"}
+
+
+def audience_cookie_name(aud: Optional[str]) -> Optional[str]:
+    """Role-scoped cookie for an audience, so Buyer and Seller sessions coexist."""
+    canonical = canonical_audience(aud)
+    return _AUDIENCE_COOKIE_NAMES.get(canonical) if canonical else None
+
+
+def audience_from_origin(request: Request) -> Optional[str]:
+    """Which portfolio app is calling, from the browser-set Origin header.
+
+    Only a hint for choosing between the caller's own session cookies; every
+    token is still signature-, expiry-, revocation- and audience-checked.
+    """
+    from urllib.parse import urlparse
+
+    origin = (request.headers.get("origin") or "").strip()
+    if not origin or origin == "null":
+        return None
+    parsed = urlparse(origin)
+    host = (parsed.hostname or "").lower()
+    first_label = host.split(".", 1)[0]
+    if first_label in ("ondcbuyer", "ondcseller"):
+        return canonical_audience(first_label)
+    if host in ("localhost", "127.0.0.1"):
+        return _DEV_PORT_AUDIENCES.get(parsed.port or 0)
+    return None
+
+
+def resolve_session(
+    request: Request, audience: Optional[str] = None
+) -> Optional[dict[str, Any]]:
+    """Session for ``audience`` (or the calling app), else the legacy cookie.
+
+    The role-scoped cookie is used only when its own token's audience matches
+    the requested role. Otherwise the legacy shared cookie is returned
+    unchanged, so callers keep enforcing their existing audience checks.
+    """
+    wanted = canonical_audience(audience) if audience else audience_from_origin(request)
+    name = audience_cookie_name(wanted)
+    if name:
+        scoped = parse_session_token(request.cookies.get(name, ""))
+        if scoped and audiences_match(scoped.get("aud"), wanted):
+            return scoped
+    return parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+
+
 def require_buyer_principal(request: Request) -> str:
     """Buyer session, plus Seller social handoff used by commerce (#16/#19/#21)."""
-    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    session = resolve_session(request, "buyer")
     if not session or not session.get("principal_id"):
         raise HTTPException(status_code=401, detail="Authenticated principal required.")
     shared_social_session = (
@@ -306,23 +366,43 @@ def cookie_domain() -> Optional[str]:
 
 
 def set_session_cookie(response, token: str) -> None:
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=token,
-        httponly=True,
-        secure=cookie_secure_flag(),
-        samesite=cookie_samesite(),
-        domain=cookie_domain(),
-        max_age=getattr(settings, "session_ttl_hours", DEFAULT_SESSION_TTL_HOURS) * 3600,
-        path="/",
-    )
+    """Write the legacy shared cookie plus the token audience's scoped cookie."""
+    names = [SESSION_COOKIE_NAME]
+    payload = decode_session_payload(token)
+    scoped = audience_cookie_name((payload or {}).get("aud"))
+    if scoped:
+        names.append(scoped)
+    for name in names:
+        response.set_cookie(
+            key=name,
+            value=token,
+            httponly=True,
+            secure=cookie_secure_flag(),
+            samesite=cookie_samesite(),
+            domain=cookie_domain(),
+            max_age=getattr(settings, "session_ttl_hours", DEFAULT_SESSION_TTL_HOURS)
+            * 3600,
+            path="/",
+        )
 
 
-def clear_session_cookie(response) -> None:
-    response.delete_cookie(
-        key=SESSION_COOKIE_NAME,
-        path="/",
-        domain=cookie_domain(),
-        secure=cookie_secure_flag(),
-        samesite=cookie_samesite(),
-    )
+def clear_session_cookie(response, names: Optional[Iterable[str]] = None) -> None:
+    """Clear session cookies (all of them unless specific names are given)."""
+    for name in names or ALL_SESSION_COOKIE_NAMES:
+        response.delete_cookie(
+            key=name,
+            path="/",
+            domain=cookie_domain(),
+            secure=cookie_secure_flag(),
+            samesite=cookie_samesite(),
+        )
+
+
+def session_cookie_sids(request: Request) -> dict[str, str]:
+    """Map each present, signature-valid session cookie name to its sid."""
+    sids: dict[str, str] = {}
+    for name in ALL_SESSION_COOKIE_NAMES:
+        payload = decode_session_payload(request.cookies.get(name, ""))
+        if payload and payload.get("sid"):
+            sids[name] = str(payload["sid"])
+    return sids
