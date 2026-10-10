@@ -25,7 +25,7 @@ from app.razorpay import (
     RazorpaySignatureError,
     public_payment_config,
 )
-from app.session_auth import SESSION_COOKIE_NAME, parse_session_token
+from app.session_auth import resolve_session
 
 router = APIRouter(prefix="/api/commerce/v1", tags=["commerce-v1"])
 
@@ -57,7 +57,7 @@ class RazorpayConfirmRequest(BaseModel):
 
 
 def _principal(request: Request) -> str:
-    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    session = resolve_session(request, "buyer")
     if not session or not session.get("principal_id"):
         raise HTTPException(status_code=401, detail="Authenticated principal required.")
     # Match demo-commerce (#16): allow Buyer commerce after a Seller social sign-in.

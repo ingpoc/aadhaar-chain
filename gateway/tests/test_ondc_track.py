@@ -456,7 +456,7 @@ def test_on_status_accepts_camelcase_and_authorization_subscriber(
     assert "subscriber identifier" in nack.json()["error"]["message"]
 
 
-def test_local_track_returns_stub_gps_and_https_map_for_shipped_order(
+def test_local_track_returns_delivery_gps_and_https_map_for_shipped_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(settings, "data_dir", str(tmp_path / "data"))
@@ -517,10 +517,13 @@ def test_local_track_returns_stub_gps_and_https_map_for_shipped_order(
     assert payload["order_id"] == order_id
     assert payload["status"] == "shipped"
     assert payload["tracking"]["id"] == "TRACK-SHIPPED-1"
-    assert payload["tracking"]["location"]["gps"] == "12.9715987,77.5945627"
+    # Bengaluru 560001 delivery address -> Bengaluru pincode centroid.
+    gps = payload["tracking"]["location"]["gps"]
+    lat, lng = (float(part) for part in gps.split(","))
+    assert 12.85 <= lat <= 13.10 and 77.45 <= lng <= 77.75, gps
     assert (
         payload["tracking"]["url"]
-        == "https://www.google.com/maps/search/?api=1&query=12.9715987,77.5945627"
+        == f"https://www.google.com/maps/search/?api=1&query={gps}"
     )
     assert payload["tracking"]["location"]["address"]["city"] == "Bengaluru"
 

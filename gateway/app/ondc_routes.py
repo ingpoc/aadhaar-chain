@@ -26,6 +26,7 @@ from starlette.background import BackgroundTask
 from app import commerce_demo, ondc_store
 from app.commerce_compat import CommerceCompatibilityAdapter
 from app.commerce_v1 import CommerceConflict, CommerceNotFound, CommerceV1, CommerceValidation
+from app.geo_centroids import centroid_for_address, explicit_coordinates, format_gps
 from app.ondc_crypto import (
     create_authorization_header,
     load_ed25519_private_pem,
@@ -1541,6 +1542,23 @@ class LocalTrackBody(BaseModel):
     order_id: Optional[str] = None
 
 
+def _delivery_coordinates(
+    order: dict[str, Any], fulfilment: dict[str, Any], address: dict[str, Any]
+) -> tuple[float, float] | None:
+    """Explicit delivery GPS on the order/fulfilment, else pincode/city centroid."""
+    candidates: list[Any] = [address]
+    end = fulfilment.get("end") if isinstance(fulfilment.get("end"), dict) else {}
+    candidates.append(end.get("location"))
+    for item in order.get("fulfillments") or []:
+        if isinstance(item, dict) and isinstance(item.get("end"), dict):
+            candidates.append(item["end"].get("location"))
+    for candidate in candidates:
+        coordinates = explicit_coordinates(candidate)
+        if coordinates:
+            return coordinates
+    return centroid_for_address(address)
+
+
 def _tracking_from_order(order: dict[str, Any]) -> dict[str, Any]:
     fulfilment = (
         order.get("fulfilment") if isinstance(order.get("fulfilment"), dict) else {}
@@ -1562,12 +1580,10 @@ def _tracking_from_order(order: dict[str, Any]) -> dict[str, Any]:
     ).strip()
     tracking_url = raw_tracking_url if raw_tracking_url.startswith("https://") else None
     location = logistics.get("tracking_location") or fulfilment.get("tracking_location")
+    address = order.get("delivery_address") or fulfilment.get("delivery_address") or {}
+    if not isinstance(address, dict):
+        address = {}
     if not isinstance(location, dict):
-        address = (
-            order.get("delivery_address") or fulfilment.get("delivery_address") or {}
-        )
-        if not isinstance(address, dict):
-            address = {}
         location = {
             "gps": None,
             "address": {
@@ -1599,8 +1615,10 @@ def _tracking_from_order(order: dict[str, Any]) -> dict[str, Any]:
     }
     gps = str(location.get("gps") or "").strip()
     if dispatched and not gps:
-        gps = "12.9715987,77.5945627"
-        location["gps"] = gps
+        # Courier map points at the real delivery location; never a fixed city.
+        derived = _delivery_coordinates(order, fulfilment, address)
+        gps = format_gps(*derived) if derived else ""
+        location["gps"] = gps or None
     if tracking_url is None and gps:
         tracking_url = f"https://www.google.com/maps/search/?api=1&query={gps}"
     return {

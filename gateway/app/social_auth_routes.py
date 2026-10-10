@@ -24,8 +24,8 @@ from app.session_auth import (
     set_session_cookie,
     clear_session_cookie,
     session_user_payload,
-    parse_session_token,
-    SESSION_COOKIE_NAME,
+    resolve_session,
+    session_cookie_sids,
 )
 from app.session_registry import (
     SessionRegistryUnavailable,
@@ -136,7 +136,7 @@ async def _issue_session(
 
 
 def _require_session(request: Request) -> dict:
-    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    session = resolve_session(request)
     if not session or not session.get("principal_id"):
         raise HTTPException(status_code=401, detail="Authenticated principal required.")
     return session
@@ -444,8 +444,11 @@ async def revoke_one_session(
         "data": {"sid": target},
     }
     response = JSONResponse(payload)
-    if target == session.get("sid"):
-        clear_session_cookie(response)
+    revoked_cookies = [
+        name for name, sid in session_cookie_sids(request).items() if sid == target
+    ]
+    if revoked_cookies:
+        clear_session_cookie(response, revoked_cookies)
     return response
 
 
@@ -472,7 +475,7 @@ async def revoke_all_sessions(request: Request) -> JSONResponse:
 @router.get("/session-debug")
 async def session_debug(request: Request) -> JSONResponse:
     """Dev helper — do not rely on in production UIs."""
-    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    session = resolve_session(request)
     return JSONResponse(
         {
             "success": True,

@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from config import settings
 from app.samantha_transcripts import append_event, list_events
-from app.session_auth import SESSION_COOKIE_NAME, parse_session_token
+from app.session_auth import resolve_session
 
 router = APIRouter(prefix="/api/realtime", tags=["realtime"])
 
@@ -286,7 +286,7 @@ class TranscriptEventRequest(BaseModel):
 
 
 def _authenticated_session(request: Request, role: str | None = None) -> dict[str, Any]:
-    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    session = resolve_session(request, role)
     if session is None:
         raise HTTPException(status_code=401, detail="Sign in before using Samantha.")
     if role:

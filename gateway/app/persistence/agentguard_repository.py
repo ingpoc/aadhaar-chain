@@ -373,8 +373,59 @@ class AgentGuardRepository:
         approval_id: str | None = None,
         payload: dict[str, Any] | None = None,
         status: str = "pending",
+        reclaim_failed: bool = False,
+        reclaim_stale_after_seconds: int | None = None,
     ) -> tuple[dict[str, Any], bool]:
-        """Create or replay an intent, rejecting key reuse with a new hash."""
+        """Create or replay an intent, rejecting key reuse with a new hash.
+
+        Callers may opt in to reclaiming a retryable key: an intent whose
+        effect ``failed``, or (when ``reclaim_stale_after_seconds`` is set) an
+        in-flight intent with no result that has not moved for that long. A
+        reclaimed intent is rebound to the new request and reported as
+        created so the caller executes it again. The guarded UPDATE row-locks
+        the intent, so concurrent retries cannot both reclaim it.
+        """
+        if reclaim_failed or reclaim_stale_after_seconds is not None:
+            reclaimed = await self._fetch_one(
+                """
+                UPDATE agentguard_execution_intents
+                SET request_hash = %s,
+                    decision_id = %s,
+                    approval_id = %s,
+                    status = %s,
+                    payload = %s,
+                    result = NULL,
+                    updated_at = NOW()
+                WHERE principal_id = %s
+                  AND operation = %s
+                  AND idempotency_key = %s
+                  AND (
+                    (%s AND status = 'failed')
+                    OR (
+                      %s::INTEGER IS NOT NULL
+                      AND status IN ('pending', 'approved', 'executing')
+                      AND result IS NULL
+                      AND updated_at < NOW() - make_interval(secs => %s::INTEGER)
+                    )
+                  )
+                RETURNING *
+                """,
+                (
+                    request_hash,
+                    decision_id,
+                    approval_id,
+                    status,
+                    Jsonb(payload or {}),
+                    principal_id,
+                    operation,
+                    idempotency_key,
+                    reclaim_failed,
+                    reclaim_stale_after_seconds,
+                    reclaim_stale_after_seconds,
+                ),
+            )
+            if reclaimed is not None:
+                return reclaimed, True
         record = await self._fetch_one(
             """
             INSERT INTO agentguard_execution_intents (

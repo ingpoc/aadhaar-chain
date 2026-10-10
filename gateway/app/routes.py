@@ -45,9 +45,8 @@ from app.models import (
 from app.agent_manager import agent_manager
 from app.evidence_store import store_encrypted_evidence
 from app.session_auth import (
-    SESSION_COOKIE_NAME,
     create_session_token,
-    parse_session_token,
+    resolve_session,
     session_user_payload,
     set_session_cookie,
 )
@@ -791,7 +790,7 @@ async def get_identity_me(request: Request):
     Prefer GET /api/auth/me. This reserved path exists so clients that guess
     /api/identity/me do not hit the wallet catch-all ("Identity not found").
     """
-    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    session = resolve_session(request)
     if session is None:
         return ApiResponse(
             success=True,

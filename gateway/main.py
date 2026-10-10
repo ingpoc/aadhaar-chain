@@ -25,9 +25,9 @@ from app.realtime_routes import router as realtime_router
 from app.agent_manager import agent_manager
 from app.runtime_config import resolve_runtime_policy
 from app.session_auth import (
-    SESSION_COOKIE_NAME,
     clear_session_cookie,
-    parse_session_token,
+    resolve_session,
+    session_cookie_sids,
     session_user_payload,
 )
 from app.session_registry import (
@@ -153,7 +153,7 @@ async def api_health_check() -> JSONResponse:
 @app.get("/api/auth/me", tags=["auth"])
 async def auth_me(request: Request) -> JSONResponse:
     """Return the authenticated principal from the session cookie."""
-    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    session = resolve_session(request)
     if session is None:
         return JSONResponse(
             {
@@ -175,7 +175,7 @@ async def auth_me(request: Request) -> JSONResponse:
 @app.get("/api/auth/validate", tags=["auth"])
 async def auth_validate(request: Request) -> JSONResponse:
     """Validate the current session cookie without throwing on missing auth."""
-    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    session = resolve_session(request)
     if session is None:
         return JSONResponse(
             {
@@ -201,10 +201,10 @@ async def auth_validate(request: Request) -> JSONResponse:
 @app.post("/api/auth/logout", tags=["auth"])
 async def auth_logout(request: Request) -> JSONResponse:
     """Clear the portfolio SSO session cookie and deny the current sid."""
-    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
-    if session and session.get("sid"):
+    # Revoke every Buyer/Seller/legacy session this browser holds.
+    for sid in sorted(set(session_cookie_sids(request).values())):
         try:
-            await revoke_sid_durable(str(session["sid"]))
+            await revoke_sid_durable(sid)
         except SessionRegistryUnavailable as exc:
             raise HTTPException(
                 status_code=503, detail="Session registry unavailable."

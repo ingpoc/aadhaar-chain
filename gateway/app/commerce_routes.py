@@ -12,7 +12,7 @@ from app.commerce_compat import CommerceCompatibilityAdapter
 from app.commerce_v1 import CommerceValidation, empty_store, operated_seller_ids
 from app.models import ApiResponse
 from app.persistence.connection import live_connection_pool
-from app.session_auth import SESSION_COOKIE_NAME, parse_session_token
+from app.session_auth import resolve_session
 from config import get_runtime_mode
 
 router = APIRouter(prefix="/api/demo-commerce", tags=["demo-commerce"])
@@ -25,7 +25,7 @@ def _require_test_fixture_mode() -> None:
 
 
 def _session_principal(request: Request, audience: str) -> str:
-    session = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME, ""))
+    session = resolve_session(request, audience)
     if not session or not session.get("principal_id"):
         raise HTTPException(status_code=401, detail="Authenticated principal required.")
     shared_social_session = (
