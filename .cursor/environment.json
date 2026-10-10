@@ -1,0 +1,18 @@
+{
+  "name": "aadhaar-chain",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "gateway",
+      "command": "cd gateway && AADHAAR_CHAIN_ENV=demo PORT=43101 .venv/bin/python main.py"
+    },
+    {
+      "name": "frontend",
+      "command": "cd frontend && npm run dev"
+    }
+  ],
+  "ports": [
+    { "name": "frontend", "port": 43100 },
+    { "name": "gateway", "port": 43101 }
+  ]
+}
